@@ -7,7 +7,12 @@ import numpy as np
 def make_overlay(img_gray: np.ndarray, mask: np.ndarray,
                  fovea_xy: tuple | None = None,
                  nearest_xy: tuple | None = None,
-                 disc_pts: list | None = None) -> np.ndarray:
+                 disc_pts: list | None = None,
+                 disc_diameter_um: float = 1800.0,
+                 crop_box: tuple[int, int, int, int] | None = None,
+                 crop_pts: list | None = None,
+                 show_macula: bool = False,
+                 scale_um_px: float | None = None) -> np.ndarray:
     """RGBオーバーレイ画像（numpy配列）を返す。"""
     rgb = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB).copy()
 
@@ -50,9 +55,30 @@ def make_overlay(img_gray: np.ndarray, mask: np.ndarray,
         d_px = np.sqrt((p2[0]-p1[0])**2 + (p2[1]-p1[1])**2)
         mx = (p1[0]+p2[0])//2
         my = (p1[1]+p2[1])//2 - 10
-        label = f"{d_px:.0f}px = 1800um"
+        label = f"{d_px:.0f}px = {disc_diameter_um:.0f}um"
         (tw, th), _ = cv2.getTextSize(label, font, 0.45, 1)
         cv2.rectangle(rgb, (mx-3, my-th-3), (mx+tw+3, my+3), (0, 0, 0), -1)
         cv2.putText(rgb, label, (mx, my), font, 0.45, amber, 1, cv2.LINE_AA)
+
+    if crop_box is not None:
+        x0, y0, x1, y1 = crop_box
+        cv2.rectangle(rgb, (x0, y0), (x1 - 1, y1 - 1), (96, 165, 250), 1)
+
+    sky = (96, 165, 250)
+    if crop_pts and len(crop_pts) >= 1:
+        p1 = (int(crop_pts[0][0]), int(crop_pts[0][1]))
+        cv2.circle(rgb, p1, 6, sky, -1)
+    if crop_pts and len(crop_pts) == 2:
+        p2 = (int(crop_pts[1][0]), int(crop_pts[1][1]))
+        cv2.circle(rgb, p2, 6, sky, -1)
+        x0, x1 = sorted((p1[0], p2[0]))
+        y0, y1 = sorted((p1[1], p2[1]))
+        cv2.rectangle(rgb, (x0, y0), (x1, y1), sky, 2)
+
+    if show_macula and fovea_xy and scale_um_px and scale_um_px > 0:
+        from engine.gawain import macula_radius_px
+        radius_px = int(round(macula_radius_px(scale_um_px)))
+        cv2.circle(rgb, (int(fovea_xy[0]), int(fovea_xy[1])), radius_px,
+                   (167, 139, 250), 1)
 
     return rgb

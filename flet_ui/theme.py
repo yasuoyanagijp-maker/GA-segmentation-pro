@@ -1,0 +1,10 @@
+"""GA Segmentation Pro — Flet UI theme (MNV_analysis_pro と同系)."""
+
+PRIMARY = "#00E5FF"
+BG_DARK = "#050510"
+PANEL_BG = "#151B2B"
+TEXT = "#F9FAFB"
+TEXT_MUTED = "#8B9BB4"
+ACCENT_RED = "#EF4444"
+ACCENT_CYAN = "#22D3EE"
+ACCENT_AMBER = "#FBBF24"
