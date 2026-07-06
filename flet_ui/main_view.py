@@ -26,6 +26,8 @@ from flet_ui.state import GAAppState
 from flet_ui import theme as T
 
 DISPLAY_WIDTH = 520
+# 未読込時のプレースホルダ（Flet Image は src か src_base64 が必須）
+EMPTY_PX = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
 
 
 def _b64_jpeg(rgb: np.ndarray, quality: int = 85) -> str:
@@ -55,7 +57,9 @@ def _card(label: str, value: str, color: str = T.TEXT) -> ft.Container:
 async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     status = ft.Text("", color=T.ACCENT_AMBER, size=13)
     hint = ft.Text("", color=T.TEXT_MUTED, size=13)
-    img_ctrl = ft.Image(fit=ft.ImageFit.CONTAIN, width=DISPLAY_WIDTH)
+    img_ctrl = ft.Image(
+        src_base64=EMPTY_PX, fit=ft.ImageFit.CONTAIN, width=DISPLAY_WIDTH, height=200,
+    )
     results_col = ft.Column(spacing=8, expand=True, scroll=ft.ScrollMode.AUTO)
     file_dd = ft.Dropdown(label="画像選択", options=[], width=320, text_size=13)
     input_field = ft.TextField(
@@ -93,6 +97,19 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     graph_area = ft.Column(visible=False)
 
     disp_scale = {"v": 1.0}
+    disp_size = {"w": DISPLAY_WIDTH, "h": 200}
+    drag = {"active": False, "start": (0.0, 0.0)}
+
+    def _to_img_xy(local_x: float, local_y: float) -> tuple[float, float]:
+        h, w = state.img_gray.shape
+        ox = max(0.0, min(w - 1, local_x / disp_scale["v"]))
+        oy = max(0.0, min(h - 1, local_y / disp_scale["v"]))
+        return ox, oy
+
+    def _overlay_disc_pts() -> list[tuple[float, float]] | None:
+        if state.mode in ("disc_line", "disc_confirm") and len(state.disc_draft_pts) == 2:
+            return state.disc_draft_pts
+        return state.disc_pts or None
 
     def load_image_at(idx: int) -> None:
         if not state.files:
@@ -108,7 +125,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         refresh_image()
         refresh_results()
 
-    def refresh_image() -> None:
+    def refresh_image(*, do_update: bool = True) -> None:
         if state.view_mode == "gif" and state.series_gif:
             gif_img.src_base64 = base64.b64encode(state.series_gif).decode("ascii")
             img_ctrl.visible = False
@@ -137,24 +154,27 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 state.mask if state.mask is not None else np.zeros_like(state.img_gray),
                 fovea_xy=state.fovea_xy,
                 nearest_xy=stats["nearest_xy"] if stats else None,
-                disc_pts=state.disc_pts,
+                disc_pts=_overlay_disc_pts(),
                 disc_diameter_um=state.disc_diameter_um,
-                crop_pts=state.crop_pts if state.mode in ("crop1", "crop2") else None,
+                crop_pts=state.crop_pts if state.mode in ("crop_drag", "crop_confirm") else None,
                 show_macula=state.mask is not None,
                 scale_um_px=state.scale_um_px,
             )
             h, w = state.img_gray.shape[:2]
         else:
-            img_ctrl.src_base64 = None
+            img_ctrl.src_base64 = EMPTY_PX
             return
 
         disp_scale["v"] = DISPLAY_WIDTH / w
         disp_h = int(h * disp_scale["v"])
         disp = cv2.resize(rgb, (DISPLAY_WIDTH, disp_h))
+        disp_size["h"] = disp_h
         img_ctrl.width = DISPLAY_WIDTH
         img_ctrl.height = disp_h
+        gesture_stack.height = disp_h
         img_ctrl.src_base64 = _b64_jpeg(disp)
-        page.update()
+        if do_update:
+            page.update()
 
     def _refresh_graph() -> None:
         graph_area.controls.clear()
@@ -231,11 +251,11 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
 
     def refresh_hint() -> None:
         msgs = {
-            "crop1": "クロップ: 対角1点目をクリック",
-            "crop2": "クロップ: 対角2点目をクリック",
-            "disc1": "乳頭計測: 端（1点目）をクリック",
-            "disc2": "乳頭計測: 反対側の端（2点目）をクリック",
-            "fovea": "中心窩を1点クリック",
+            "crop_drag": "クロップ: ドラッグで矩形を描画",
+            "crop_confirm": "クロップ範囲を確認して OK または やり直し",
+            "disc_line": "乳頭計測: 乳頭の両端を結ぶ直線をドラッグ",
+            "disc_confirm": "直線を確認して OK または やり直し",
+            "fovea": "中心窩をタップ",
         }
         hint.value = msgs.get(state.mode or "", "")
         hint.color = T.PRIMARY if state.mode else T.TEXT_MUTED
@@ -269,67 +289,166 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
 
     file_dd.on_change = on_file_change
 
-    def on_image_tap(e: ft.TapEvent) -> None:
-        if state.img_gray is None or state.mode not in ("crop1", "crop2", "disc1", "disc2", "fovea"):
+    def on_pan_start(e: ft.DragStartEvent) -> None:
+        if state.img_gray is None:
             return
-        h, w = state.img_gray.shape
-        ox = max(0, min(w - 1, e.local_x / disp_scale["v"]))
-        oy = max(0, min(h - 1, e.local_y / disp_scale["v"]))
+        if state.mode == "disc_line":
+            drag["active"] = True
+            drag["start"] = (e.local_x, e.local_y)
+            p = _to_img_xy(e.local_x, e.local_y)
+            state.disc_draft_pts = [p, p]
+            refresh_image(do_update=False)
+        elif state.mode == "crop_drag":
+            drag["active"] = True
+            drag["start"] = (e.local_x, e.local_y)
+            p = _to_img_xy(e.local_x, e.local_y)
+            state.crop_pts = [p, p]
+            refresh_image(do_update=False)
 
-        if state.mode == "crop1":
-            state.crop_pts = [(ox, oy)]
-            state.mode = "crop2"
-        elif state.mode == "crop2":
-            state.crop_pts.append((ox, oy))
+    def on_pan_update(e: ft.DragUpdateEvent) -> None:
+        if not drag["active"] or state.img_gray is None:
+            return
+        if state.mode == "disc_line":
+            p1 = _to_img_xy(*drag["start"])
+            p2 = _to_img_xy(e.local_x, e.local_y)
+            state.disc_draft_pts = [p1, p2]
+            refresh_image()
+        elif state.mode == "crop_drag":
+            p1 = _to_img_xy(*drag["start"])
+            p2 = _to_img_xy(e.local_x, e.local_y)
+            state.crop_pts = [p1, p2]
+            refresh_image()
+
+    def on_pan_end(_e: ft.DragEndEvent) -> None:
+        if not drag["active"]:
+            return
+        drag["active"] = False
+        if state.mode == "disc_line" and len(state.disc_draft_pts) == 2:
+            p1, p2 = state.disc_draft_pts
+            d_px = ((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2) ** 0.5
+            if d_px >= 5:
+                state.mode = "disc_confirm"
+                status.value = f"乳頭径ライン: {d_px:.0f} px — OK で確定"
+            else:
+                state.disc_draft_pts = []
+                status.value = "直線が短すぎます。もう一度ドラッグしてください"
+        elif state.mode == "crop_drag" and len(state.crop_pts) == 2:
             p1, p2 = state.crop_pts
-            try:
-                box = normalize_box(p1[0], p1[1], p2[0], p2[1], w, h)
-                if state.crop_box is None:
-                    state.crop_box = box
-                else:
-                    ox0, oy0, _, _ = state.crop_box
-                    bx0, by0, bx1, by1 = box
-                    state.crop_box = (ox0 + bx0, oy0 + by0, ox0 + bx1, oy0 + by1)
-                state.img_gray = apply_crop(state.img_gray, box)
+            w = abs(p2[0] - p1[0])
+            h = abs(p2[1] - p1[1])
+            if w >= 5 and h >= 5:
+                state.mode = "crop_confirm"
+                status.value = "クロップ範囲を確認して OK で確定"
+            else:
                 state.crop_pts = []
-                state.mode = None
-                state.reset_analysis(keep_series=True)
-            except ValueError as exc:
-                status.value = str(exc)
-                state.crop_pts = []
-                state.mode = "crop1"
-        elif state.mode == "disc1":
-            state.disc_pts = [(ox, oy)]
-            state.mode = "disc2"
-        elif state.mode == "disc2":
-            state.disc_pts.append((ox, oy))
-            p1, p2 = state.disc_pts
-            state.scale_um_px = calibration.compute_scale_um_per_px(
-                p1, p2, float(disc_field.value or state.disc_diameter_um))
-            state.mode = None
-            state.series_results = None
-        elif state.mode == "fovea":
-            state.fovea_xy = (ox, oy)
-            state.mode = None
-            state.series_results = None
-            if state.mask is not None and state.scale_um_px:
-                state.stats = ga_stats(state.mask, state.scale_um_px, state.fovea_xy)
-
+                status.value = "矩形が小さすぎます。もう一度ドラッグしてください"
+        update_confirm_visibility()
         refresh_hint()
-        update_cancel_visibility()
+        refresh_image()
+        page.update()
+
+    def on_tap_down(e: ft.TapEvent) -> None:
+        if state.img_gray is None or state.mode != "fovea":
+            return
+        ox, oy = _to_img_xy(e.local_x, e.local_y)
+        state.fovea_xy = (ox, oy)
+        state.mode = None
+        state.series_results = None
+        if state.mask is not None and state.scale_um_px:
+            state.stats = ga_stats(state.mask, state.scale_um_px, state.fovea_xy)
+        status.value = f"中心窩: ({ox:.0f}, {oy:.0f})"
+        refresh_hint()
+        update_confirm_visibility()
         refresh_image()
         refresh_results()
         page.update()
 
+    def on_disc_ok(_=None) -> None:
+        if len(state.disc_draft_pts) != 2:
+            status.value = "直線を描いてください"
+            page.update()
+            return
+        p1, p2 = state.disc_draft_pts
+        try:
+            state.disc_pts = [p1, p2]
+            state.scale_um_px = calibration.compute_scale_um_per_px(
+                p1, p2, float(disc_field.value or state.disc_diameter_um))
+        except ValueError as exc:
+            status.value = str(exc)
+            page.update()
+            return
+        state.disc_draft_pts = []
+        state.mode = None
+        state.series_results = None
+        status.value = f"乳頭計測完了: {state.scale_um_px:.2f} μm/px"
+        refresh_hint()
+        update_confirm_visibility()
+        refresh_image()
+        refresh_results()
+        page.update()
+
+    def on_disc_redo(_=None) -> None:
+        state.disc_draft_pts = []
+        state.mode = "disc_line"
+        status.value = "乳頭の直線をもう一度ドラッグしてください"
+        refresh_hint()
+        update_confirm_visibility()
+        refresh_image()
+        page.update()
+
+    def on_crop_ok(_=None) -> None:
+        if state.img_gray is None or len(state.crop_pts) != 2:
+            status.value = "クロップ範囲を描いてください"
+            page.update()
+            return
+        h, w = state.img_gray.shape
+        p1, p2 = state.crop_pts
+        try:
+            box = normalize_box(p1[0], p1[1], p2[0], p2[1], w, h)
+            if state.crop_box is None:
+                state.crop_box = box
+            else:
+                ox0, oy0, _, _ = state.crop_box
+                bx0, by0, bx1, by1 = box
+                state.crop_box = (ox0 + bx0, oy0 + by0, ox0 + bx1, oy0 + by1)
+            state.img_gray = apply_crop(state.img_gray, box)
+            state.crop_pts = []
+            state.mode = None
+            state.reset_analysis(keep_series=True)
+            status.value = "クロップ完了"
+        except ValueError as exc:
+            status.value = str(exc)
+            state.crop_pts = []
+            state.mode = "crop_drag"
+        refresh_hint()
+        update_confirm_visibility()
+        refresh_image()
+        page.update()
+
+    def on_crop_redo(_=None) -> None:
+        state.crop_pts = []
+        state.mode = "crop_drag"
+        status.value = "クロップ矩形をもう一度ドラッグしてください"
+        refresh_hint()
+        update_confirm_visibility()
+        refresh_image()
+        page.update()
+
     def set_mode(mode: str) -> None:
         state.mode = mode
-        if mode == "disc1":
+        drag["active"] = False
+        if mode == "disc_line":
             state.disc_pts = []
+            state.disc_draft_pts = []
             state.scale_um_px = None
-        if mode == "crop1":
+            status.value = "乳頭の両端を結ぶ直線をドラッグしてください"
+        elif mode == "crop_drag":
             state.crop_pts = []
+            status.value = "クロップ範囲をドラッグしてください"
+        elif mode == "fovea":
+            status.value = "中心窩の位置をタップしてください"
         refresh_hint()
-        update_cancel_visibility()
+        update_confirm_visibility()
         page.update()
 
     def on_analyze(_=None) -> None:
@@ -424,15 +543,24 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
 
     series_date_dd.on_change = on_series_date
 
+    gesture_stack = ft.Stack(
+        [img_ctrl, gif_img],
+        width=DISPLAY_WIDTH,
+        height=200,
+    )
     img_stack = ft.GestureDetector(
-        content=ft.Stack([img_ctrl, gif_img]),
-        on_tap=on_image_tap,
+        content=gesture_stack,
+        on_pan_start=on_pan_start,
+        on_pan_update=on_pan_update,
+        on_pan_end=on_pan_end,
+        on_tap_down=on_tap_down,
+        mouse_cursor=ft.MouseCursor.PRECISE,
     )
 
     toolbar = ft.Row(
         [
-            ft.ElevatedButton("⓪ クロップ", on_click=lambda _: set_mode("crop1")),
-            ft.ElevatedButton("① 乳頭", on_click=lambda _: set_mode("disc1")),
+            ft.ElevatedButton("⓪ クロップ", on_click=lambda _: set_mode("crop_drag")),
+            ft.ElevatedButton("① 乳頭", on_click=lambda _: set_mode("disc_line")),
             ft.ElevatedButton("② 中心窩", on_click=lambda _: set_mode("fovea")),
             ft.ElevatedButton("③ 解析", on_click=on_analyze, bgcolor=T.PRIMARY, color="#000"),
             ft.ElevatedButton("④ 時系列", on_click=on_series),
@@ -441,26 +569,38 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         spacing=8,
     )
 
-    def update_cancel_visibility() -> None:
-        cancel_row.visible = state.mode in ("disc1", "disc2", "crop1", "crop2", "fovea")
+    def update_confirm_visibility() -> None:
+        cancel_row.visible = state.mode in ("disc_line", "crop_drag", "fovea")
+        disc_confirm_row.visible = state.mode == "disc_confirm"
+        crop_confirm_row.visible = state.mode == "crop_confirm"
 
     def on_cancel(_=None) -> None:
         state.cancel_mode()
+        drag["active"] = False
+        status.value = ""
         refresh_hint()
-        update_cancel_visibility()
-        refresh_image()
-        page.update()
-
-    def on_restart_disc(_=None) -> None:
-        state.restart_disc()
-        refresh_hint()
-        update_cancel_visibility()
+        update_confirm_visibility()
         refresh_image()
         page.update()
 
     cancel_row = ft.Row([
         ft.OutlinedButton("✕ キャンセル", on_click=on_cancel),
-        ft.OutlinedButton("↩ 1点目から", on_click=on_restart_disc),
+    ], visible=False)
+
+    disc_confirm_row = ft.Row([
+        ft.ElevatedButton(
+            "✓ OK", on_click=on_disc_ok,
+            bgcolor="#10B981", color="#000",
+        ),
+        ft.OutlinedButton("↩ やり直し", on_click=on_disc_redo),
+    ], visible=False)
+
+    crop_confirm_row = ft.Row([
+        ft.ElevatedButton(
+            "✓ OK", on_click=on_crop_ok,
+            bgcolor="#10B981", color="#000",
+        ),
+        ft.OutlinedButton("↩ やり直し", on_click=on_crop_redo),
     ], visible=False)
 
     left = ft.Column(
@@ -469,6 +609,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             ft.Text("研究用", size=11, color=T.TEXT_MUTED),
             toolbar,
             cancel_row,
+            disc_confirm_row,
+            crop_confirm_row,
             hint,
             status,
             view_mode,
@@ -476,7 +618,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             img_stack,
             graph_area,
         ],
-        expand=True,
+        spacing=8,
         scroll=ft.ScrollMode.AUTO,
     )
 
@@ -500,16 +642,33 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     )
 
     page.add(
-        ft.Row(
-            [
-                sidebar,
-                ft.VerticalDivider(width=1, color="#374151"),
-                left,
-                ft.VerticalDivider(width=1, color="#374151"),
-                ft.Container(content=results_col, width=300, padding=10),
-            ],
+        ft.Container(
+            content=ft.Row(
+                [
+                    sidebar,
+                    ft.VerticalDivider(width=1, color="#374151"),
+                    ft.Container(content=left, expand=3, padding=ft.padding.only(left=8, right=8)),
+                    ft.VerticalDivider(width=1, color="#374151"),
+                    ft.Container(content=results_col, width=280, padding=10),
+                ],
+                expand=True,
+                spacing=0,
+            ),
             expand=True,
         )
     )
+    page.update()
+
     refresh_hint()
-    update_cancel_visibility()
+    update_confirm_visibility()
+
+    async def _deferred_auto_load() -> None:
+        import asyncio
+        import os
+        await asyncio.sleep(0.05)
+        auto_dir = os.environ.get("GA_INPUT_DIR", "").strip()
+        if auto_dir:
+            input_field.value = auto_dir
+            on_load_files()
+
+    page.run_task(_deferred_auto_load)

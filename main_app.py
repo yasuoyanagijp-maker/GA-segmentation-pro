@@ -14,12 +14,26 @@ async def main(page: ft.Page) -> None:
     page.theme_mode = ft.ThemeMode.DARK
     page.bgcolor = T.BG_DARK
     page.padding = 16
+    page.spacing = 0
     page.window.width = 1400
     page.window.height = 900
 
     state = GAAppState()
     page.data = state
-    await build_main_view(page, state)
+    try:
+        await build_main_view(page, state)
+    except Exception as exc:
+        import traceback
+        page.controls.clear()
+        page.add(
+            ft.Column([
+                ft.Text("起動エラー", size=20, color=T.ACCENT_RED),
+                ft.Text(str(exc), color=T.TEXT),
+                ft.Text(traceback.format_exc(), size=11, color=T.TEXT_MUTED, selectable=True),
+            ], scroll=ft.ScrollMode.AUTO),
+        )
+        page.update()
+        raise
 
 
 if __name__ == "__main__":

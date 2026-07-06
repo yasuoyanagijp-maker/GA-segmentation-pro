@@ -9,6 +9,9 @@ cd "$DIR"
 export FLET_USE_WEB
 : "${FLET_PORT:=8551}"
 export FLET_PORT
+# 起動時に自動読込する入力フォルダ（任意）
+: "${GA_INPUT_DIR:=}"
+export GA_INPUT_DIR
 
 cleanup_port() {
     local port=$1
@@ -19,6 +22,10 @@ cleanup_port() {
         kill -9 $pid 2>/dev/null || true
         sleep 1
     fi
+    # 古い Flet プロセスが残るとブラウザがグルグルのままになる
+    pkill -f "[f]let run.*${port}" 2>/dev/null || true
+    pkill -f "[G]A-segmentation-pro/main_app.py" 2>/dev/null || true
+    sleep 1
 }
 cleanup_port "$FLET_PORT"
 

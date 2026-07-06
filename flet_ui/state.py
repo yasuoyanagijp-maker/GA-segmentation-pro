@@ -15,8 +15,9 @@ class GAAppState:
     files: list[Path] = field(default_factory=list)
     file_idx: int = 0
 
-    mode: str | None = None
+    mode: str | None = None  # disc_line | disc_confirm | crop_drag | crop_confirm | fovea
     disc_pts: list[tuple[float, float]] = field(default_factory=list)
+    disc_draft_pts: list[tuple[float, float]] = field(default_factory=list)
     fovea_xy: tuple[float, float] | None = None
     scale_um_px: float | None = None
 
@@ -55,13 +56,15 @@ class GAAppState:
             self.estimated_prog = None
 
     def cancel_mode(self) -> None:
-        if self.mode in ("disc1", "disc2"):
+        if self.mode in ("disc_line", "disc_confirm"):
             self.disc_pts = []
-        elif self.mode in ("crop1", "crop2"):
+            self.disc_draft_pts = []
+        elif self.mode in ("crop_drag", "crop_confirm"):
             self.crop_pts = []
         self.mode = None
 
     def restart_disc(self) -> None:
         self.disc_pts = []
+        self.disc_draft_pts = []
         self.scale_um_px = None
-        self.mode = "disc1"
+        self.mode = "disc_line"
