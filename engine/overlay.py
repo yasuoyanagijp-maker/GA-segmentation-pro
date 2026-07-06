@@ -3,6 +3,26 @@
 import cv2
 import numpy as np
 
+# MNV_analysis_pro ROI 表示と同系（緑・40% 半透明）
+MASK_BLEND_COLOR_RGB = (0, 255, 0)
+MASK_BLEND_ALPHA = 0.4
+
+
+def blend_mask_overlay(
+    img_gray: np.ndarray,
+    mask: np.ndarray,
+    *,
+    alpha: float = MASK_BLEND_ALPHA,
+    color_rgb: tuple[int, int, int] = MASK_BLEND_COLOR_RGB,
+) -> np.ndarray:
+    """GA マスクを MNV 同様の半透明オーバーレイで合成する。"""
+    base = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
+    if mask is None or not np.any(mask > 0):
+        return base
+    overlay = base.copy()
+    overlay[mask > 0] = color_rgb
+    return cv2.addWeighted(overlay, alpha, base, 1.0 - alpha, 0)
+
 
 def make_overlay(img_gray: np.ndarray, mask: np.ndarray,
                  fovea_xy: tuple | None = None,
@@ -12,12 +32,17 @@ def make_overlay(img_gray: np.ndarray, mask: np.ndarray,
                  crop_box: tuple[int, int, int, int] | None = None,
                  crop_pts: list | None = None,
                  show_macula: bool = False,
-                 scale_um_px: float | None = None) -> np.ndarray:
-    """RGBオーバーレイ画像（numpy配列）を返す。"""
-    rgb = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB).copy()
+                 scale_um_px: float | None = None,
+                 mask_style: str = "solid") -> np.ndarray:
+    """RGBオーバーレイ画像（numpy配列）を返す。
 
-    # GA mask in red
-    rgb[mask > 0] = [255, 60, 60]
+    mask_style: "solid" = 赤塗り, "blend" = MNV 同系の半透明緑
+    """
+    if mask_style == "blend":
+        rgb = blend_mask_overlay(img_gray, mask)
+    else:
+        rgb = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB).copy()
+        rgb[mask > 0] = [255, 60, 60]
 
     # Line fovea → nearest GA
     if fovea_xy and nearest_xy:

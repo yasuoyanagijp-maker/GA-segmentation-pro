@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +16,7 @@ from engine.crop import apply_crop, normalize_box
 from engine.io_utils import SUPPORTED_SUFFIXES, list_images, load_gray
 from engine.life_table import LIFE_TABLE_SOURCE, format_life_expectancy, life_expectancy_years
 from engine.overlay import make_overlay
+from engine.region_growing import erase_oversegmentation_from_mask
 from engine.stats import ga_stats
 from engine.timeseries import (
     analyze_time_series,
@@ -24,6 +26,15 @@ from engine.timeseries import (
 )
 from flet_ui.state import GAAppState
 from flet_ui import theme as T
+from flet_ui.theme import (
+    apply_page_theme,
+    btn_erase,
+    btn_ok,
+    btn_outlined,
+    btn_primary,
+    btn_sidebar,
+    btn_toolbar,
+)
 
 DISPLAY_WIDTH = 520
 # 未読込時のプレースホルダ（Flet Image は src か src_base64 が必須）
@@ -85,9 +96,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     )
     view_mode = ft.RadioGroup(
         content=ft.Row([
-            ft.Radio(value="work", label="作業"),
-            ft.Radio(value="gif", label="GIF"),
-            ft.Radio(value="graph", label="グラフ"),
+            ft.Radio(value="work", label="作業", label_style=ft.TextStyle(color=T.TEXT)),
+            ft.Radio(value="gif", label="GIF", label_style=ft.TextStyle(color=T.TEXT)),
+            ft.Radio(value="graph", label="グラフ", label_style=ft.TextStyle(color=T.TEXT)),
         ]),
         value=state.view_mode,
         visible=False,
@@ -99,6 +110,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     disp_scale = {"v": 1.0}
     disp_size = {"w": DISPLAY_WIDTH, "h": 200}
     drag = {"active": False, "start": (0.0, 0.0)}
+    erase_state = {"pressing": False, "preview_mask": None, "changed": False}
 
     def _to_img_xy(local_x: float, local_y: float) -> tuple[float, float]:
         h, w = state.img_gray.shape
@@ -106,10 +118,52 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         oy = max(0.0, min(h - 1, local_y / disp_scale["v"]))
         return ox, oy
 
+    def _display_mask() -> np.ndarray:
+        if erase_state["preview_mask"] is not None:
+            return erase_state["preview_mask"]
+        if state.mask is not None:
+            return state.mask
+        return np.zeros_like(state.img_gray) if state.img_gray is not None else np.array([])
+
+    def _mask_style() -> str:
+        if state.mode in ("seg_review", "seg_erase"):
+            return "blend"
+        return "solid"
+
     def _overlay_disc_pts() -> list[tuple[float, float]] | None:
         if state.mode in ("disc_line", "disc_confirm") and len(state.disc_draft_pts) == 2:
             return state.disc_draft_pts
         return state.disc_pts or None
+
+    def _build_rgb_frame(self_mask: np.ndarray | None = None) -> np.ndarray:
+        """表示用 RGB フレームを生成（erase プレビュー用に mask を差し替え可能）。"""
+        mask = self_mask if self_mask is not None else _display_mask()
+        stats = state.stats
+        return make_overlay(
+            state.img_gray,
+            mask,
+            fovea_xy=state.fovea_xy,
+            nearest_xy=stats["nearest_xy"] if stats else None,
+            disc_pts=_overlay_disc_pts(),
+            disc_diameter_um=state.disc_diameter_um,
+            crop_pts=state.crop_pts if state.mode in ("crop_drag", "crop_confirm") else None,
+            show_macula=state.stats is not None and state.mode not in ("seg_review", "seg_erase"),
+            scale_um_px=state.scale_um_px,
+            mask_style=_mask_style(),
+        )
+
+    def _push_image_rgb(rgb: np.ndarray, *, do_update: bool = True, jpeg_quality: int = 85) -> None:
+        h, w = rgb.shape[:2]
+        disp_scale["v"] = DISPLAY_WIDTH / w
+        disp_h = int(h * disp_scale["v"])
+        disp = cv2.resize(rgb, (DISPLAY_WIDTH, disp_h))
+        disp_size["h"] = disp_h
+        img_ctrl.width = DISPLAY_WIDTH
+        img_ctrl.height = disp_h
+        gesture_stack.height = disp_h
+        img_ctrl.src_base64 = _b64_jpeg(disp, quality=jpeg_quality)
+        if do_update:
+            page.update()
 
     def load_image_at(idx: int) -> None:
         if not state.files:
@@ -144,37 +198,14 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         graph_area.visible = False
 
         if state.series_results and state.view_mode == "work":
-            row = state.series_results[state.series_time_idx]
             rgb = state.series_overlays[state.series_time_idx]
-            h, w = rgb.shape[:2]
         elif state.img_gray is not None:
-            stats = state.stats
-            rgb = make_overlay(
-                state.img_gray,
-                state.mask if state.mask is not None else np.zeros_like(state.img_gray),
-                fovea_xy=state.fovea_xy,
-                nearest_xy=stats["nearest_xy"] if stats else None,
-                disc_pts=_overlay_disc_pts(),
-                disc_diameter_um=state.disc_diameter_um,
-                crop_pts=state.crop_pts if state.mode in ("crop_drag", "crop_confirm") else None,
-                show_macula=state.mask is not None,
-                scale_um_px=state.scale_um_px,
-            )
-            h, w = state.img_gray.shape[:2]
+            rgb = _build_rgb_frame()
         else:
             img_ctrl.src_base64 = EMPTY_PX
             return
 
-        disp_scale["v"] = DISPLAY_WIDTH / w
-        disp_h = int(h * disp_scale["v"])
-        disp = cv2.resize(rgb, (DISPLAY_WIDTH, disp_h))
-        disp_size["h"] = disp_h
-        img_ctrl.width = DISPLAY_WIDTH
-        img_ctrl.height = disp_h
-        gesture_stack.height = disp_h
-        img_ctrl.src_base64 = _b64_jpeg(disp)
-        if do_update:
-            page.update()
+        _push_image_rgb(rgb, do_update=do_update)
 
     def _refresh_graph() -> None:
         graph_area.controls.clear()
@@ -256,6 +287,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             "disc_line": "乳頭計測: 乳頭の両端を結ぶ直線をドラッグ",
             "disc_confirm": "直線を確認して OK または やり直し",
             "fovea": "中心窩をタップ",
+            "seg_review": "セグメンテーション確認 — Erase で修正、✓ OK で確定",
+            "seg_erase": "長押しで削除（複数箇所可）— ✓ OK で確定",
         }
         hint.value = msgs.get(state.mode or "", "")
         hint.color = T.PRIMARY if state.mode else T.TEXT_MUTED
@@ -290,7 +323,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     file_dd.on_change = on_file_change
 
     def on_pan_start(e: ft.DragStartEvent) -> None:
-        if state.img_gray is None:
+        if state.img_gray is None or state.mode in ("seg_review", "seg_erase"):
             return
         if state.mode == "disc_line":
             drag["active"] = True
@@ -347,8 +380,52 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         refresh_image()
         page.update()
 
+    async def continuous_erase(ix: int, iy: int) -> None:
+        """長押し中、パワー拡大に合わせて半透明マスクを毎フレーム更新。"""
+        a_power = 0.5
+        while erase_state["pressing"]:
+            if state.img_gray is None or state.mask is None:
+                break
+            preview, removed = erase_oversegmentation_from_mask(
+                state.img_gray, state.mask, (ix, iy), a_power,
+            )
+            erase_state["preview_mask"] = preview
+            if removed > 0:
+                erase_state["changed"] = True
+            rgb = _build_rgb_frame(preview)
+            _push_image_rgb(rgb, do_update=True, jpeg_quality=72)
+            status.value = (
+                f"Erase中… パワー {a_power:.1f}（削除 {removed}px）"
+                if removed else f"Erase中… パワー {a_power:.1f}（明るい縁へ拡大中）"
+            )
+            a_power = min(6.0, a_power + 0.2)
+            await asyncio.sleep(0.04)
+
     def on_tap_down(e: ft.TapEvent) -> None:
-        if state.img_gray is None or state.mode != "fovea":
+        if state.img_gray is None:
+            return
+        if state.mode == "seg_erase":
+            ox, oy = _to_img_xy(e.local_x, e.local_y)
+            ix, iy = int(ox), int(oy)
+            erase_state["pressing"] = True
+            erase_state["preview_mask"] = None
+            erase_state["changed"] = False
+            erase_state["seed"] = (ix, iy)
+            status.value = "Erase中…（元画像の明るさで判定）"
+            preview, removed = erase_oversegmentation_from_mask(
+                state.img_gray, state.mask, (ix, iy), 0.5,
+            )
+            erase_state["preview_mask"] = preview
+            if removed > 0:
+                erase_state["changed"] = True
+                _push_image_rgb(_build_rgb_frame(preview), do_update=True, jpeg_quality=72)
+
+            async def _run() -> None:
+                await continuous_erase(ix, iy)
+
+            page.run_task(_run)
+            return
+        if state.mode != "fovea":
             return
         ox, oy = _to_img_xy(e.local_x, e.local_y)
         state.fovea_xy = (ox, oy)
@@ -361,6 +438,23 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         update_confirm_visibility()
         refresh_image()
         refresh_results()
+        page.update()
+
+    def on_tap_up(_e: ft.TapEvent) -> None:
+        if state.mode != "seg_erase":
+            return
+        erase_state["pressing"] = False
+        if erase_state["changed"] and erase_state["preview_mask"] is not None:
+            state.mask = erase_state["preview_mask"].copy()
+            status.value = "削除を適用 — 続けて別の箇所を長押し、または ✓ OK"
+            state.mode = "seg_erase"
+        else:
+            status.value = "変化なし — 別の箇所を長押しするか ✓ OK で確定"
+        erase_state["preview_mask"] = None
+        erase_state["changed"] = False
+        refresh_hint()
+        update_confirm_visibility()
+        refresh_image()
         page.update()
 
     def on_disc_ok(_=None) -> None:
@@ -460,10 +554,43 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             status.value = "画像を読み込んでください"
         else:
             state.mask = segmentation.segment_ga(state.img_gray)
-            state.stats = ga_stats(state.mask, state.scale_um_px, state.fovea_xy)
-            status.value = "解析完了"
+            state.stats = None
+            state.mode = "seg_review"
+            erase_state["pressing"] = False
+            erase_state["preview_mask"] = None
+            status.value = "セグメンテーション完了 — Erase で修正（複数可）、✓ OK で確定"
+        refresh_hint()
+        update_confirm_visibility()
         refresh_image()
         refresh_results()
+        page.update()
+
+    def on_seg_ok(_=None) -> None:
+        if state.mask is None:
+            status.value = "マスクがありません"
+            page.update()
+            return
+        erase_state["pressing"] = False
+        erase_state["preview_mask"] = None
+        erase_state["changed"] = False
+        state.stats = ga_stats(state.mask, state.scale_um_px, state.fovea_xy)
+        state.mode = None
+        status.value = "解析完了"
+        refresh_hint()
+        update_confirm_visibility()
+        refresh_image()
+        refresh_results()
+        page.update()
+
+    def on_seg_erase_click(_=None) -> None:
+        if state.mask is None:
+            status.value = "先に解析を実行してください"
+            page.update()
+            return
+        state.mode = "seg_erase"
+        status.value = "長押しで削除（複数箇所可）— ✓ OK で確定"
+        refresh_hint()
+        update_confirm_visibility()
         page.update()
 
     def on_series(_=None) -> None:
@@ -554,53 +681,64 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         on_pan_update=on_pan_update,
         on_pan_end=on_pan_end,
         on_tap_down=on_tap_down,
+        on_tap_up=on_tap_up,
         mouse_cursor=ft.MouseCursor.PRECISE,
     )
 
     toolbar = ft.Row(
         [
-            ft.ElevatedButton("⓪ クロップ", on_click=lambda _: set_mode("crop_drag")),
-            ft.ElevatedButton("① 乳頭", on_click=lambda _: set_mode("disc_line")),
-            ft.ElevatedButton("② 中心窩", on_click=lambda _: set_mode("fovea")),
-            ft.ElevatedButton("③ 解析", on_click=on_analyze, bgcolor=T.PRIMARY, color="#000"),
-            ft.ElevatedButton("④ 時系列", on_click=on_series),
+            btn_toolbar("⓪ クロップ", on_click=lambda _: set_mode("crop_drag")),
+            btn_toolbar("① 乳頭", on_click=lambda _: set_mode("disc_line")),
+            btn_toolbar("② 中心窩", on_click=lambda _: set_mode("fovea")),
+            btn_primary("③ 解析", on_click=on_analyze),
+            btn_toolbar("④ 時系列", on_click=on_series),
         ],
         wrap=True,
         spacing=8,
     )
 
     def update_confirm_visibility() -> None:
-        cancel_row.visible = state.mode in ("disc_line", "crop_drag", "fovea")
+        cancel_row.visible = state.mode in (
+            "disc_line", "crop_drag", "fovea", "seg_review", "seg_erase",
+        )
         disc_confirm_row.visible = state.mode == "disc_confirm"
         crop_confirm_row.visible = state.mode == "crop_confirm"
+        seg_confirm_row.visible = state.mode in ("seg_review", "seg_erase")
 
     def on_cancel(_=None) -> None:
-        state.cancel_mode()
+        if state.mode in ("seg_review", "seg_erase"):
+            state.mask = None
+            state.stats = None
+            erase_state["pressing"] = False
+            erase_state["preview_mask"] = None
+            state.mode = None
+        else:
+            state.cancel_mode()
         drag["active"] = False
         status.value = ""
         refresh_hint()
         update_confirm_visibility()
         refresh_image()
+        refresh_results()
         page.update()
 
     cancel_row = ft.Row([
-        ft.OutlinedButton("✕ キャンセル", on_click=on_cancel),
+        btn_outlined("✕ キャンセル", on_click=on_cancel),
     ], visible=False)
 
     disc_confirm_row = ft.Row([
-        ft.ElevatedButton(
-            "✓ OK", on_click=on_disc_ok,
-            bgcolor="#10B981", color="#000",
-        ),
-        ft.OutlinedButton("↩ やり直し", on_click=on_disc_redo),
+        btn_ok("✓ OK", on_click=on_disc_ok),
+        btn_outlined("↩ やり直し", on_click=on_disc_redo),
     ], visible=False)
 
     crop_confirm_row = ft.Row([
-        ft.ElevatedButton(
-            "✓ OK", on_click=on_crop_ok,
-            bgcolor="#10B981", color="#000",
-        ),
-        ft.OutlinedButton("↩ やり直し", on_click=on_crop_redo),
+        btn_ok("✓ OK", on_click=on_crop_ok),
+        btn_outlined("↩ やり直し", on_click=on_crop_redo),
+    ], visible=False)
+
+    seg_confirm_row = ft.Row([
+        btn_ok("✓ OK", on_click=on_seg_ok),
+        btn_erase("Erase 白領域（長押し）", on_click=on_seg_erase_click),
     ], visible=False)
 
     left = ft.Column(
@@ -611,6 +749,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             cancel_row,
             disc_confirm_row,
             crop_confirm_row,
+            seg_confirm_row,
             hint,
             status,
             view_mode,
@@ -627,7 +766,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             ft.Text("フォルダ", weight=ft.FontWeight.BOLD, color=T.PRIMARY),
             ft.Row([input_field, ft.IconButton(ft.Icons.FOLDER_OPEN, on_click=on_pick_folder, tooltip="フォルダ選択")]),
             output_field,
-            ft.ElevatedButton("画像リストを読込", on_click=on_load_files, expand=True),
+            btn_sidebar("画像リストを読込", on_click=on_load_files, expand=True),
             file_dd,
             ft.Divider(color="#374151"),
             disc_field,

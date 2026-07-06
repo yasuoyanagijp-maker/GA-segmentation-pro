@@ -15,7 +15,7 @@ class GAAppState:
     files: list[Path] = field(default_factory=list)
     file_idx: int = 0
 
-    mode: str | None = None  # disc_line | disc_confirm | crop_drag | crop_confirm | fovea
+    mode: str | None = None  # disc_line | disc_confirm | crop_drag | crop_confirm | fovea | seg_review | seg_erase
     disc_pts: list[tuple[float, float]] = field(default_factory=list)
     disc_draft_pts: list[tuple[float, float]] = field(default_factory=list)
     fovea_xy: tuple[float, float] | None = None
@@ -61,6 +61,9 @@ class GAAppState:
             self.disc_draft_pts = []
         elif self.mode in ("crop_drag", "crop_confirm"):
             self.crop_pts = []
+        elif self.mode in ("seg_review", "seg_erase"):
+            self.mask = None
+            self.stats = None
         self.mode = None
 
     def restart_disc(self) -> None:

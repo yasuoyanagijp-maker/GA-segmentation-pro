@@ -7,11 +7,13 @@ import flet as ft
 from flet_ui.main_view import build_main_view
 from flet_ui.state import GAAppState
 from flet_ui import theme as T
+from flet_ui.theme import apply_page_theme
 
 
 async def main(page: ft.Page) -> None:
     page.title = "GA Segmentation Pro"
     page.theme_mode = ft.ThemeMode.DARK
+    apply_page_theme(page)
     page.bgcolor = T.BG_DARK
     page.padding = 16
     page.spacing = 0
