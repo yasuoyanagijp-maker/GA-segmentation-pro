@@ -1,10 +1,13 @@
 import numpy as np
+import pytest
 from datetime import date
 from pathlib import Path
 
 from engine.registration import register_stack
 from engine.timeseries import (
     estimate_progression_rate_um_per_year,
+    estimate_growth_mm2_per_year,
+    estimate_growth_mm_sqrt_per_year,
     guess_image_date,
     overlays_to_gif_bytes,
     resize_to_reference,
@@ -39,6 +42,17 @@ def test_estimate_progression_rate_positive():
     rate = estimate_progression_rate_um_per_year(results)
     assert rate is not None
     assert rate > 0
+
+
+def test_estimate_growth_rates():
+    results = [
+        {'date': '2020-01-01', 'stats': {'area_mm2': 1.0, 'area_mm_sqrt': 1.0}},
+        {'date': '2021-01-01', 'stats': {'area_mm2': 1.5, 'area_mm_sqrt': 1.22}},
+    ]
+    mm2_rate = estimate_growth_mm2_per_year(results)
+    sqrt_rate = estimate_growth_mm_sqrt_per_year(results)
+    assert mm2_rate == pytest.approx(0.5, abs=0.01)
+    assert sqrt_rate == pytest.approx(0.22, abs=0.01)
 
 
 def test_overlays_to_gif_bytes():

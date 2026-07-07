@@ -33,4 +33,16 @@ def test_ga_stats_empty_mask():
     mask = np.zeros((10, 10), dtype=np.uint8)
     result = ga_stats(mask, scale_um_px=1.0, fovea_xy=(5, 5))
     assert result['area_px'] == 0
+    assert result['area_mm_sqrt'] == 0.0
     assert result['dist_um'] is None
+
+
+def test_ga_stats_sqrt_transformed_area():
+    mask = np.zeros((100, 100), dtype=np.uint8)
+    mask[0:10, 0:10] = 255  # 100 px
+
+    result = ga_stats(mask, scale_um_px=100.0, fovea_xy=None)
+
+    assert result['area_px'] == 100
+    assert result['area_mm2'] == pytest.approx(1.0)
+    assert result['area_mm_sqrt'] == pytest.approx(1.0)

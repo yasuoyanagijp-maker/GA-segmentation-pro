@@ -62,28 +62,17 @@ def make_overlay(img_gray: np.ndarray, mask: np.ndarray,
         cv2.line(rgb, (fx, fy + r), (fx, fy + 18), (34, 211, 238), 1)
         cv2.circle(rgb, (fx, fy), 2, (34, 211, 238), -1)
 
-    # Disc measurement points and line
+    # Disc measurement points and line (no on-image text; UI shows metrics)
     amber = (251, 191, 36)
-    font = cv2.FONT_HERSHEY_SIMPLEX
     if disc_pts and len(disc_pts) >= 1:
         p1 = (int(disc_pts[0][0]), int(disc_pts[0][1]))
         cv2.circle(rgb, p1, 7, amber, -1)
         cv2.circle(rgb, p1, 9, amber, 1)
-        cv2.putText(rgb, "1", (p1[0]+10, p1[1]-8), font, 0.55, amber, 1, cv2.LINE_AA)
     if disc_pts and len(disc_pts) == 2:
         p2 = (int(disc_pts[1][0]), int(disc_pts[1][1]))
         cv2.circle(rgb, p2, 7, amber, -1)
         cv2.circle(rgb, p2, 9, amber, 1)
-        cv2.putText(rgb, "2", (p2[0]+10, p2[1]-8), font, 0.55, amber, 1, cv2.LINE_AA)
         cv2.line(rgb, p1, p2, amber, 2)
-        # midpoint label: px distance
-        d_px = np.sqrt((p2[0]-p1[0])**2 + (p2[1]-p1[1])**2)
-        mx = (p1[0]+p2[0])//2
-        my = (p1[1]+p2[1])//2 - 10
-        label = f"{d_px:.0f}px = {disc_diameter_um:.0f}um"
-        (tw, th), _ = cv2.getTextSize(label, font, 0.45, 1)
-        cv2.rectangle(rgb, (mx-3, my-th-3), (mx+tw+3, my+3), (0, 0, 0), -1)
-        cv2.putText(rgb, label, (mx, my), font, 0.45, amber, 1, cv2.LINE_AA)
 
     if crop_box is not None:
         x0, y0, x1, y1 = crop_box

@@ -107,16 +107,23 @@ def analyze_time_series(
     return results
 
 
-def estimate_progression_rate_um_per_year(results: list[dict]) -> float | None:
-    """中心窩距離の時系列から進行速度（μm/年）を線形回帰で推定。"""
-    pts = []
+def _slope_per_year_from_results(
+    results: list[dict],
+    getter,
+) -> float | None:
+    """基準日（先頭時点）からの経過年数に対する線形回帰の傾きを返す。"""
+    if len(results) < 2:
+        return None
+
+    d0 = datetime.fromisoformat(results[0]['date']).date()
+    pts: list[tuple[float, float]] = []
     for row in results:
-        if row['stats']['dist_um'] is None:
+        y = getter(row)
+        if y is None:
             continue
-        d0 = datetime.fromisoformat(results[0]['date']).date()
         d1 = datetime.fromisoformat(row['date']).date()
         years = (d1 - d0).days / 365.25
-        pts.append((years, float(row['stats']['dist_um'])))
+        pts.append((years, float(y)))
 
     if len(pts) < 2:
         return None
@@ -127,8 +134,38 @@ def estimate_progression_rate_um_per_year(results: list[dict]) -> float | None:
         return None
 
     slope, _ = np.polyfit(xs, ys, 1)
+    return float(slope)
+
+
+def estimate_progression_rate_um_per_year(results: list[dict]) -> float | None:
+    """中心窩距離の時系列から進行速度（μm/年）を線形回帰で推定。"""
+    slope = _slope_per_year_from_results(
+        results, lambda r: r['stats']['dist_um'],
+    )
+    if slope is None:
+        return None
     # 距離が縮む（進行）方向を正にする
-    return round(abs(float(slope)), 1)
+    return round(abs(slope), 1)
+
+
+def estimate_growth_mm2_per_year(results: list[dict]) -> float | None:
+    """GA面積の時系列から拡大速度（mm²/年）を線形回帰で推定。"""
+    slope = _slope_per_year_from_results(
+        results, lambda r: r['stats']['area_mm2'],
+    )
+    if slope is None:
+        return None
+    return round(slope, 3)
+
+
+def estimate_growth_mm_sqrt_per_year(results: list[dict]) -> float | None:
+    """√変換GA面積の時系列から拡大速度（mm/年, SQRT scale）を線形回帰で推定。"""
+    slope = _slope_per_year_from_results(
+        results, lambda r: r['stats']['area_mm_sqrt'],
+    )
+    if slope is None:
+        return None
+    return round(slope, 2)
 
 
 def overlays_to_gif_bytes(overlays: list[np.ndarray], duration_ms: int = 600) -> bytes:

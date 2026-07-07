@@ -15,7 +15,10 @@ class GAAppState:
     files: list[Path] = field(default_factory=list)
     file_idx: int = 0
 
-    mode: str | None = None  # disc_line | disc_confirm | crop_drag | crop_confirm | fovea | seg_review | seg_erase
+    mode: str | None = None  # disc_line | disc_confirm | width_cal | crop_drag | crop_confirm | fovea | seg_review | seg_erase
+    image_modality: str = "optos"  # optos | hra
+    calibration_source: str | None = None  # disc | width
+    field_width_mm: float | None = None
     disc_pts: list[tuple[float, float]] = field(default_factory=list)
     disc_draft_pts: list[tuple[float, float]] = field(default_factory=list)
     fovea_xy: tuple[float, float] | None = None
@@ -40,6 +43,8 @@ class GAAppState:
     series_gif: bytes | None = None
     series_time_idx: int = 0
     estimated_prog: float | None = None
+    estimated_growth_mm2_per_year: float | None = None
+    estimated_growth_mm_sqrt_per_year: float | None = None
     view_mode: str = "work"  # work | gif | graph
 
     def reset_analysis(self, *, keep_series: bool = False) -> None:
@@ -47,6 +52,7 @@ class GAAppState:
         self.disc_pts = []
         self.fovea_xy = None
         self.scale_um_px = None
+        self.calibration_source = None
         self.mask = None
         self.stats = None
         if not keep_series:
@@ -54,6 +60,8 @@ class GAAppState:
             self.series_overlays = None
             self.series_gif = None
             self.estimated_prog = None
+            self.estimated_growth_mm2_per_year = None
+            self.estimated_growth_mm_sqrt_per_year = None
 
     def cancel_mode(self) -> None:
         if self.mode in ("disc_line", "disc_confirm"):
@@ -61,6 +69,8 @@ class GAAppState:
             self.disc_draft_pts = []
         elif self.mode in ("crop_drag", "crop_confirm"):
             self.crop_pts = []
+        elif self.mode == "width_cal":
+            pass
         elif self.mode in ("seg_review", "seg_erase"):
             self.mask = None
             self.stats = None
@@ -70,4 +80,5 @@ class GAAppState:
         self.disc_pts = []
         self.disc_draft_pts = []
         self.scale_um_px = None
+        self.calibration_source = None
         self.mode = "disc_line"

@@ -1,5 +1,7 @@
 """stats.py – GA面積・中心窩距離などの計測値算出。"""
 
+import math
+
 import numpy as np
 from skimage.measure import label, regionprops
 
@@ -70,6 +72,7 @@ def ga_stats(mask: np.ndarray, scale_um_px: float,
     return {
         'area_px': area_px,
         'area_mm2': round(area_mm2, 3),
+        'area_mm_sqrt': round(math.sqrt(area_mm2), 2) if area_mm2 > 0 else 0.0,
         'dist_um': dist_um,
         'nearest_xy': nearest_xy,
         'lesions': lesions,

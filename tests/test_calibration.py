@@ -1,6 +1,9 @@
 import pytest
 
-from engine.calibration import compute_scale_um_per_px
+from engine.calibration import (
+    compute_scale_um_per_px,
+    compute_scale_um_per_px_from_field_width,
+)
 
 
 def test_compute_scale_basic():
@@ -17,3 +20,11 @@ def test_compute_scale_diagonal():
 def test_compute_scale_same_point_raises():
     with pytest.raises(ValueError):
         compute_scale_um_per_px((10, 10), (10, 10))
+
+
+def test_compute_scale_from_field_width():
+    scale = compute_scale_um_per_px_from_field_width(1000, 30.0)
+    assert scale == pytest.approx(30.0)
+
+    with pytest.raises(ValueError):
+        compute_scale_um_per_px_from_field_width(0, 30.0)

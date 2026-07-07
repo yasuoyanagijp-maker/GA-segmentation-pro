@@ -22,3 +22,13 @@ def compute_scale_um_per_px(p1: tuple[float, float],
     if d_px <= 0:
         raise ValueError("2点が同一座標のためスケールを算出できません")
     return disc_diameter_um / d_px
+
+
+def compute_scale_um_per_px_from_field_width(image_width_px: float,
+                                              field_width_mm: float) -> float:
+    """画像幅(px)と実長(mm)から um/px スケールを算出する（HRA 等、乳頭非表示時）。"""
+    if image_width_px <= 0:
+        raise ValueError("画像幅(px)が不正です")
+    if field_width_mm <= 0:
+        raise ValueError("画像幅(mm)は正の値を指定してください")
+    return field_width_mm * 1000.0 / image_width_px

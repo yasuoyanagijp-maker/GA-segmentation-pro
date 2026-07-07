@@ -20,6 +20,8 @@ from engine.region_growing import erase_oversegmentation_from_mask
 from engine.stats import ga_stats
 from engine.timeseries import (
     analyze_time_series,
+    estimate_growth_mm2_per_year,
+    estimate_growth_mm_sqrt_per_year,
     estimate_progression_rate_um_per_year,
     guess_image_date,
     overlays_to_gif_bytes,
@@ -65,6 +67,76 @@ def _card(label: str, value: str, color: str = T.TEXT) -> ft.Container:
     )
 
 
+def _ga_area_card(stats: dict | None) -> ft.Container:
+    """Raw mm² and square-root–transformed mm shown side-by-side (cohort baseline style)."""
+    if not stats:
+        return _card("GA Area", "—", T.ACCENT_RED)
+    return ft.Container(
+        content=ft.Column(
+            [
+                ft.Text("GA Area", size=12, color=T.TEXT_MUTED),
+                ft.Row(
+                    [
+                        ft.Text(
+                            f"{stats['area_mm2']} mm²",
+                            size=20,
+                            weight=ft.FontWeight.W_600,
+                            color=T.ACCENT_RED,
+                        ),
+                        ft.Text(
+                            f"{stats['area_mm_sqrt']} mm [SQRT]",
+                            size=20,
+                            weight=ft.FontWeight.W_600,
+                            color=T.ACCENT_RED,
+                        ),
+                    ],
+                    spacing=16,
+                    wrap=True,
+                ),
+            ],
+            spacing=2,
+        ),
+        bgcolor=T.PANEL_BG,
+        border=ft.border.all(1, "#374151"),
+        border_radius=10,
+        padding=ft.padding.symmetric(horizontal=16, vertical=12),
+    )
+
+
+def _growth_card(mm2_per_year: float | None, mm_sqrt_per_year: float | None) -> ft.Container:
+    """Raw mm²/year and square-root–transformed mm/year shown side-by-side."""
+    if mm2_per_year is None and mm_sqrt_per_year is None:
+        return _card("GA Growth", "—", T.ACCENT_AMBER)
+    parts: list[ft.Control] = []
+    if mm2_per_year is not None:
+        parts.append(ft.Text(
+            f"{mm2_per_year} mm²/year",
+            size=20,
+            weight=ft.FontWeight.W_600,
+            color=T.ACCENT_AMBER,
+        ))
+    if mm_sqrt_per_year is not None:
+        parts.append(ft.Text(
+            f"{mm_sqrt_per_year} mm/year [SQRT]",
+            size=20,
+            weight=ft.FontWeight.W_600,
+            color=T.ACCENT_AMBER,
+        ))
+    return ft.Container(
+        content=ft.Column(
+            [
+                ft.Text("GA Growth", size=12, color=T.TEXT_MUTED),
+                ft.Row(parts, spacing=16, wrap=True),
+            ],
+            spacing=2,
+        ),
+        bgcolor=T.PANEL_BG,
+        border=ft.border.all(1, "#374151"),
+        border_radius=10,
+        padding=ft.padding.symmetric(horizontal=16, vertical=12),
+    )
+
+
 async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     status = ft.Text("", color=T.ACCENT_AMBER, size=13)
     hint = ft.Text("", color=T.TEXT_MUTED, size=13)
@@ -90,6 +162,23 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         label="乳頭径 (μm)", value=str(int(state.disc_diameter_um)), width=140,
         keyboard_type=ft.KeyboardType.NUMBER,
     )
+    field_width_field = ft.TextField(
+        label="画像幅 (mm)", value="", width=180,
+        keyboard_type=ft.KeyboardType.NUMBER,
+        hint_text="例: 55",
+    )
+    image_width_label = ft.Text("", size=11, color=T.TEXT_MUTED)
+    scale_info = ft.Text("", size=11, color=T.TEXT_MUTED)
+    disc_info = ft.Text("", size=11, color=T.ACCENT_AMBER)
+    modality_dd = ft.Dropdown(
+        label="画像モダリティ",
+        width=320,
+        options=[
+            ft.dropdown.Option(key="optos", text="Optos"),
+            ft.dropdown.Option(key="hra", text="HRA (Spectralis)"),
+        ],
+        value=state.image_modality,
+    )
     prog_field = ft.TextField(
         label="進行速度 (μm/年)", value=str(int(state.prog)), width=160,
         keyboard_type=ft.KeyboardType.NUMBER,
@@ -111,6 +200,37 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     disp_size = {"w": DISPLAY_WIDTH, "h": 200}
     drag = {"active": False, "start": (0.0, 0.0)}
     erase_state = {"pressing": False, "preview_mask": None, "changed": False}
+
+    def _refresh_scale_info() -> None:
+        if state.scale_um_px is None:
+            scale_info.value = ""
+            return
+        src = "乳頭" if state.calibration_source == "disc" else "幅指定"
+        scale_info.value = f"スケール ({src}): {state.scale_um_px:.2f} μm/px"
+
+    def _update_disc_info() -> None:
+        pts = state.disc_draft_pts if state.mode in ("disc_line", "disc_confirm") else state.disc_pts
+        if len(pts) != 2:
+            disc_info.value = ""
+            return
+        p1, p2 = pts
+        d_px = ((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2) ** 0.5
+        try:
+            disc_um = float(disc_field.value or state.disc_diameter_um)
+        except ValueError:
+            disc_um = state.disc_diameter_um
+        if d_px > 0:
+            preview = disc_um / d_px
+            disc_info.value = f"乳頭計測: {d_px:.0f} px = {disc_um:.0f} μm ({preview:.2f} μm/px)"
+        else:
+            disc_info.value = ""
+
+    def _refresh_image_width_label() -> None:
+        if state.img_gray is None:
+            image_width_label.value = ""
+            return
+        _, w = state.img_gray.shape
+        image_width_label.value = f"現在の画像: {w} px（水平幅）"
 
     def _to_img_xy(local_x: float, local_y: float) -> tuple[float, float]:
         h, w = state.img_gray.shape
@@ -176,6 +296,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.crop_box = None
         state.crop_pts = []
         state.reset_analysis(keep_series=True)
+        _refresh_image_width_label()
+        _refresh_scale_info()
         refresh_image()
         refresh_results()
 
@@ -218,6 +340,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 ft.DataRow(cells=[
                     ft.DataCell(ft.Text(r["date"])),
                     ft.DataCell(ft.Text(f"{s['area_mm2']}")),
+                    ft.DataCell(ft.Text(f"{s['area_mm_sqrt']}")),
                     ft.DataCell(ft.Text(f"{s['gawain']:.1f}" if s["gawain"] is not None else "—")),
                     ft.DataCell(ft.Text(
                         f"{s['dist_um']:.0f}" if s["dist_um"] is not None else "—")),
@@ -228,6 +351,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 columns=[
                     ft.DataColumn(ft.Text("Date")),
                     ft.DataColumn(ft.Text("GA mm²")),
+                    ft.DataColumn(ft.Text("GA mm [SQRT]")),
                     ft.DataColumn(ft.Text("GAWAIN")),
                     ft.DataColumn(ft.Text("Dist μm")),
                 ],
@@ -254,7 +378,11 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         cross = round(dist / prog, 1) if dist and prog > 0 else None
 
         results_col.controls.extend([
-            _card("GA Area", f"{stats['area_mm2']} mm²" if stats else "—", T.ACCENT_RED),
+            _ga_area_card(stats),
+            _growth_card(
+                state.estimated_growth_mm2_per_year if state.series_results else None,
+                state.estimated_growth_mm_sqrt_per_year if state.series_results else None,
+            ),
             _card("GAWAIN", f"{stats['gawain']:.1f}" if stats and stats.get("gawain") is not None else "—", T.ACCENT_AMBER),
             _card("Dist to fovea", f"{dist:.0f} μm" if dist is not None else "—", T.ACCENT_CYAN),
             _card("平均余命", life),
@@ -286,12 +414,15 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             "crop_confirm": "クロップ範囲を確認して OK または やり直し",
             "disc_line": "乳頭計測: 乳頭の両端を結ぶ直線をドラッグ",
             "disc_confirm": "直線を確認して OK または やり直し",
+            "width_cal": "画像の水平方向の実長 (mm) を入力して OK",
             "fovea": "中心窩をタップ",
             "seg_review": "セグメンテーション確認 — Erase で修正、✓ OK で確定",
-            "seg_erase": "長押しで削除（複数箇所可）— ✓ OK で確定",
+            "seg_erase": "長押しで削除（緑の内外どちらでも可）— ✓ OK で確定",
         }
         hint.value = msgs.get(state.mode or "", "")
-        hint.color = T.PRIMARY if state.mode else T.TEXT_MUTED
+        if not state.mode and modality_dd.value == "hra" and state.scale_um_px is None:
+            hint.value = "HRA: 乳頭が見えない場合は「幅指定」でスケール設定"
+        hint.color = T.PRIMARY if state.mode or hint.value else T.TEXT_MUTED
 
     def on_load_files(_=None) -> None:
         state.input_dir = input_field.value.strip()
@@ -345,6 +476,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             p1 = _to_img_xy(*drag["start"])
             p2 = _to_img_xy(e.local_x, e.local_y)
             state.disc_draft_pts = [p1, p2]
+            _update_disc_info()
             refresh_image()
         elif state.mode == "crop_drag":
             p1 = _to_img_xy(*drag["start"])
@@ -362,6 +494,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             if d_px >= 5:
                 state.mode = "disc_confirm"
                 status.value = f"乳頭径ライン: {d_px:.0f} px — OK で確定"
+                _update_disc_info()
             else:
                 state.disc_draft_pts = []
                 status.value = "直線が短すぎます。もう一度ドラッグしてください"
@@ -411,7 +544,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             erase_state["preview_mask"] = None
             erase_state["changed"] = False
             erase_state["seed"] = (ix, iy)
-            status.value = "Erase中…（元画像の明るさで判定）"
+            status.value = "Erase中…（緑の内外どちらでも可・元画像の明るさで判定）"
             preview, removed = erase_oversegmentation_from_mask(
                 state.img_gray, state.mask, (ix, iy), 0.5,
             )
@@ -467,6 +600,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             state.disc_pts = [p1, p2]
             state.scale_um_px = calibration.compute_scale_um_per_px(
                 p1, p2, float(disc_field.value or state.disc_diameter_um))
+            state.calibration_source = "disc"
         except ValueError as exc:
             status.value = str(exc)
             page.update()
@@ -475,6 +609,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.mode = None
         state.series_results = None
         status.value = f"乳頭計測完了: {state.scale_um_px:.2f} μm/px"
+        disc_info.value = ""
+        _refresh_scale_info()
         refresh_hint()
         update_confirm_visibility()
         refresh_image()
@@ -484,6 +620,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     def on_disc_redo(_=None) -> None:
         state.disc_draft_pts = []
         state.mode = "disc_line"
+        disc_info.value = ""
         status.value = "乳頭の直線をもう一度ドラッグしてください"
         refresh_hint()
         update_confirm_visibility()
@@ -528,6 +665,67 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         refresh_image()
         page.update()
 
+    def on_width_start(_=None) -> None:
+        if state.img_gray is None:
+            status.value = "画像を読み込んでください"
+            page.update()
+            return
+        state.mode = "width_cal"
+        if state.field_width_mm is not None:
+            field_width_field.value = str(state.field_width_mm)
+        _refresh_image_width_label()
+        status.value = ""
+        refresh_hint()
+        update_confirm_visibility()
+        page.update()
+
+    def on_width_ok(_=None) -> None:
+        if state.img_gray is None:
+            status.value = "画像を読み込んでください"
+            page.update()
+            return
+        try:
+            field_mm = float(field_width_field.value)
+            if field_mm <= 0:
+                raise ValueError
+        except ValueError:
+            status.value = "画像幅 (mm) を正しく入力してください"
+            page.update()
+            return
+        _, w_px = state.img_gray.shape
+        try:
+            state.scale_um_px = calibration.compute_scale_um_per_px_from_field_width(w_px, field_mm)
+        except ValueError as exc:
+            status.value = str(exc)
+            page.update()
+            return
+        state.calibration_source = "width"
+        state.field_width_mm = field_mm
+        state.disc_pts = []
+        state.disc_draft_pts = []
+        state.mode = None
+        state.series_results = None
+        disc_info.value = ""
+        status.value = f"幅指定完了: {w_px} px = {field_mm} mm → {state.scale_um_px:.2f} μm/px"
+        _refresh_scale_info()
+        refresh_hint()
+        update_confirm_visibility()
+        refresh_image()
+        refresh_results()
+        page.update()
+
+    def on_width_cancel(_=None) -> None:
+        state.mode = None
+        status.value = ""
+        refresh_hint()
+        update_confirm_visibility()
+        page.update()
+
+    def on_modality_change(e) -> None:
+        state.image_modality = modality_dd.value or "optos"
+        refresh_hint()
+        page.update()
+
     def set_mode(mode: str) -> None:
         state.mode = mode
         drag["active"] = False
@@ -535,6 +733,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             state.disc_pts = []
             state.disc_draft_pts = []
             state.scale_um_px = None
+            state.calibration_source = None
+            disc_info.value = ""
+            _refresh_scale_info()
             status.value = "乳頭の両端を結ぶ直線をドラッグしてください"
         elif mode == "crop_drag":
             state.crop_pts = []
@@ -547,7 +748,10 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
 
     def on_analyze(_=None) -> None:
         if state.scale_um_px is None:
-            status.value = "先に乳頭計測を完了してください"
+            if modality_dd.value == "hra":
+                status.value = "先にスケール設定（幅指定または乳頭計測）を完了してください"
+            else:
+                status.value = "先に乳頭計測を完了してください"
         elif state.fovea_xy is None:
             status.value = "先に中心窩を指定してください"
         elif state.img_gray is None:
@@ -599,7 +803,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             page.update()
             return
         if state.scale_um_px is None or state.fovea_xy is None:
-            status.value = "先に乳頭計測と中心窩指定を完了してください"
+            status.value = "先にスケール設定と中心窩指定を完了してください"
             page.update()
             return
         status.value = "時系列解析中…"
@@ -630,6 +834,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.series_overlays = overlays
         state.series_gif = overlays_to_gif_bytes(overlays)
         state.estimated_prog = estimate_progression_rate_um_per_year(results)
+        state.estimated_growth_mm2_per_year = estimate_growth_mm2_per_year(results)
+        state.estimated_growth_mm_sqrt_per_year = estimate_growth_mm_sqrt_per_year(results)
         if state.estimated_prog:
             prog_field.value = str(int(state.estimated_prog))
         view_mode.visible = True
@@ -689,6 +895,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         [
             btn_toolbar("⓪ クロップ", on_click=lambda _: set_mode("crop_drag")),
             btn_toolbar("① 乳頭", on_click=lambda _: set_mode("disc_line")),
+            btn_toolbar("①' 幅指定", on_click=on_width_start),
             btn_toolbar("② 中心窩", on_click=lambda _: set_mode("fovea")),
             btn_primary("③ 解析", on_click=on_analyze),
             btn_toolbar("④ 時系列", on_click=on_series),
@@ -703,6 +910,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         )
         disc_confirm_row.visible = state.mode == "disc_confirm"
         crop_confirm_row.visible = state.mode == "crop_confirm"
+        width_panel.visible = state.mode == "width_cal"
         seg_confirm_row.visible = state.mode in ("seg_review", "seg_erase")
 
     def on_cancel(_=None) -> None:
@@ -741,6 +949,43 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         btn_erase("Erase 白領域（長押し）", on_click=on_seg_erase_click),
     ], visible=False)
 
+    width_panel = ft.Container(
+        visible=False,
+        bgcolor=T.PANEL_BG,
+        border=ft.border.all(1, "#374151"),
+        border_radius=8,
+        padding=ft.padding.all(12),
+        content=ft.Column(
+            [
+                ft.Text("幅指定スケール", size=13, weight=ft.FontWeight.W_600, color=T.PRIMARY),
+                ft.Text(
+                    "画像の水平方向の実長 (mm) を入力してください",
+                    size=11,
+                    color=T.TEXT_MUTED,
+                ),
+                ft.Row(
+                    [
+                        field_width_field,
+                        ft.Text("mm", size=14, color=T.TEXT),
+                    ],
+                    spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.END,
+                ),
+                image_width_label,
+                ft.Row(
+                    [
+                        btn_ok("✓ OK", on_click=on_width_ok),
+                        btn_outlined("✕ キャンセル", on_click=on_width_cancel),
+                    ],
+                    spacing=8,
+                ),
+            ],
+            spacing=8,
+            tight=True,
+        ),
+    )
+    modality_dd.on_change = on_modality_change
+
     left = ft.Column(
         [
             ft.Text("GA Segmentation Pro", size=22, weight=ft.FontWeight.BOLD, color=T.PRIMARY),
@@ -749,8 +994,11 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             cancel_row,
             disc_confirm_row,
             crop_confirm_row,
+            width_panel,
             seg_confirm_row,
             hint,
+            disc_info,
+            scale_info,
             status,
             view_mode,
             series_date_dd,
@@ -769,7 +1017,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             btn_sidebar("画像リストを読込", on_click=on_load_files, expand=True),
             file_dd,
             ft.Divider(color="#374151"),
+            modality_dd,
             disc_field,
+            ft.Divider(color="#374151"),
             age_field,
             sex_dd,
             prog_field,
@@ -800,6 +1050,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
 
     refresh_hint()
     update_confirm_visibility()
+    _refresh_image_width_label()
+    _refresh_scale_info()
 
     async def _deferred_auto_load() -> None:
         import asyncio
