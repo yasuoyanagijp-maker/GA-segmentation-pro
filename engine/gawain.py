@@ -17,7 +17,17 @@ import numpy as np
 MACULA_RADIUS_MM = 3.0
 NUM_ANNULI = 60
 ANNULUS_WIDTH_MM = 0.05
+GAWAIN_FULL_NAME = "Geographic Atrophy Weighted-by-Acuity Index (GAWAIN)"
+GAWAIN_VALUE_RANGE = "[0–100]"
+GAWAIN_LABEL = f"{GAWAIN_FULL_NAME} {GAWAIN_VALUE_RANGE}"
 WEIGHTS_PATH = Path(__file__).resolve().parent.parent / 'data' / 'gawain_weights.csv'
+
+
+def format_gawain_display(gawain: float | None) -> str:
+    """GAWAIN 値とレンジを常に [] 付きで返す。"""
+    if gawain is None:
+        return f"— {GAWAIN_VALUE_RANGE}"
+    return f"{gawain:.1f} {GAWAIN_VALUE_RANGE}"
 
 
 @lru_cache(maxsize=1)

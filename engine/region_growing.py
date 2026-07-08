@@ -150,6 +150,67 @@ def erase_oversegmentation_from_mask(
     return out, removed
 
 
+def expand_segmentation_from_mask(
+    img_gray: np.ndarray,
+    mask: np.ndarray,
+    seed: tuple[int, int],
+    a: float,
+    *,
+    window_size: int = 11,
+) -> tuple[np.ndarray, int]:
+    """FAF 向け: 暗い GA 領域をマスクに追加（erase の逆操作）。
+
+    緑の内外どちらでも、暗部を長押しで連結拡大しマスクに加える。
+    戻り値: (新マスク, 追加画素数)
+    """
+    gray = _to_gray(img_gray)
+    x, y = int(seed[0]), int(seed[1])
+    h, w = gray.shape[:2]
+    if x < 0 or x >= w or y < 0 or y >= h:
+        return mask, 0
+
+    seed_val = float(gray[y, x])
+    mu, sigma = _local_stats(gray, x, y, window_size)
+
+    if seed_val > mu + 0.25 * sigma:
+        return mask, 0
+
+    grown = fast_region_growing(img_gray, (x, y), a, window_size=window_size)
+    if not np.any(grown):
+        return mask, 0
+
+    add = (grown > 0) & (mask == 0)
+    added = int(np.sum(add))
+    if added == 0:
+        return mask, 0
+
+    out = mask.copy()
+    out[add] = 255
+    return out, added
+
+
+def clear_mask_in_freehand_region(
+    mask: np.ndarray,
+    points: list[tuple[float, float]],
+) -> tuple[np.ndarray, int]:
+    """フリーハンドで囲んだ領域内のマスク画素を消去する。"""
+    h, w = mask.shape[:2]
+    if len(points) < 3:
+        return mask, 0
+    pts = np.array([[int(x), int(y)] for x, y in points], dtype=np.int32)
+    pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
+    pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
+    region = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(region, [pts], 255)
+    remove = (mask > 0) & (region > 0)
+    removed = int(np.sum(remove))
+    if removed == 0:
+        return mask, 0
+    out = mask.copy()
+    out[remove] = 0
+    return out, removed
+
+
 # 後方互換
 def erase_bright_from_mask(
     img_gray: np.ndarray,

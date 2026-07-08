@@ -168,6 +168,57 @@ def estimate_growth_mm_sqrt_per_year(results: list[dict]) -> float | None:
     return round(slope, 2)
 
 
+def build_series_from_saved(
+    per_file: dict[str, dict],
+    files: list[Path],
+    series_dates: dict[str, str],
+    *,
+    register: bool = True,
+) -> list[dict]:
+    """メモリ上の個別解析結果から時系列表示用データを構築（再セグメントなし）。"""
+    from engine.registration import apply_transformations_to_stack, register_stack
+
+    ordered = sorted(
+        [f for f in files if f.name in per_file],
+        key=lambda f: series_dates.get(f.name, ""),
+    )
+    if len(ordered) < 2:
+        raise ValueError("確定済み画像が2枚未満です")
+
+    snapshots = [per_file[f.name] for f in ordered]
+    images = resize_to_reference([s["image"] for s in snapshots])
+    masks = resize_to_reference([s["mask"] for s in snapshots])
+    img_stack = np.stack(images, axis=0)
+    mask_stack = np.stack(masks, axis=0)
+
+    if register and len(images) > 1:
+        img_stack, matrices = register_stack(img_stack)
+        mask_stack = apply_transformations_to_stack(mask_stack, matrices)
+
+    results: list[dict] = []
+    for i, (snap, f) in enumerate(zip(snapshots, ordered)):
+        img = img_stack[i]
+        mask = mask_stack[i]
+        scale = snap.get("scale_um_px")
+        fovea = snap.get("fovea_xy")
+        if scale and fovea:
+            stats = ga_stats(mask, scale, fovea)
+        else:
+            stats = snap["stats"]
+        results.append({
+            "index": i,
+            "path": snap["path"],
+            "filename": f.name,
+            "date": snap["date"],
+            "image": img,
+            "mask": mask,
+            "stats": stats,
+            "fovea_xy": fovea,
+            "scale_um_px": scale,
+        })
+    return results
+
+
 def overlays_to_gif_bytes(overlays: list[np.ndarray], duration_ms: int = 600) -> bytes:
     """RGBオーバーレイ列からGIFバイト列を生成する。"""
     if not overlays:

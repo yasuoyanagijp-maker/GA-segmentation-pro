@@ -43,6 +43,20 @@ def test_gawain_partial_ga_between_healthy_and_total_loss():
     assert 0.0 < healthy < 100.0
 
 
+def test_format_gawain_display():
+    from engine.gawain import GAWAIN_VALUE_RANGE, format_gawain_display
+
+    assert format_gawain_display(85.3) == f"85.3 {GAWAIN_VALUE_RANGE}"
+    assert format_gawain_display(None) == f"— {GAWAIN_VALUE_RANGE}"
+
+
+def test_gawain_label_includes_full_name_and_range():
+    from engine.gawain import GAWAIN_FULL_NAME, GAWAIN_LABEL, GAWAIN_VALUE_RANGE
+
+    assert GAWAIN_FULL_NAME in GAWAIN_LABEL
+    assert GAWAIN_VALUE_RANGE in GAWAIN_LABEL
+
+
 def test_ga_stats_includes_gawain():
     mask = np.zeros((100, 100), dtype=np.uint8)
     result = ga_stats(mask, scale_um_px=5.0, fovea_xy=(50, 50))

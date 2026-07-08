@@ -19,10 +19,24 @@ MIN_SIZE_RATIO = 0.05
 MAX_DIST_FROM_MAIN = 0   # 0 = 中心病変のみ
 
 
-def segment_ga(img: np.ndarray) -> np.ndarray:
-    """CLAHE → Otsu → morphology → 近接フィルタ → 二値マスク。"""
-    clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_TILE)
-    enhanced = clahe.apply(img)
+def segment_ga(
+    img: np.ndarray,
+    *,
+    use_clahe: bool = True,
+    clahe_clip: float | None = None,
+) -> np.ndarray:
+    """CLAHE → Otsu → morphology → 近接フィルタ → 二値マスク。
+
+    use_clahe=False は局所コントラスト補正なし（過大マスクになりやすい）。
+    clahe_clip: None なら CLAHE_CLIP。大きいほど局所コントラストが強くなる。
+    """
+    if use_clahe:
+        clip = float(CLAHE_CLIP if clahe_clip is None else clahe_clip)
+        clip = max(0.5, clip)
+        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=CLAHE_TILE)
+        enhanced = clahe.apply(img)
+    else:
+        enhanced = img
 
     _, mask = cv2.threshold(enhanced, 0, 255,
                             cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)

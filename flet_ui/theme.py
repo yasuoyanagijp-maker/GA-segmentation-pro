@@ -107,6 +107,25 @@ def btn_outlined(label: str, on_click) -> ft.OutlinedButton:
     )
 
 
+def btn_draw(label: str, on_click) -> ft.ElevatedButton:
+    return ft.ElevatedButton(
+        label,
+        on_click=on_click,
+        style=ft.ButtonStyle(
+            bgcolor={
+                ft.ControlState.DEFAULT: ACCENT_GREEN,
+                ft.ControlState.HOVERED: ACCENT_GREEN_HOVER,
+            },
+            color={
+                ft.ControlState.DEFAULT: BTN_ON_GREEN,
+                ft.ControlState.HOVERED: BTN_ON_GREEN,
+            },
+            shape=_BTN_SHAPE,
+            padding=ft.padding.symmetric(horizontal=18, vertical=10),
+        ),
+    )
+
+
 def btn_erase(label: str, on_click) -> ft.ElevatedButton:
     return ft.ElevatedButton(
         label,

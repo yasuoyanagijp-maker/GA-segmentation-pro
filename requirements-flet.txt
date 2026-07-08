@@ -9,6 +9,7 @@ Pillow==10.3.0
 scikit-image==0.22.0
 scipy==1.13.0
 tifffile==2024.2.12
+fpdf2==2.8.3
 
 # dev
 pytest==8.2.0

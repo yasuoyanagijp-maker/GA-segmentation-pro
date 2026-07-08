@@ -5,6 +5,7 @@ from pathlib import Path
 
 from engine.registration import register_stack
 from engine.timeseries import (
+    build_series_from_saved,
     estimate_progression_rate_um_per_year,
     estimate_growth_mm2_per_year,
     estimate_growth_mm_sqrt_per_year,
@@ -69,3 +70,45 @@ def test_resize_to_reference():
     b = np.zeros((80, 90), dtype=np.uint8)
     out = resize_to_reference([a, b])
     assert out[1].shape == a.shape
+
+
+def test_build_series_from_saved():
+    from engine.stats import ga_stats
+
+    img1 = np.zeros((40, 40), dtype=np.uint8)
+    img2 = np.ones((40, 40), dtype=np.uint8) * 128
+    mask1 = np.zeros((40, 40), dtype=np.uint8)
+    mask2 = np.zeros((40, 40), dtype=np.uint8)
+    mask2[10:20, 10:20] = 255
+    fovea = (20.0, 20.0)
+    scale = 5.0
+    stats1 = ga_stats(mask1, scale, fovea)
+    stats2 = ga_stats(mask2, scale, fovea)
+    per_file = {
+        "a.jpg": {
+            "path": Path("/tmp/a.jpg"),
+            "filename": "a.jpg",
+            "date": "2020-01-01",
+            "image": img1,
+            "mask": mask1,
+            "stats": stats1,
+            "fovea_xy": fovea,
+            "scale_um_px": scale,
+        },
+        "b.jpg": {
+            "path": Path("/tmp/b.jpg"),
+            "filename": "b.jpg",
+            "date": "2021-01-01",
+            "image": img2,
+            "mask": mask2,
+            "stats": stats2,
+            "fovea_xy": fovea,
+            "scale_um_px": scale,
+        },
+    }
+    files = [Path("/tmp/a.jpg"), Path("/tmp/b.jpg")]
+    dates = {"a.jpg": "2020-01-01", "b.jpg": "2021-01-01"}
+    results = build_series_from_saved(per_file, files, dates, register=False)
+    assert len(results) == 2
+    assert results[0]["filename"] == "a.jpg"
+    assert results[1]["stats"]["area_mm2"] == stats2["area_mm2"]

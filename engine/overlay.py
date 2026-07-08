@@ -88,6 +88,13 @@ def make_overlay(img_gray: np.ndarray, mask: np.ndarray,
         x0, x1 = sorted((p1[0], p2[0]))
         y0, y1 = sorted((p1[1], p2[1]))
         cv2.rectangle(rgb, (x0, y0), (x1, y1), sky, 2)
+    elif crop_pts and len(crop_pts) > 2:
+        pts = np.array([(int(x), int(y)) for x, y in crop_pts], np.int32)
+        cv2.polylines(rgb, [pts], False, sky, 2)
+        fill_layer = rgb.copy()
+        cv2.fillPoly(fill_layer, [pts], sky)
+        rgb = cv2.addWeighted(fill_layer, 0.22, rgb, 0.78, 0)
+        cv2.polylines(rgb, [pts], False, sky, 2)
 
     if show_macula and fovea_xy and scale_um_px and scale_um_px > 0:
         from engine.gawain import macula_radius_px

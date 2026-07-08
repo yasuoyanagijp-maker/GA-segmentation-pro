@@ -3,6 +3,7 @@ import numpy as np
 from engine.region_growing import (
     erase_bright_from_mask,
     erase_oversegmentation_from_mask,
+    expand_segmentation_from_mask,
     fast_region_growing,
     fast_region_growing_bright,
 )
@@ -74,3 +75,37 @@ def test_erase_bright_from_mask_only_touches_mask():
     ga_mask[12:18, 12:18] = 255
     out = erase_bright_from_mask(img, ga_mask, (15, 15), a=1.5)
     assert np.sum(out) < np.sum(ga_mask)
+
+
+def test_expand_from_dark_outside_mask():
+    """暗部クリック → 未マスクの暗い GA を追加。"""
+    img = np.full((40, 40), 200, dtype=np.uint8)
+    img[10:20, 10:20] = 40
+    ga_mask = np.zeros((40, 40), dtype=np.uint8)
+    ga_mask[12:14, 12:14] = 255
+    out, added = expand_segmentation_from_mask(img, ga_mask, (15, 15), a=2.0)
+    assert added > 0
+    assert np.sum(out) > np.sum(ga_mask)
+    assert out[15, 15] == 255
+
+
+def test_expand_no_change_on_bright_click():
+    img = np.full((40, 40), 40, dtype=np.uint8)
+    img[10:20, 10:20] = 220
+    ga_mask = np.zeros((40, 40), dtype=np.uint8)
+    ga_mask[12:18, 12:18] = 255
+    out, added = expand_segmentation_from_mask(img, ga_mask, (15, 15), a=2.0)
+    assert added == 0
+    assert np.array_equal(out, ga_mask)
+
+
+def test_clear_mask_in_freehand_region():
+    from engine.region_growing import clear_mask_in_freehand_region
+
+    mask = np.zeros((60, 60), dtype=np.uint8)
+    mask[20:40, 20:40] = 255
+    pts = [(15, 15), (45, 15), (45, 45), (15, 45)]
+    out, removed = clear_mask_in_freehand_region(mask, pts)
+    assert removed > 0
+    assert out[30, 30] == 0
+    assert out[5, 5] == 0
