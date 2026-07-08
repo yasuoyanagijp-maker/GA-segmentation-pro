@@ -89,23 +89,25 @@ def resolve_file_dropdown_change(
     series_results: list[dict] | None,
     files: list[Path],
     file_idx: int,
+    series_launching: bool = False,
 ) -> tuple[str, int | None]:
     """Decide how the image-file dropdown should react.
 
     Returns (action, payload) where action is one of:
-      - "ignore": do nothing (sync skip, empty, or keep series)
-      - "series_timepoint": switch series time index (payload = series index)
+      - "ignore": do nothing (sync skip, empty, keep series, or launch guard)
+      - "series_timepoint": reserved (unused; timepoints use series_date_dd)
       - "load_image": leave series (if any) and load files[payload]
 
-    Critical: while series_results is set, never return "load_image". Spurious
-    Flet on_change events after 3/3 used to clear the series and reload index 0.
+    Critical: while series_results is set OR series is launching, never return
+    "load_image" and never navigate via this dropdown. Spurious Flet on_change
+    after 3/3 used to clear the series / jump to folder index 0 (often during
+    page.update before series_results was assigned, or by selecting the earliest
+    dated file which looks like “back to image 1”).
     """
-    if skip or not selected:
+    if skip or series_launching or not selected:
         return "ignore", None
     if series_results is not None:
-        for i, r in enumerate(series_results):
-            if r["filename"] == selected:
-                return "series_timepoint", i
+        # Timepoint navigation is only via series_date_dd while series is open.
         return "ignore", None
     for i, f in enumerate(files):
         if f.name == selected:
@@ -113,6 +115,25 @@ def resolve_file_dropdown_change(
                 return "ignore", None
             return "load_image", i
     return "ignore", None
+
+
+def resolve_series_landing_index(
+    results: list[dict],
+    *,
+    preferred_filename: str | None,
+) -> int:
+    """Pick which timepoint to show after series build.
+
+    Prefer the just-confirmed file so 3/3 does not visually snap back to image 1
+    (earliest date / series index 0).
+    """
+    if not results:
+        return 0
+    if preferred_filename:
+        for i, r in enumerate(results):
+            if r.get("filename") == preferred_filename:
+                return i
+    return 0
 
 
 def _card(label: str, value: str, color: str = T.TEXT) -> ft.Container:
@@ -338,6 +359,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     # Dropdown sync: generation counter avoids asyncio.sleep(0) races where Flet
     # delivers on_change after skip was already cleared.
     dd_sync = {"skip": False, "gen": 0}
+    # Blocks load_image while series is being built (covers page.update races
+    # before series_results is assigned).
+    series_guard = {"launching": False, "gen": 0}
     seg_correction_stats: dict | None = None
 
     def _set_status(msg: str) -> None:
@@ -371,18 +395,28 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         dd_sync["skip"] = True
         return dd_sync["gen"]
 
-    def _release_dropdown_sync(gen: int) -> None:
+    def _release_dropdown_sync(gen: int, *, hold_s: float = 0.35) -> None:
         """Release skip only if no newer sync started (avoids sleep(0) races)."""
 
         async def _release() -> None:
-            # Two yields: enough for local handlers; late web events are guarded
-            # separately by the series-active path in on_file_change.
+            # Hold long enough for deferred Flet web on_change after page.update.
             await asyncio.sleep(0)
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(hold_s)
             if dd_sync["gen"] == gen:
                 dd_sync["skip"] = False
 
         page.run_task(_release)
+
+    def _begin_series_launch_guard() -> int:
+        series_guard["gen"] += 1
+        series_guard["launching"] = True
+        # Also arm dropdown skip for the whole build so mid-build updates cannot
+        # load_image_at(0) before series_results exists.
+        return _begin_dropdown_sync()
+
+    def _end_series_launch_guard(dd_gen: int) -> None:
+        series_guard["launching"] = False
+        _release_dropdown_sync(dd_gen, hold_s=0.6)
 
     def _refresh_file_dropdown() -> None:
         if not state.files:
@@ -426,10 +460,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 )
                 for f in state.files
             ]
-            if state.series_results:
-                idx = min(state.series_time_idx, len(state.series_results) - 1)
-                file_dd.value = state.series_results[idx]["filename"]
-            elif state.files:
+            # While series is active / launching, leave value alone so Flet cannot
+            # fire a deferred on_change that reloads folder index 0.
+            if state.series_results is None and not series_guard["launching"] and state.files:
                 file_dd.value = state.files[state.file_idx].name
             _release_dropdown_sync(gen)
             return
@@ -517,7 +550,11 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             "scale_um_px": state.scale_um_px,
         }
 
-    def _apply_series_results(results: list[dict]) -> None:
+    def _apply_series_results(
+        results: list[dict],
+        *,
+        landing_filename: str | None = None,
+    ) -> None:
         overlays = []
         for row in results:
             s = row["stats"]
@@ -548,8 +585,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             )
             for i, r in enumerate(results)
         ]
-        series_date_dd.value = "0"
-        state.series_time_idx = 0
+        land = resolve_series_landing_index(results, preferred_filename=landing_filename)
+        series_date_dd.value = str(land)
+        state.series_time_idx = land
         # Keep file_idx aligned for status labels, but never mutate file_dd here —
         # that mutation was racing with on_file_change after 3/3 auto-launch.
         _sync_file_idx_to_series_timepoint(update_dropdown=False)
@@ -961,6 +999,10 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     def load_image_at(idx: int, *, new_folder: bool = False) -> None:
         if not state.files:
             return
+        # Never replace the working image while a series view is active or
+        # mid-launch — that is how 3/3 confirmation snapped back to image 1.
+        if state.series_results is not None or series_guard["launching"]:
+            return
         state.file_idx = max(0, min(idx, len(state.files) - 1))
         path = state.files[state.file_idx]
         gray = load_gray(path)
@@ -1345,24 +1387,12 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             series_results=state.series_results,
             files=state.files,
             file_idx=state.file_idx,
+            series_launching=series_guard["launching"],
         )
-        if action == "ignore" or payload is None:
+        if action != "load_image" or payload is None:
             return
-        if action == "series_timepoint":
-            i = payload
-            if state.series_time_idx != i:
-                state.series_time_idx = i
-                series_date_dd.value = str(i)
-                selected = e.control.value
-                state.file_idx = next(
-                    (j for j, f in enumerate(state.files) if f.name == selected),
-                    state.file_idx,
-                )
-                refresh_image()
-                refresh_results()
-                page.update()
+        if state.series_results is not None or series_guard["launching"]:
             return
-        # action == "load_image" — series is inactive by construction
         i = payload
         load_image_at(i)
         if state.batch_mode:
@@ -2031,7 +2061,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         else:
             _set_status("解析完了")
         if state.batch_mode and batch_all_done:
-            _launch_series_display(auto=True)
+            land_name = state.files[state.file_idx].name if state.files else None
+            _launch_series_display(auto=True, landing_filename=land_name)
             return
         refresh_hint()
         update_confirm_visibility()
@@ -2087,15 +2118,24 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     def on_seg_draw_click(_=None) -> None:
         _begin_edit_mode("seg_draw")
 
-    def _launch_series_display(*, auto: bool = False) -> bool:
+    def _launch_series_display(
+        *,
+        auto: bool = False,
+        landing_filename: str | None = None,
+    ) -> bool:
         """確定済み結果から時系列表示を構築する。"""
         saved = _batch_saved_count()
         n = len(state.files)
         if saved < 2:
             _set_status(f"時系列には2枚以上の確定結果が必要です (現在 {saved}/{n} 枚)")
             return False
+        prefer = landing_filename
+        if prefer is None and state.files:
+            prefer = state.files[state.file_idx].name
+        dd_gen = _begin_series_launch_guard()
         _set_status("時系列表示を構築中…")
-        page.update()
+        # Do NOT page.update() here: flushing UI mid-build lets deferred
+        # file_dd on_change fire while series_results is still None.
         try:
             results = build_series_from_saved(
                 state.per_file_results,
@@ -2104,15 +2144,17 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 register=True,
             )
         except ValueError as exc:
+            _end_series_launch_guard(dd_gen)
             _set_status(str(exc))
             page.update()
             return False
         except Exception as exc:
+            _end_series_launch_guard(dd_gen)
             _set_status(f"時系列エラー: {exc}")
             page.update()
             return False
         state.disc_diameter_um = float(disc_field.value or 1800)
-        _apply_series_results(results)
+        _apply_series_results(results, landing_filename=prefer)
         prefix = "時系列表示を開始" if auto else "時系列表示"
         _set_status(f"{prefix} ({len(results)} 時点) — GIF / グラフで確認できます")
         state.view_mode = "work"
@@ -2126,6 +2168,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         _update_batch_ui(refresh_dropdown=False)
         _refresh_file_dropdown_labels()
         page.update()
+        _end_series_launch_guard(dd_gen)
         return True
 
     def on_series(_=None) -> None:
