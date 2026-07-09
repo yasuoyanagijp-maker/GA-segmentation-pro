@@ -192,8 +192,14 @@ def expand_segmentation_from_mask(
 def clear_mask_in_freehand_region(
     mask: np.ndarray,
     points: list[tuple[float, float]],
+    *,
+    outside: bool = False,
 ) -> tuple[np.ndarray, int]:
-    """フリーハンドで囲んだ領域内のマスク画素を消去する。"""
+    """フリーハンドで囲んだ領域のマスクを消去する。
+
+    outside=False: 範囲内を消去（従来どおり）
+    outside=True: 範囲外を消去（囲んだ内側だけ残す）
+    """
     h, w = mask.shape[:2]
     if len(points) < 3:
         return mask, 0
@@ -202,7 +208,10 @@ def clear_mask_in_freehand_region(
     pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
     region = np.zeros((h, w), dtype=np.uint8)
     cv2.fillPoly(region, [pts], 255)
-    remove = (mask > 0) & (region > 0)
+    if outside:
+        remove = (mask > 0) & (region == 0)
+    else:
+        remove = (mask > 0) & (region > 0)
     removed = int(np.sum(remove))
     if removed == 0:
         return mask, 0

@@ -25,7 +25,7 @@ class GAAppState:
     img_gray_raw: np.ndarray | None = None
     foveal_correction_applied: bool = False
     foveal_correction_skipped: bool = False
-    foveal_correction_strength: float = 0.5
+    foveal_correction_strength: float = 0.0
     use_clahe: bool = True
     clahe_clip: float = 2.0
     scale_um_px: float | None = None
@@ -71,7 +71,7 @@ class GAAppState:
         """フルリセット（クロップ後・新規解析開始）。"""
         self.reset_per_image()
         self.disc_pts = []
-        self.foveal_correction_strength = 0.5
+        self.foveal_correction_strength = 0.0
         self.scale_um_px = None
         self.calibration_source = None
         if not keep_series:

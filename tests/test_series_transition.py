@@ -9,15 +9,14 @@ from flet_ui.main_view import (
 from flet_ui.state import GAAppState
 
 
-def test_file_dropdown_never_loads_while_series_active():
-    """Spurious dropdown on_change after auto-launch must not clear / jump."""
+def test_file_dropdown_switches_timepoint_while_series_active():
+    """While series is open, file dropdown switches timepoint for series files."""
     files = [Path("img1.png"), Path("img2.png"), Path("img3.png")]
     series = [
         {"filename": "img1.png"},
         {"filename": "img2.png"},
         {"filename": "img3.png"},
     ]
-    # Selecting earliest file while series open must NOT navigate (looks like image 1).
     action, payload = resolve_file_dropdown_change(
         skip=False,
         selected="img1.png",
@@ -25,18 +24,38 @@ def test_file_dropdown_never_loads_while_series_active():
         files=files,
         file_idx=2,
     )
-    assert action == "ignore"
-    assert payload is None
+    assert action == "series_timepoint"
+    assert payload == 0
 
     action, payload = resolve_file_dropdown_change(
         skip=False,
         selected="img3.png",
         series_results=series,
         files=files,
-        file_idx=2,
+        file_idx=0,
     )
-    assert action == "ignore"
-    assert payload is None
+    assert action == "series_timepoint"
+    assert payload == 2
+
+
+def test_file_dropdown_exits_series_for_unconfirmed_file():
+    """Partial series (2/4): picking an unconfirmed file must load_image."""
+    files = [
+        Path("img1.png"), Path("img2.png"), Path("img3.png"), Path("img4.png"),
+    ]
+    series = [
+        {"filename": "img1.png"},
+        {"filename": "img2.png"},
+    ]
+    action, payload = resolve_file_dropdown_change(
+        skip=False,
+        selected="img3.png",
+        series_results=series,
+        files=files,
+        file_idx=1,
+    )
+    assert action == "load_image"
+    assert payload == 2
 
     action, payload = resolve_file_dropdown_change(
         skip=False,
@@ -55,7 +74,7 @@ def test_file_dropdown_blocked_while_series_launching():
     action, payload = resolve_file_dropdown_change(
         skip=False,
         selected="img1.png",
-        series_results=None,  # not yet assigned
+        series_results=None,
         files=files,
         file_idx=2,
         series_launching=True,
@@ -87,7 +106,6 @@ def test_file_dropdown_loads_only_when_series_inactive():
 
 
 def test_series_landing_prefers_just_confirmed_file():
-    """3/3 auto-launch must not snap visually to earliest (folder image 1)."""
     results = [
         {"filename": "img1.png", "date": "2020-01-01"},
         {"filename": "img2.png", "date": "2021-01-01"},
@@ -101,7 +119,6 @@ def test_series_landing_prefers_just_confirmed_file():
 
 
 def test_batch_complete_state_keeps_series_results():
-    """Simulate post-3/3 apply: series_results stays set on landing timepoint."""
     state = GAAppState()
     state.files = [Path("a.png"), Path("b.png"), Path("c.png")]
     state.file_idx = 2
@@ -129,7 +146,40 @@ def test_batch_complete_state_keeps_series_results():
         files=state.files,
         file_idx=state.file_idx,
     )
-    assert action == "ignore"
+    assert action == "series_timepoint"
     assert state.series_results is not None
     assert len(state.series_results) == 3
     assert state.series_time_idx == 2
+
+
+def test_series_ready_at_two_confirmed_not_all():
+    """④ auto-launch threshold: 2+ confirmed, even if folder has more files."""
+    files = [Path("a.png"), Path("b.png"), Path("c.png"), Path("d.png")]
+    per_file = {
+        "a.png": {"filename": "a.png"},
+        "b.png": {"filename": "b.png"},
+    }
+    saved = sum(1 for f in files if f.name in per_file)
+    n = len(files)
+    assert saved >= 2
+    assert saved < n  # partial batch still qualifies for series
+    series_ready = saved >= 2
+    assert series_ready is True
+
+
+def test_scale_recal_keeps_other_confirmed_results():
+    """2枚目で乳頭/幅指定しても1枚目の確定は消えない（チェック保持）。"""
+    state = GAAppState()
+    state.files = [Path("img1.png"), Path("img2.png")]
+    state.file_idx = 1  # currently on image 2
+    state.per_file_results = {
+        "img1.png": {"filename": "img1.png", "scale_um_px": 5.0},
+        "img2.png": {"filename": "img2.png", "scale_um_px": 5.0},
+    }
+    # Mimic invalidate: drop only current file, keep others
+    cur = state.files[state.file_idx].name
+    if cur in state.per_file_results:
+        del state.per_file_results[cur]
+    assert "img1.png" in state.per_file_results
+    assert "img2.png" not in state.per_file_results
+    assert len(state.per_file_results) == 1

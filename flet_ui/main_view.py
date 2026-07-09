@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import logging
 from datetime import date, datetime
 from pathlib import Path
 
@@ -60,6 +61,14 @@ DISPLAY_WIDTH = 520
 # 未読込時のプレースホルダ（Flet Image は src か src_base64 が必須）
 EMPTY_PX = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
 
+_log = logging.getLogger("ga.batch")
+if not _log.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("[GA-batch] %(message)s"))
+    _log.addHandler(_handler)
+    _log.setLevel(logging.INFO)
+    _log.propagate = False
+
 
 def _b64_jpeg(rgb: np.ndarray, quality: int = 85) -> str:
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -94,20 +103,26 @@ def resolve_file_dropdown_change(
     """Decide how the image-file dropdown should react.
 
     Returns (action, payload) where action is one of:
-      - "ignore": do nothing (sync skip, empty, keep series, or launch guard)
-      - "series_timepoint": reserved (unused; timepoints use series_date_dd)
+      - "ignore": do nothing (sync skip, empty, or launch guard)
+      - "series_timepoint": switch series time index (payload = series index)
       - "load_image": leave series (if any) and load files[payload]
 
-    Critical: while series_results is set OR series is launching, never return
-    "load_image" and never navigate via this dropdown. Spurious Flet on_change
-    after 3/3 used to clear the series / jump to folder index 0 (often during
-    page.update before series_results was assigned, or by selecting the earliest
-    dated file which looks like “back to image 1”).
+    While series is open:
+      - selecting a file already in the series → switch timepoint
+      - selecting a file NOT in the series (typically unconfirmed) → exit
+        series and load that image so the user can continue batch analysis
+    During series_launching, ignore all dropdown events (race guard).
     """
     if skip or series_launching or not selected:
         return "ignore", None
     if series_results is not None:
-        # Timepoint navigation is only via series_date_dd while series is open.
+        for i, r in enumerate(series_results):
+            if r["filename"] == selected:
+                return "series_timepoint", i
+        # Not in series → exit series and open that file for analysis.
+        for i, f in enumerate(files):
+            if f.name == selected:
+                return "load_image", i
         return "ignore", None
     for i, f in enumerate(files):
         if f.name == selected:
@@ -306,7 +321,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         [
             ft.Text("時系列（撮影日）", size=12, weight=ft.FontWeight.W_600, color=T.PRIMARY),
             ft.Text(
-                "EXIF → ファイル名 → 更新日時の順で自動推定。誤りがあれば修正してください。",
+                "✓ = 解析済み。EXIF → ファイル名 → 更新日時の順で自動推定。誤りがあれば修正してください。",
                 size=10,
                 color=T.TEXT_MUTED,
             ),
@@ -321,7 +336,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         last_date=datetime(2035, 12, 31),
     )
     foveal_strength_slider = ft.Slider(
-        min=0, max=100, value=50, divisions=20,
+        min=0, max=100, value=0, divisions=20,
         label="{value}%",
         width=280,
     )
@@ -354,6 +369,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         "changed": False,
         "undo_stack": [],
         "session_base": None,
+        "clear_outside": False,
     }
     batch_progress = ft.Text("", size=12, color=T.TEXT_MUTED, visible=False)
     # Dropdown sync: generation counter avoids asyncio.sleep(0) races where Flet
@@ -511,12 +527,32 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         series_date_dd.visible = False
         prog_field.value = ""
 
-    def _invalidate_saved_results() -> None:
-        """スケール変更などで確定済み結果が無効になったとき。"""
-        if not state.per_file_results and not state.series_results:
-            return
-        state.per_file_results = {}
-        _clear_series_display()
+    def _invalidate_saved_results(*, reason: str = "scale_change") -> None:
+        """スケール変更時: 時系列表示は破棄。他画像の確定は保持する。
+
+        以前は per_file_results を全消去していたため、2枚目で乳頭/幅指定を
+        やり直すと1枚目の ✓ が消えていた。各スナップショットは独自の
+        scale_um_px を持つので、他画像の確定は残してよい。
+        """
+        before = list(state.per_file_results.keys())
+        cur = state.files[state.file_idx].name if state.files else None
+        # 現在画像だけ再確定が必要（スケールが変わった）
+        removed_cur = False
+        if cur and cur in state.per_file_results:
+            del state.per_file_results[cur]
+            removed_cur = True
+        had_series = state.series_results is not None
+        if had_series:
+            _clear_series_display()
+        after = list(state.per_file_results.keys())
+        _log.info(
+            "invalidate reason=%s cur=%s removed_cur=%s had_series=%s "
+            "before=%s after=%s",
+            reason, cur, removed_cur, had_series, before, after,
+        )
+        if before and not after and removed_cur:
+            # only current was saved — fine
+            pass
         _update_batch_ui()
 
     def _update_batch_ui(*, refresh_dropdown: bool = True) -> None:
@@ -536,6 +572,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         _refresh_seg_ok_label()
         if refresh_dropdown:
             _refresh_file_dropdown()
+        refresh_series_dates_ui()
 
     def _snapshot_current() -> dict:
         path = state.files[state.file_idx]
@@ -588,9 +625,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         land = resolve_series_landing_index(results, preferred_filename=landing_filename)
         series_date_dd.value = str(land)
         state.series_time_idx = land
-        # Keep file_idx aligned for status labels, but never mutate file_dd here —
-        # that mutation was racing with on_file_change after 3/3 auto-launch.
-        _sync_file_idx_to_series_timepoint(update_dropdown=False)
+        # Align file_idx; update file_dd under sync guard so users can jump
+        # timepoints from the sidebar without exiting series.
+        _sync_file_idx_to_series_timepoint(update_dropdown=True)
 
     def _next_batch_idx(after: int) -> int | None:
         """確定後: 現在の次の画像インデックス（順番に進む）。"""
@@ -672,16 +709,29 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         for f in state.files:
             fname = f.name
             iso = state.series_dates[fname]
+            done = fname in state.per_file_results
             series_dates_col.controls.append(
                 ft.Container(
                     content=ft.Column(
                         [
-                            ft.Text(
-                                fname,
-                                size=10,
-                                color=T.TEXT_MUTED,
-                                max_lines=2,
-                                overflow=ft.TextOverflow.ELLIPSIS,
+                            ft.Row(
+                                [
+                                    ft.Icon(
+                                        ft.Icons.CHECK_CIRCLE if done else ft.Icons.RADIO_BUTTON_UNCHECKED,
+                                        size=16,
+                                        color=T.ACCENT_GREEN if done else T.TEXT_MUTED,
+                                    ),
+                                    ft.Text(
+                                        fname,
+                                        size=10,
+                                        color=T.ACCENT_GREEN if done else T.TEXT_MUTED,
+                                        max_lines=2,
+                                        overflow=ft.TextOverflow.ELLIPSIS,
+                                        expand=True,
+                                    ),
+                                ],
+                                spacing=4,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
                             ),
                             ft.Row(
                                 [
@@ -996,12 +1046,18 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         if do_update:
             page.update()
 
-    def load_image_at(idx: int, *, new_folder: bool = False) -> None:
+    def load_image_at(
+        idx: int,
+        *,
+        new_folder: bool = False,
+        force: bool = False,
+    ) -> None:
         if not state.files:
             return
         # Never replace the working image while a series view is active or
         # mid-launch — that is how 3/3 confirmation snapped back to image 1.
-        if state.series_results is not None or series_guard["launching"]:
+        # force=True is for intentional exits (e.g. reanalyze this timepoint).
+        if not force and (state.series_results is not None or series_guard["launching"]):
             return
         state.file_idx = max(0, min(idx, len(state.files) - 1))
         path = state.files[state.file_idx]
@@ -1024,11 +1080,19 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     def _save_batch_result() -> None:
         """バッチモード: 現在画像の確定結果をメモリへ保存（画面は現在画像のまま）。"""
         if state.stats is None or state.mask is None or not state.files:
+            _log.warning(
+                "save skipped: stats=%s mask=%s files=%s",
+                state.stats is not None, state.mask is not None, bool(state.files),
+            )
             return
         fname = state.files[state.file_idx].name
         state.per_file_results[fname] = _snapshot_current()
         _prune_stale_batch_results()
         _clear_series_display()
+        _log.info(
+            "saved %s → confirmed=%s",
+            fname, list(state.per_file_results.keys()),
+        )
 
     def on_next_image(_=None) -> None:
         """確定後、次の画像（なければ最初の未解析）へ進む。"""
@@ -1122,13 +1186,15 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         fname = row["filename"]
         state.per_file_results.pop(fname, None)
         _clear_series_display()
+        series_guard["launching"] = False
         for i, f in enumerate(state.files):
             if f.name == fname:
-                load_image_at(i)
+                load_image_at(i, force=True)
                 break
         status.value = f"{fname} — 再解析してください（③ 解析）"
         on_analyze()
         _update_batch_ui()
+        page.update()
 
     def refresh_image(*, do_update: bool = True) -> None:
         if state.view_mode == "gif" and state.series_gif:
@@ -1282,6 +1348,45 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 btn_toolbar("個別結果", on_click=on_show_saved),
             )
         if state.series_results:
+            n_tp = len(state.series_results)
+            tp = min(state.series_time_idx, n_tp - 1) + 1
+            n_files = len(state.files)
+            saved = _batch_saved_count()
+            cur = state.series_results[min(state.series_time_idx, n_tp - 1)]
+            results_col.controls.append(ft.Text(
+                _safe_text(
+                    f"時系列 時点 {tp}/{n_tp}"
+                    f" · 確定 {saved}/{n_files}"
+                    f" · {cur['date']} {cur['filename']}"
+                ),
+                size=12,
+                color=T.PRIMARY,
+            ))
+            if saved < n_files:
+                results_col.controls.append(ft.Text(
+                    _safe_text(
+                        f"未確定 {n_files - saved} 枚あり。"
+                        "「次の未解析へ」またはサイドバーで画像を選んで解析を続けてください。"
+                    ),
+                    size=11,
+                    color=T.ACCENT_AMBER,
+                ))
+                results_col.controls.append(
+                    btn_primary("次の未解析へ ▶", on_click=on_continue_unanalyzed),
+                )
+            results_col.controls.append(
+                ft.Row(
+                    [
+                        btn_toolbar("◀ 前の時点", on_click=on_series_prev),
+                        btn_toolbar("次の時点 ▶", on_click=on_series_next),
+                    ],
+                    spacing=8,
+                    wrap=True,
+                )
+            )
+            results_col.controls.append(
+                btn_toolbar("↻ この時点を再解析", on_click=on_reanalyze_timepoint),
+            )
             results_col.controls.append(
                 ft.Row(
                     [
@@ -1291,9 +1396,6 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                     spacing=8,
                     wrap=True,
                 )
-            )
-            results_col.controls.append(
-                btn_toolbar("↻ この時点を再解析", on_click=on_reanalyze_timepoint),
             )
         elif stats and state.mode is None and not state.series_results:
             results_col.controls.append(
@@ -1332,11 +1434,19 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             "width_cal": "画像の水平方向の実長 (mm) を入力して OK",
             "fovea": "中心窩をタップ",
             "foveal_confirm": "黄斑色素ブロック補正 - 強度を調整して適用または補正しない（自動で解析へ）",
-            "seg_review": "セグメンテーション確認 - Erase / Draw / 範囲消去で修正、OK で確定",
+            "seg_review": "セグメンテーション確認 - Erase / Draw / 範囲消去・範囲外消去で修正、OK で確定",
             "seg_erase": "長押しで削除 (緑の内外どちらでも可) - やり直しで取消",
             "seg_draw": "長押しで暗部を追加 (緑の内外どちらでも可) - やり直しで取消",
-            "seg_clear": "範囲消去: フリーハンドで囲んで指定",
-            "seg_clear_confirm": "範囲内のマスクを消去します - OK または やり直し",
+            "seg_clear": (
+                "範囲外消去: 残す範囲をフリーハンドで囲む"
+                if edit_state.get("clear_outside")
+                else "範囲消去: フリーハンドで囲んで指定"
+            ),
+            "seg_clear_confirm": (
+                "範囲外のマスクを消去します - OK または やり直し"
+                if edit_state.get("clear_outside")
+                else "範囲内のマスクを消去します - OK または やり直し"
+            ),
         }
         hint.value = _safe_text(msgs.get(state.mode or "", ""))
         if not state.mode and modality_dd.value == "hra" and state.scale_um_px is None:
@@ -1380,6 +1490,57 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         if (p[0] - lx) ** 2 + (p[1] - ly) ** 2 >= 4.0:
             state.clear_pts.append(p)
 
+    def _goto_series_timepoint(i: int, *, do_update: bool = True) -> None:
+        if not state.series_results:
+            return
+        i = max(0, min(i, len(state.series_results) - 1))
+        if state.series_time_idx != i:
+            state.series_time_idx = i
+        series_date_dd.value = str(i)
+        fname = state.series_results[i]["filename"]
+        state.file_idx = next(
+            (j for j, f in enumerate(state.files) if f.name == fname),
+            state.file_idx,
+        )
+        # Keep sidebar file dropdown label in sync without firing load_image.
+        if file_dd.value != fname:
+            gen = _begin_dropdown_sync()
+            file_dd.value = fname
+            _release_dropdown_sync(gen)
+        refresh_image(do_update=False)
+        refresh_results()
+        if do_update:
+            page.update()
+
+    def on_series_prev(_=None) -> None:
+        if not state.series_results:
+            return
+        _goto_series_timepoint(state.series_time_idx - 1)
+
+    def on_series_next(_=None) -> None:
+        if not state.series_results:
+            return
+        _goto_series_timepoint(state.series_time_idx + 1)
+
+    def on_continue_unanalyzed(_=None) -> None:
+        """時系列表示中でも未解析画像へ進める（部分確定バッチ用）。"""
+        nxt = _first_unsaved_idx()
+        if nxt is None:
+            _set_status("未解析の画像はありません")
+            page.update()
+            return
+        _clear_series_display()
+        series_guard["launching"] = False
+        load_image_at(nxt, force=True)
+        saved = _batch_saved_count()
+        n = len(state.files)
+        _set_status(
+            f"画像 {nxt + 1}/{n} · 確定済み {saved}/{n}"
+            f" — 解析を続けてください: {state.files[nxt].name}"
+        )
+        _update_batch_ui()
+        page.update()
+
     def on_file_change(e) -> None:
         action, payload = resolve_file_dropdown_change(
             skip=dd_sync["skip"],
@@ -1389,19 +1550,27 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             file_idx=state.file_idx,
             series_launching=series_guard["launching"],
         )
-        if action != "load_image" or payload is None:
+        if action == "ignore" or payload is None:
             return
-        if state.series_results is not None or series_guard["launching"]:
+        if action == "series_timepoint":
+            _goto_series_timepoint(payload)
             return
-        i = payload
-        load_image_at(i)
+        # load_image: may exit an open series when user picks an unconfirmed file
+        if series_guard["launching"]:
+            return
+        if state.series_results is not None:
+            _clear_series_display()
+            series_guard["launching"] = False
+            load_image_at(payload, force=True)
+        else:
+            load_image_at(payload)
         if state.batch_mode:
             saved = _batch_saved_count()
             n = len(state.files)
-            fname = state.files[i].name
+            fname = state.files[payload].name
             tag = "[済] " if fname in state.per_file_results else ""
             _set_status(
-                f"画像 {i + 1}/{n} · 確定済み {saved}/{n} — {tag}{fname}"
+                f"画像 {payload + 1}/{n} · 確定済み {saved}/{n} — {tag}{fname}"
             )
             page.update()
 
@@ -1472,7 +1641,10 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             path_len = _freehand_path_length(state.clear_pts)
             if path_len >= 12.0:
                 state.mode = "seg_clear_confirm"
-                status.value = "範囲内のマスクを消去します - OK で実行"
+                if edit_state.get("clear_outside"):
+                    status.value = "範囲外のマスクを消去します - OK で実行"
+                else:
+                    status.value = "範囲内のマスクを消去します - OK で実行"
             else:
                 state.clear_pts = []
                 status.value = "範囲が短すぎます。もう一度フリーハンドで囲んでください"
@@ -1582,7 +1754,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.series_results = None
         state.mask = None
         state.stats = None
-        foveal_strength_slider.value = int(state.foveal_correction_strength * 100)
+        # 中心窩補正のデフォルト強度は 0（補正なし）
+        state.foveal_correction_strength = 0.0
+        foveal_strength_slider.value = 0
         refresh_hint()
         update_confirm_visibility()
         refresh_image()
@@ -1616,10 +1790,11 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             return
         strength = _foveal_strength()
         state.foveal_correction_applied = strength > 0
-        state.foveal_correction_skipped = False
+        state.foveal_correction_skipped = strength <= 0
         state.foveal_correction_strength = strength
         state.series_results = None
-        _run_segmentation_review()
+        # OK → ③ 解析（セグメンテーション確認）へ自動進行
+        _run_segmentation_review(status_prefix="解析")
         refresh_hint()
         update_confirm_visibility()
         refresh_image()
@@ -1748,6 +1923,12 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             page.update()
 
     def on_seg_clear_start(_=None) -> None:
+        _begin_seg_clear(outside=False)
+
+    def on_seg_clear_outside_start(_=None) -> None:
+        _begin_seg_clear(outside=True)
+
+    def _begin_seg_clear(*, outside: bool) -> None:
         if state.mask is None:
             _set_status("先に解析を実行してください")
             page.update()
@@ -1757,31 +1938,46 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             edit_state["undo_stack"] = []
         state.clear_pts = []
         state.mode = "seg_clear"
+        edit_state["clear_outside"] = outside
         edit_state["preview_mask"] = None
         edit_state["changed"] = False
         edit_state["pressing"] = False
-        _set_status("フリーハンドで消去範囲を囲んでください")
+        _set_status(
+            "フリーハンドで残す範囲を囲んでください（範囲外を消去）"
+            if outside else
+            "フリーハンドで消去範囲を囲んでください"
+        )
         refresh_hint()
         update_confirm_visibility()
         page.update()
 
     def on_seg_clear_ok(_=None) -> None:
         if state.mask is None or len(state.clear_pts) < 3:
-            _set_status("フリーハンドで消去範囲を囲んでください")
+            _set_status("フリーハンドで範囲を囲んでください")
             page.update()
             return
+        outside = bool(edit_state.get("clear_outside"))
         edit_state["undo_stack"].append(state.mask.copy())
-        new_mask, removed = clear_mask_in_freehand_region(state.mask, state.clear_pts)
+        new_mask, removed = clear_mask_in_freehand_region(
+            state.mask, state.clear_pts, outside=outside,
+        )
         if removed == 0:
             edit_state["undo_stack"].pop()
         else:
             state.mask = new_mask
         state.clear_pts = []
         state.mode = "seg_review"
-        _set_status(
-            f"範囲内マスクを消去 ({removed} px) - 続けて編集するか OK"
-            if removed else "範囲内にマスクがありません - やり直しまたは続行"
-        )
+        edit_state["clear_outside"] = False
+        if outside:
+            _set_status(
+                f"範囲外マスクを消去 ({removed} px) - 続けて編集するか OK"
+                if removed else "範囲外にマスクがありません - やり直しまたは続行"
+            )
+        else:
+            _set_status(
+                f"範囲内マスクを消去 ({removed} px) - 続けて編集するか OK"
+                if removed else "範囲内にマスクがありません - やり直しまたは続行"
+            )
         refresh_hint()
         update_confirm_visibility()
         refresh_image()
@@ -1790,7 +1986,12 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     def on_seg_clear_redo(_=None) -> None:
         state.clear_pts = []
         state.mode = "seg_clear"
-        _set_status("フリーハンドで消去範囲を囲んでください")
+        outside = bool(edit_state.get("clear_outside"))
+        _set_status(
+            "フリーハンドで残す範囲を囲んでください（範囲外を消去）"
+            if outside else
+            "フリーハンドで消去範囲を囲んでください"
+        )
         refresh_hint()
         update_confirm_visibility()
         refresh_image()
@@ -1833,15 +2034,18 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             return
         state.disc_draft_pts = []
         state.mode = None
-        _invalidate_saved_results()
-        status.value = f"乳頭計測完了: {state.scale_um_px:.2f} μm/px — 確定済み結果をクリアしました"
+        _invalidate_saved_results(reason="disc_ok")
+        kept = _batch_saved_count()
+        status.value = (
+            f"乳頭計測完了: {state.scale_um_px:.2f} μm/px"
+            + (f" — 他画像の確定 {kept} 枚は保持" if kept else "")
+            + " — 中心窩をタップしてください"
+        )
         disc_info.value = ""
         _refresh_scale_info()
-        refresh_hint()
-        update_confirm_visibility()
-        refresh_image()
-        refresh_results()
-        page.update()
+        # ①完了 → ②中心窩へ自動進行
+        set_mode("fovea")
+        return
 
     def on_disc_redo(_=None) -> None:
         state.disc_draft_pts = []
@@ -1874,7 +2078,20 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             state.crop_pts = []
             state.mode = None
             state.reset_per_image()
-            status.value = "クロップ完了"
+            # ⓪完了 → Optos:①乳頭 / HRA:①'幅指定 へ自動進行
+            if modality_dd.value == "hra":
+                status.value = "クロップ完了 — 幅指定へ進みます"
+                refresh_hint()
+                update_confirm_visibility()
+                refresh_image()
+                on_width_start()
+                return
+            status.value = "クロップ完了 — 乳頭計測へ進みます"
+            refresh_hint()
+            update_confirm_visibility()
+            refresh_image()
+            set_mode("disc_line")
+            return
         except ValueError as exc:
             status.value = str(exc)
             state.crop_pts = []
@@ -1932,18 +2149,18 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.disc_pts = []
         state.disc_draft_pts = []
         state.mode = None
-        _invalidate_saved_results()
+        _invalidate_saved_results(reason="width_ok")
+        kept = _batch_saved_count()
         disc_info.value = ""
         status.value = (
             f"幅指定完了: {w_px} px = {field_mm} mm → {state.scale_um_px:.2f} μm/px"
-            " — 確定済み結果をクリアしました"
+            + (f" — 他画像の確定 {kept} 枚は保持" if kept else "")
+            + " — 中心窩をタップしてください"
         )
         _refresh_scale_info()
-        refresh_hint()
-        update_confirm_visibility()
-        refresh_image()
-        refresh_results()
-        page.update()
+        # ①'完了 → ②中心窩へ自動進行
+        set_mode("fovea")
+        return
 
     def on_width_cancel(_=None) -> None:
         state.mode = None
@@ -2042,25 +2259,30 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.mode = None
         saved = 0
         n = len(state.files)
-        batch_all_done = False
+        # 2枚以上確定で④時系列を自動起動（全枚数完了を待たない）
+        series_ready = False
         if state.batch_mode:
             _save_batch_result()
             saved = _batch_saved_count()
             pos = state.file_idx + 1
-            batch_all_done = saved >= n and n >= 2
-            if saved >= n:
-                _set_status(
-                    f"確定済み {saved}/{n} (画像 {pos}/{n})"
-                    " - 全画像完了。時系列表示を開始します…"
+            series_ready = saved >= 2
+            if series_ready:
+                missing = n - saved
+                extra = (
+                    f" - 時系列表示を開始します…"
+                    if missing == 0
+                    else f" - 時系列表示を開始（未確定 {missing} 枚は後から追加可）…"
                 )
+                _set_status(f"確定済み {saved}/{n} (画像 {pos}/{n}){extra}")
             else:
                 _set_status(
                     f"確定済み {saved}/{n} (画像 {pos}/{n})"
                     " - 結果を確認し「次へ ▶」で次画像"
+                    "（2枚以上で④時系列可）"
                 )
         else:
             _set_status("解析完了")
-        if state.batch_mode and batch_all_done:
+        if state.batch_mode and series_ready:
             land_name = state.files[state.file_idx].name if state.files else None
             _launch_series_display(auto=True, landing_filename=land_name)
             return
@@ -2156,7 +2378,13 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.disc_diameter_um = float(disc_field.value or 1800)
         _apply_series_results(results, landing_filename=prefer)
         prefix = "時系列表示を開始" if auto else "時系列表示"
-        _set_status(f"{prefix} ({len(results)} 時点) — GIF / グラフで確認できます")
+        missing = n - saved
+        tip = (
+            f" — 未確定 {missing} 枚。残り確定後に④を再実行してください"
+            if missing > 0 else
+            " — 撮影日 / ◀▶ で時点切替、右の再解析で個別修正"
+        )
+        _set_status(f"{prefix} ({len(results)} 時点 / 確定 {saved}/{n}){tip}")
         state.view_mode = "work"
         view_mode.value = "work"
         view_mode.visible = True
@@ -2194,10 +2422,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
 
     def on_series_date(e) -> None:
         if e.control.value is not None:
-            state.series_time_idx = int(e.control.value)
-            _sync_file_idx_to_series_timepoint(update_dropdown=False)
-            refresh_image()
-            refresh_results()
+            _goto_series_timepoint(int(e.control.value))
 
     series_date_dd.on_change = on_series_date
 
@@ -2258,6 +2483,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         nonlocal seg_correction_stats
         if state.mode in ("seg_clear", "seg_clear_confirm"):
             state.clear_pts = []
+            edit_state["clear_outside"] = False
             state.mode = "seg_review"
             status.value = "範囲消去をキャンセル"
         elif state.mode in ("seg_erase", "seg_draw"):
@@ -2345,6 +2571,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         btn_erase("Erase 白領域（長押し）", on_click=on_seg_erase_click),
         btn_draw("Draw 暗部（長押し）", on_click=on_seg_draw_click),
         btn_outlined("範囲消去", on_click=on_seg_clear_start),
+        btn_outlined("範囲外消去", on_click=on_seg_clear_outside_start),
         seg_edit_redo_btn,
     ], visible=False, wrap=True)
 
@@ -2415,7 +2642,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 foveal_strength_slider,
                 ft.Row(
                     [
-                        btn_ok("✓ 補正を適用", on_click=on_foveal_ok),
+                        btn_ok("✓ OK（解析へ）", on_click=on_foveal_ok),
                         btn_outlined("補正しない", on_click=on_foveal_skip),
                         btn_outlined("↩ やり直し", on_click=on_foveal_redo),
                     ],

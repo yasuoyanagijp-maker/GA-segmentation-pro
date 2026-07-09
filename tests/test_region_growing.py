@@ -109,3 +109,15 @@ def test_clear_mask_in_freehand_region():
     assert removed > 0
     assert out[30, 30] == 0
     assert out[5, 5] == 0
+
+
+def test_clear_mask_outside_freehand_region():
+    from engine.region_growing import clear_mask_in_freehand_region
+
+    mask = np.zeros((60, 60), dtype=np.uint8)
+    mask[10:50, 10:50] = 255
+    pts = [(20, 20), (40, 20), (40, 40), (20, 40)]
+    out, removed = clear_mask_in_freehand_region(mask, pts, outside=True)
+    assert removed > 0
+    assert out[30, 30] == 255  # inside kept
+    assert out[12, 12] == 0    # outside cleared
