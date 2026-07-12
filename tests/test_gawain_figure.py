@@ -32,7 +32,10 @@ def test_estimate_fovea_from_mask():
     assert 45 < fovea[1] < 55
 
 
-def test_render_gawain_figure_bytes():
+def test_render_gawain_figure_uses_agg_backend():
+    import matplotlib
+
+    assert matplotlib.get_backend().lower() == "agg"
     img = np.full((300, 300), 180, dtype=np.uint8)
     mask = np.zeros_like(img)
     mask[135:165, 135:165] = 255
