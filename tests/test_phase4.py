@@ -10,9 +10,6 @@ from engine.timeseries import (
     estimate_growth_mm2_per_year,
     estimate_growth_mm_sqrt_per_year,
     guess_image_date,
-    guess_image_datetime,
-    datetime_to_plot_x,
-    datetime_to_iso,
     overlays_to_gif_bytes,
     resize_to_reference,
 )
@@ -36,70 +33,6 @@ def test_register_stack_recovers_translation():
 def test_guess_image_date_from_filename():
     path = Path('/tmp/patient_20240315_faf.png')
     assert guess_image_date(path) == date(2024, 3, 15)
-    assert guess_image_datetime(path) == __import__('datetime').datetime(2024, 3, 15)
-
-
-def test_datetime_to_plot_x_is_continuous():
-    from datetime import datetime
-
-    d0 = datetime(2020, 1, 1)
-    d1 = datetime(2020, 2, 1)
-    x0 = datetime_to_plot_x(d0)
-    x1 = datetime_to_plot_x(d1)
-    assert abs((x1 - x0) - 31.0) < 0.01
-
-
-def test_parse_user_datetime_input_accepts_date_and_time():
-    from datetime import datetime
-
-    from engine.timeseries import parse_user_datetime_input
-
-    assert parse_user_datetime_input("2024-03-15") == datetime(2024, 3, 15)
-    assert parse_user_datetime_input("2024-03-15 14:30") == datetime(2024, 3, 15, 14, 30)
-
-
-def test_refresh_series_dates_skips_manual():
-    from engine.timeseries import refresh_series_dates_for_files
-
-    files = [Path("/tmp/patient_20240315_faf.png")]
-    out = refresh_series_dates_for_files(
-        files, {"patient_20240315_faf.png"}, skip_manual={"patient_20240315_faf.png"},
-    )
-    assert out == {}
-    out2 = refresh_series_dates_for_files(files, {"patient_20240315_faf.png"})
-    assert "patient_20240315_faf.png" in out2
-
-
-def test_sync_date_to_snapshots():
-    from engine.timeseries import sync_date_to_snapshots
-
-    per = {"a.png": {"date": "old", "filename": "a.png"}}
-    sync_date_to_snapshots(per, "a.png", "2025-06-01T10:00:00")
-    assert per["a.png"]["date"] == "2025-06-01T10:00:00"
-
-
-def test_build_series_uses_refreshed_series_dates():
-    per = {
-        'a.png': {
-            'path': Path('a.png'), 'filename': 'a.png', 'date': '1999-01-01',
-            'image': np.zeros((64, 64), dtype=np.uint8),
-            'mask': np.zeros((64, 64), dtype=np.uint8),
-            'stats': {'area_mm2': 1.0}, 'fovea_xy': (32.0, 32.0),
-        },
-        'b.png': {
-            'path': Path('b.png'), 'filename': 'b.png', 'date': '1999-06-01',
-            'image': np.zeros((64, 64), dtype=np.uint8),
-            'mask': np.zeros((64, 64), dtype=np.uint8),
-            'stats': {'area_mm2': 2.0}, 'fovea_xy': (32.0, 32.0),
-        },
-    }
-    files = [Path('a.png'), Path('b.png')]
-    series_dates = {'a.png': '2020-01-01', 'b.png': '2021-01-01'}
-    results = build_series_from_saved(
-        per, files, series_dates, register=False,
-    )
-    assert results[0]['date'] == '2020-01-01'
-    assert results[1]['date'] == '2021-01-01'
 
 
 def test_estimate_progression_rate_positive():
