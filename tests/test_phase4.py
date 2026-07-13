@@ -213,14 +213,59 @@ def test_series_metric_regressions_detects_decrease():
     from engine.timeseries import series_metric_regressions
 
     ok = [
-        {"stats": {"area_mm2": 1.0, "area_mm_sqrt": 1.0, "gawain": 10}},
-        {"stats": {"area_mm2": 1.2, "area_mm_sqrt": 1.1, "gawain": 12}},
+        {"stats": {"area_mm2": 1.0, "area_mm_sqrt": 1.0, "gawain": 10, "dist_um": 200.0}},
+        {"stats": {"area_mm2": 1.2, "area_mm_sqrt": 1.1, "gawain": 12, "dist_um": 150.0}},
     ]
     assert series_metric_regressions(ok) == []
     bad = [
-        {"stats": {"area_mm2": 2.0, "area_mm_sqrt": 1.4, "gawain": 20}},
-        {"stats": {"area_mm2": 1.5, "area_mm_sqrt": 1.2, "gawain": 18}},
+        {"stats": {"area_mm2": 2.0, "area_mm_sqrt": 1.4, "gawain": 20, "dist_um": 100.0}},
+        {"stats": {"area_mm2": 1.5, "area_mm_sqrt": 1.2, "gawain": 18, "dist_um": 120.0}},
     ]
     alerts = series_metric_regressions(bad)
-    assert len(alerts) == 3
+    assert len(alerts) == 4
     assert any("再解析" in a for a in alerts)
+    assert any("中心窩距離" in a for a in alerts)
+
+
+def test_build_series_recalculates_dist_after_registration():
+    """dist_um must come from registered mask + fovea, not saved per-file stats."""
+    from engine.stats import ga_stats
+
+    img = np.zeros((40, 40), dtype=np.uint8)
+    mask1 = np.zeros((40, 40), dtype=np.uint8)
+    mask2 = np.zeros((40, 40), dtype=np.uint8)
+    mask2[10:15, 5:10] = 255
+    fovea = (35.0, 20.0)
+    stale_fovea = (5.0, 20.0)
+    scale = 5.0
+    per_file = {
+        "a.jpg": {
+            "path": Path("/tmp/a.jpg"),
+            "filename": "a.jpg",
+            "date": "2020-01-01",
+            "image": img.copy(),
+            "mask": mask1,
+            "stats": ga_stats(mask1, scale, fovea),
+            "fovea_xy": fovea,
+            "scale_um_px": scale,
+        },
+        "b.jpg": {
+            "path": Path("/tmp/b.jpg"),
+            "filename": "b.jpg",
+            "date": "2021-01-01",
+            "image": img.copy(),
+            "mask": mask2,
+            "stats": ga_stats(mask2, scale, stale_fovea),
+            "fovea_xy": fovea,
+            "scale_um_px": scale,
+        },
+    }
+    files = [Path("/tmp/a.jpg"), Path("/tmp/b.jpg")]
+    dates = {"a.jpg": "2020-01-01", "b.jpg": "2021-01-01"}
+    prior = {"b.jpg": np.array([[1, 0, 15], [0, 1, 0]], dtype=np.float32)}
+    results = build_series_from_saved(
+        per_file, files, dates, register=True, prior_matrices=prior,
+    )
+    expected = ga_stats(results[1]["mask"], scale, results[1]["fovea_xy"])
+    assert results[1]["stats"]["dist_um"] == expected["dist_um"]
+    assert results[1]["stats"]["dist_um"] != per_file["b.jpg"]["stats"]["dist_um"]

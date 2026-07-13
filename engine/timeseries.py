@@ -289,20 +289,22 @@ def _compute_row_stats(mask, scale, fovea, fallback_stats):
 
 
 def series_metric_regressions(results: list[dict]) -> list[str]:
-    """Detect later timepoints that are smaller than earlier ones for GA metrics.
+    """Detect implausible metric trends across chronological timepoints.
 
     Returns short Japanese alert strings (empty if no regression).
-    Checks area_mm2, area_mm_sqrt, and gawain in chronological order.
+    Area / SQRT / GAWAIN should increase; dist_um should decrease toward fovea.
     """
     if len(results) < 2:
         return []
-    keys = (
-        ("area_mm2", "GA面積"),
-        ("area_mm_sqrt", "SQRT面積"),
-        ("gawain", "GAWAIN"),
+    # (key, label, expect_increase)
+    checks = (
+        ("area_mm2", "GA面積", True),
+        ("area_mm_sqrt", "SQRT面積", True),
+        ("gawain", "GAWAIN", True),
+        ("dist_um", "中心窩距離", False),
     )
     alerts: list[str] = []
-    for key, label in keys:
+    for key, label, expect_increase in checks:
         prev = None
         for row in results:
             stats = row.get("stats") or {}
@@ -310,11 +312,17 @@ def series_metric_regressions(results: list[dict]) -> list[str]:
             if val is None:
                 continue
             v = float(val)
-            if prev is not None and v < prev - 1e-9:
-                alerts.append(
-                    f"{label}が時間経過で減少しています（再解析を推奨）"
-                )
-                break
+            if prev is not None:
+                if expect_increase and v < prev - 1e-9:
+                    alerts.append(
+                        f"{label}が時間経過で減少しています（再解析を推奨）"
+                    )
+                    break
+                if not expect_increase and v >= prev - 1e-9:
+                    alerts.append(
+                        f"{label}が時間経過で縮まっていません（再解析を推奨）"
+                    )
+                    break
             prev = v
     return alerts
 
