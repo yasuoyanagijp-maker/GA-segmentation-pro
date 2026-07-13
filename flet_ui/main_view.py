@@ -6,6 +6,7 @@ import asyncio
 import base64
 import copy
 import logging
+import math
 from datetime import date, datetime
 from pathlib import Path
 
@@ -36,13 +37,23 @@ from engine.foveal_correction import (
 )
 from engine.gawain import GAWAIN_LABEL, format_gawain_display
 from engine.stats import ga_stats
+from engine.series_registration import REGISTRATION_METHODS
 from engine.timeseries import (
     build_series_from_saved,
+    datetime_to_plot_x,
+    disc_xy_from_pts,
     estimate_growth_mm2_per_year,
     estimate_growth_mm_sqrt_per_year,
     estimate_progression_rate_um_per_year,
-    guess_image_date,
+    guess_image_datetime,
+    datetime_to_iso,
+    parse_series_datetime,
+    parse_user_datetime_input,
+    refresh_series_dates_for_files,
+    sync_date_to_snapshots,
+    landmarks_from_snapshot,
     overlays_to_gif_bytes,
+    reregister_timepoint,
 )
 from flet_ui.state import GAAppState
 from flet_ui import theme as T
@@ -58,6 +69,7 @@ from flet_ui.theme import (
 )
 
 DISPLAY_WIDTH = 520
+APP_VERSION = "2026-07-11-manual-datetime-v7"  # 画面右下に表示（コード反映確認用）
 # 未読込時のプレースホルダ（Flet Image は src か src_base64 が必須）
 EMPTY_PX = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
 
@@ -317,11 +329,19 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     )
     series_date_dd = ft.Dropdown(label="撮影日", width=360, visible=False)
     series_dates_col = ft.Column(spacing=6)
+    registration_sw = ft.Switch(
+        label="位置合わせ (Registration)",
+        value=state.series_registration_enabled,
+        tooltip="OFF: 各画像の座標のまま時系列・グラフ表示。ON: 位置合わせを実行",
+    )
+    reg_apply_btn = btn_toolbar("位置合わせを実行", on_click=lambda _: None)
+    reg_apply_btn.visible = False
     series_dates_section = ft.Column(
         [
             ft.Text("時系列（撮影日）", size=12, weight=ft.FontWeight.W_600, color=T.PRIMARY),
             ft.Text(
-                "✓ = 解析済み。EXIF → ファイル名 → 更新日時の順で自動推定。誤りがあれば修正してください。",
+                "☑ = 時系列対象（解析済みのみ選択可）。"
+                " ✓ = 解析済み。撮影日は EXIF → ファイル名 → 更新日時の順で推定。",
                 size=10,
                 color=T.TEXT_MUTED,
             ),
@@ -359,6 +379,18 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     )
     gif_img = ft.Image(visible=False, fit=ft.ImageFit.CONTAIN, width=DISPLAY_WIDTH)
     graph_area = ft.Column(visible=False)
+    graph_metric_dd = ft.Dropdown(
+        label="表示する指標",
+        width=280,
+        text_size=13,
+        value=state.graph_metric,
+        options=[
+            ft.dropdown.Option(key="area_mm2", text="GA Area (mm2)"),
+            ft.dropdown.Option(key="area_mm_sqrt", text="SQRT GA Area (mm)"),
+            ft.dropdown.Option(key="gawain", text=_safe_text(GAWAIN_LABEL)),
+            ft.dropdown.Option(key="dist_um", text="Distance to fovea (um)"),
+        ],
+    )
 
     disp_scale = {"v": 1.0}
     disp_size = {"w": DISPLAY_WIDTH, "h": 200}
@@ -379,6 +411,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     # before series_results is assigned).
     series_guard = {"launching": False, "gen": 0}
     seg_correction_stats: dict | None = None
+    # 遅延生成されるコントロール（registration 確認パネル等）への参照置き場。
+    _ui: dict = {}
 
     def _set_status(msg: str) -> None:
         status.value = _safe_text(msg)
@@ -521,11 +555,27 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.estimated_growth_mm2_per_year = None
         state.estimated_growth_mm_sqrt_per_year = None
         state.series_time_idx = 0
+        state.series_review_active = False
+        state.series_review_idx = 0
+        state.series_registered = False
         state.view_mode = "work"
         view_mode.value = "work"
         view_mode.visible = False
         series_date_dd.visible = False
         prog_field.value = ""
+        reg_apply_btn.visible = False
+        if "reg_review_panel" in _ui:
+            _ui["reg_review_panel"].visible = False
+
+    def _update_registration_controls() -> None:
+        """位置合わせトグル・実行ボタンの表示を同期。"""
+        registration_sw.value = state.series_registration_enabled
+        reg_apply_btn.visible = (
+            state.series_registration_enabled
+            and state.series_results is not None
+            and not state.series_registered
+            and not state.series_review_active
+        )
 
     def _invalidate_saved_results(*, reason: str = "scale_change") -> None:
         """スケール変更時: 時系列表示は破棄。他画像の確定は保持する。
@@ -558,67 +608,116 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     def _update_batch_ui(*, refresh_dropdown: bool = True) -> None:
         n = len(state.files)
         saved = _batch_saved_count()
+        selected = _selected_count()
         state.batch_mode = n >= 2
         batch_progress.visible = state.batch_mode
-        ready = saved >= 2
+        ready = selected >= 2
         if state.batch_mode:
             batch_progress.value = _batch_progress_label()
         series_btn.visible = ready
         series_launch_row.visible = ready
         if ready:
-            label = _safe_text(f"時系列で表示 ({saved}/{n})")
+            label = _safe_text(f"時系列で表示 (選択 {selected}/{saved} 確定)")
             series_launch_btn.text = label
             series_btn.text = label
         _refresh_seg_ok_label()
         if refresh_dropdown:
             _refresh_file_dropdown()
         refresh_series_dates_ui()
+        _update_registration_controls()
+
+    def _is_selected(fname: str) -> bool:
+        """時系列対象か。既定では確定済み画像を対象にする。"""
+        return state.series_selected.get(fname, fname in state.per_file_results)
+
+    def _selected_confirmed() -> list[str]:
+        return [
+            f.name for f in state.files
+            if f.name in state.per_file_results and _is_selected(f.name)
+        ]
+
+    def _selected_count() -> int:
+        return len(_selected_confirmed())
+
+    def _bind_select_toggle(fname: str):
+        def _handler(e: ft.ControlEvent) -> None:
+            state.series_selected[fname] = bool(e.control.value)
+            if state.series_results is not None or state.series_review_active:
+                _clear_series_display()
+                status.value = _safe_text(
+                    "対象画像を変更しました — ④ 時系列を再実行してください"
+                )
+            _update_batch_ui(refresh_dropdown=False)
+            page.update()
+        return _handler
 
     def _snapshot_current() -> dict:
+        """現在画像の解析結果と、registration 用の画像固有固定点を保存する。"""
         path = state.files[state.file_idx]
+        fovea = None
+        if state.fovea_xy is not None:
+            fovea = (float(state.fovea_xy[0]), float(state.fovea_xy[1]))
+        disc_pts = None
+        disc_xy = None
+        if state.disc_pts and len(state.disc_pts) == 2:
+            disc_pts = [(float(p[0]), float(p[1])) for p in state.disc_pts]
+            disc_xy = disc_xy_from_pts(disc_pts)
         return {
             "path": path,
             "filename": path.name,
-            "date": state.series_dates.get(path.name, guess_image_date(path).isoformat()),
+            "date": state.series_dates.get(
+                path.name, datetime_to_iso(guess_image_datetime(path)),
+            ),
             "image": state.img_gray.copy(),
             "mask": state.mask.copy(),
             "stats": copy.deepcopy(state.stats),
-            "fovea_xy": state.fovea_xy,
+            "fovea_xy": fovea,
+            "disc_pts": disc_pts,
+            "disc_xy": disc_xy,
             "scale_um_px": state.scale_um_px,
+            "calibration_source": state.calibration_source,
         }
+
+    def _row_overlay(row: dict) -> np.ndarray:
+        s = row["stats"]
+        fxy = row.get("fovea_xy")
+        scale = row.get("scale_um_px")
+        disc = row.get("disc_pts")
+        return make_overlay(
+            row["image"], row["mask"],
+            fovea_xy=fxy,
+            nearest_xy=s.get("nearest_xy"),
+            disc_pts=disc,
+            disc_diameter_um=state.disc_diameter_um,
+            show_macula=True,
+            scale_um_px=scale,
+        )
+
+    def _rebuild_series_derived() -> None:
+        """state.series_results から overlay / GIF / 進行速度を再構築する。"""
+        results = state.series_results or []
+        overlays = [_row_overlay(row) for row in results]
+        state.series_overlays = overlays
+        state.series_gif = overlays_to_gif_bytes(overlays) if overlays else None
+        state.estimated_prog = estimate_progression_rate_um_per_year(results)
+        state.estimated_growth_mm2_per_year = estimate_growth_mm2_per_year(results)
+        state.estimated_growth_mm_sqrt_per_year = estimate_growth_mm_sqrt_per_year(results)
+        prog_field.value = str(int(state.estimated_prog)) if state.estimated_prog else ""
 
     def _apply_series_results(
         results: list[dict],
         *,
         landing_filename: str | None = None,
     ) -> None:
-        overlays = []
-        for row in results:
-            s = row["stats"]
-            fxy = row.get("fovea_xy") or state.fovea_xy
-            scale = row.get("scale_um_px") or state.scale_um_px
-            overlays.append(make_overlay(
-                row["image"], row["mask"],
-                fovea_xy=fxy,
-                nearest_xy=s.get("nearest_xy"),
-                disc_pts=state.disc_pts,
-                disc_diameter_um=state.disc_diameter_um,
-                show_macula=True,
-                scale_um_px=scale,
-            ))
         state.series_results = results
-        state.series_overlays = overlays
-        state.series_gif = overlays_to_gif_bytes(overlays)
-        state.estimated_prog = estimate_progression_rate_um_per_year(results)
-        state.estimated_growth_mm2_per_year = estimate_growth_mm2_per_year(results)
-        state.estimated_growth_mm_sqrt_per_year = estimate_growth_mm_sqrt_per_year(results)
-        prog_field.value = str(int(state.estimated_prog)) if state.estimated_prog else ""
-        view_mode.visible = True
+        _rebuild_series_derived()
         series_date_dd.visible = True
         series_date_dd.options = [
             ft.dropdown.Option(
                 key=str(i),
-                text=_safe_text(f"{r['date']} - {r['filename']}"),
+                text=_safe_text(
+                    f"{_format_series_datetime_label(r['date'])} - {r['filename']}"
+                ),
             )
             for i, r in enumerate(results)
         ]
@@ -650,8 +749,40 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             if key in state.series_dates:
                 dates[key] = state.series_dates[key]
             else:
-                dates[key] = guess_image_date(f).isoformat()
+                dates[key] = datetime_to_iso(guess_image_datetime(f))
         state.series_dates = dates
+
+    def _apply_series_datetime(
+        fname: str,
+        dt: datetime,
+        *,
+        manual: bool,
+    ) -> None:
+        """撮影日時を state / 確定スナップショットへ記録。"""
+        iso = datetime_to_iso(dt)
+        state.series_dates[fname] = iso
+        if manual:
+            state.series_dates_manual[fname] = True
+        sync_date_to_snapshots(state.per_file_results, fname, iso)
+        _invalidate_series_after_date_edit()
+        refresh_series_dates_ui()
+
+    def _ensure_selected_series_dates(selected_fnames: set[str]) -> None:
+        """④ 起動前: 自動推定は手動未設定のみ。全対象は series_dates 最新値を同期。"""
+        manual_skip = {
+            fname for fname in selected_fnames
+            if state.series_dates_manual.get(fname)
+        }
+        refreshed = refresh_series_dates_for_files(
+            state.files, selected_fnames, skip_manual=manual_skip,
+        )
+        for fname, iso in refreshed.items():
+            state.series_dates[fname] = iso
+            sync_date_to_snapshots(state.per_file_results, fname, iso)
+        for fname in selected_fnames:
+            iso = state.series_dates.get(fname)
+            if iso:
+                sync_date_to_snapshots(state.per_file_results, fname, iso)
 
     def _invalidate_series_after_date_edit() -> None:
         if not state.series_results:
@@ -660,9 +791,14 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         status.value = "撮影日を変更しました — ④ 時系列を再実行してください"
 
     def _apply_series_date(fname: str, picked: date) -> None:
-        state.series_dates[fname] = picked.isoformat()
-        _invalidate_series_after_date_edit()
-        refresh_series_dates_ui()
+        """カレンダーから日付のみ選択（時刻は 00:00）。"""
+        _apply_series_datetime(
+            fname, datetime.combine(picked, datetime.min.time()), manual=True,
+        )
+
+    def _apply_series_datetime_from_text(fname: str, raw: str) -> None:
+        dt = parse_user_datetime_input(raw)
+        _apply_series_datetime(fname, dt, manual=True)
 
     def _on_date_picker_change(e: ft.ControlEvent) -> None:
         fname = date_picker_target["fname"]
@@ -684,13 +820,12 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         def _handler(e: ft.ControlEvent) -> None:
             raw = (e.control.value or "").strip()
             try:
-                picked = datetime.strptime(raw, "%Y-%m-%d").date()
+                _apply_series_datetime_from_text(fname, raw)
             except ValueError:
-                e.control.error_text = "YYYY-MM-DD 形式"
+                e.control.error_text = "YYYY-MM-DD または YYYY-MM-DD HH:MM"
                 page.update()
                 return
             e.control.error_text = None
-            _apply_series_date(fname, picked)
             page.update()
         return _handler
 
@@ -709,13 +844,34 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         for f in state.files:
             fname = f.name
             iso = state.series_dates[fname]
+            is_manual = state.series_dates_manual.get(fname, False)
             done = fname in state.per_file_results
+            lm_note = ""
+            if done:
+                lm = landmarks_from_snapshot(state.per_file_results[fname])
+                if lm.get("fovea_xy"):
+                    fx, fy = lm["fovea_xy"]
+                    lm_note = f"中心窩 ({fx:.0f},{fy:.0f})"
+                    if lm.get("disc_xy"):
+                        dx, dy = lm["disc_xy"]
+                        lm_note += f" · 乳頭 ({dx:.0f},{dy:.0f})"
             series_dates_col.controls.append(
                 ft.Container(
                     content=ft.Column(
                         [
                             ft.Row(
                                 [
+                                    ft.Checkbox(
+                                        value=_is_selected(fname),
+                                        disabled=not done,
+                                        tooltip=(
+                                            "時系列解析の対象に含める"
+                                            if done
+                                            else "先に③解析で確定してください"
+                                        ),
+                                        on_change=_bind_select_toggle(fname),
+                                        scale=0.85,
+                                    ),
                                     ft.Icon(
                                         ft.Icons.CHECK_CIRCLE if done else ft.Icons.RADIO_BUTTON_UNCHECKED,
                                         size=16,
@@ -729,17 +885,27 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                                         overflow=ft.TextOverflow.ELLIPSIS,
                                         expand=True,
                                     ),
+                                    ft.Text(
+                                        "手動",
+                                        size=9,
+                                        color=T.ACCENT_AMBER,
+                                    ) if is_manual else ft.Container(width=0),
                                 ],
                                 spacing=4,
                                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
                             ),
+                            ft.Text(
+                                lm_note,
+                                size=9,
+                                color=T.ACCENT_CYAN if lm_note else T.TEXT_MUTED,
+                            ) if lm_note else ft.Container(height=0),
                             ft.Row(
                                 [
                                     ft.TextField(
                                         value=iso,
-                                        width=130,
+                                        width=168,
                                         text_size=12,
-                                        hint_text="YYYY-MM-DD",
+                                        hint_text="YYYY-MM-DD HH:MM",
                                         on_submit=_bind_date_field_submit(fname),
                                     ),
                                     ft.IconButton(
@@ -922,10 +1088,18 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         ):
             return None
         mask_raw = segmentation.segment_ga(
-            raw, use_clahe=state.use_clahe, clahe_clip=state.clahe_clip,
+            raw,
+            use_clahe=state.use_clahe,
+            clahe_clip=state.clahe_clip,
+            fovea_xy=state.fovea_xy,
+            scale_um_px=state.scale_um_px,
         )
         mask_corr = segmentation.segment_ga(
-            seg_gray, use_clahe=state.use_clahe, clahe_clip=state.clahe_clip,
+            seg_gray,
+            use_clahe=state.use_clahe,
+            clahe_clip=state.clahe_clip,
+            fovea_xy=state.fovea_xy,
+            scale_um_px=state.scale_um_px,
         )
         return correction_effect_stats(
             raw, seg_gray, state.fovea_xy, state.scale_um_px,
@@ -960,7 +1134,13 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             seg_gray,
             use_clahe=state.use_clahe,
             clahe_clip=state.clahe_clip,
+            fovea_xy=state.fovea_xy,
+            scale_um_px=state.scale_um_px,
         )
+
+    def _finalize_mask(mask: np.ndarray) -> np.ndarray:
+        """編集後マスクから孤立微小粒子を除去。"""
+        return segmentation.cleanup_mask_after_edit(mask)
 
     def _overlay_base_gray() -> np.ndarray | None:
         """オーバーレイ/Erase/Draw と同じグレー画像を返す。"""
@@ -1046,6 +1226,20 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         if do_update:
             page.update()
 
+    def _restore_from_snapshot(snap: dict) -> None:
+        """確定スナップショットを作業画面へ復元（中心窩・乳頭含む）。"""
+        state.img_gray = snap["image"].copy()
+        state.mask = snap["mask"].copy()
+        state.stats = copy.deepcopy(snap["stats"])
+        lm = landmarks_from_snapshot(snap)
+        state.fovea_xy = lm["fovea_xy"]
+        state.disc_pts = list(lm["disc_pts"]) if lm["disc_pts"] else []
+        if snap.get("scale_um_px") is not None:
+            state.scale_um_px = snap["scale_um_px"]
+        if snap.get("calibration_source") is not None:
+            state.calibration_source = snap["calibration_source"]
+        state.mode = None
+
     def load_image_at(
         idx: int,
         *,
@@ -1061,15 +1255,22 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             return
         state.file_idx = max(0, min(idx, len(state.files) - 1))
         path = state.files[state.file_idx]
-        gray = load_gray(path)
-        state.img_full = gray
-        state.img_gray = gray.copy()
-        state.crop_box = None
-        state.crop_pts = []
+        fname = path.name
+        snap = state.per_file_results.get(fname)
         if new_folder:
             state.reset_analysis(keep_series=True)
         else:
             state.reset_per_image()
+        if snap and not force and not new_folder:
+            # 確定済み画像: 保存時の中心窩・乳頭・マスクを復元して表示
+            _restore_from_snapshot(snap)
+            state.img_full = state.img_gray.copy()
+        else:
+            gray = load_gray(path)
+            state.img_full = gray
+            state.img_gray = gray.copy()
+            state.crop_box = None
+            state.crop_pts = []
         _refresh_image_width_label()
         _refresh_scale_info()
         _refresh_file_dropdown()
@@ -1085,13 +1286,18 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 state.stats is not None, state.mask is not None, bool(state.files),
             )
             return
+        if state.fovea_xy is None:
+            _log.warning("save skipped: fovea_xy is None for %s", state.files[state.file_idx].name)
+            return
         fname = state.files[state.file_idx].name
-        state.per_file_results[fname] = _snapshot_current()
+        snap = _snapshot_current()
+        state.per_file_results[fname] = snap
         _prune_stale_batch_results()
         _clear_series_display()
+        lm = landmarks_from_snapshot(snap)
         _log.info(
-            "saved %s → confirmed=%s",
-            fname, list(state.per_file_results.keys()),
+            "saved %s fovea=%s disc=%s → confirmed=%s",
+            fname, lm["fovea_xy"], lm["disc_xy"], list(state.per_file_results.keys()),
         )
 
     def on_next_image(_=None) -> None:
@@ -1126,13 +1332,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             page.update()
             return
         _clear_series_display()
-        state.img_gray = snap["image"].copy()
-        state.mask = snap["mask"].copy()
-        state.stats = copy.deepcopy(snap["stats"])
-        state.fovea_xy = snap.get("fovea_xy")
-        if snap.get("scale_um_px") is not None:
-            state.scale_um_px = snap["scale_um_px"]
-        state.mode = None
+        _restore_from_snapshot(snap)
         status.value = f"確定済み結果を表示: {fname}"
         refresh_hint()
         update_confirm_visibility()
@@ -1197,6 +1397,14 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         page.update()
 
     def refresh_image(*, do_update: bool = True) -> None:
+        if state.series_review_active and state.series_results:
+            rgb = _review_display_rgb()
+            img_ctrl.visible = True
+            gif_img.visible = False
+            graph_area.visible = False
+            if rgb is not None:
+                _push_image_rgb(rgb, do_update=do_update)
+            return
         if state.view_mode == "gif" and state.series_gif:
             gif_img.src_base64 = base64.b64encode(state.series_gif).decode("ascii")
             img_ctrl.visible = False
@@ -1224,31 +1432,203 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
 
         _push_image_rgb(rgb, do_update=do_update)
 
+    _GRAPH_METRICS = {
+        "area_mm2": ("GA Area (mm2)", lambda s: s.get("area_mm2"), T.ACCENT_RED),
+        "area_mm_sqrt": ("SQRT GA Area (mm)", lambda s: s.get("area_mm_sqrt"), "#F59E0B"),
+        "gawain": (_safe_text(GAWAIN_LABEL), lambda s: s.get("gawain"), T.ACCENT_AMBER),
+        "dist_um": ("Distance to fovea (um)", lambda s: s.get("dist_um"), T.ACCENT_CYAN),
+    }
+
+    def _format_series_datetime_label(iso: str) -> str:
+        """グラフ・表用の日時ラベル。"""
+        try:
+            dt = parse_series_datetime(iso)
+        except ValueError:
+            return iso
+        if dt.hour or dt.minute or dt.second:
+            return dt.strftime("%Y-%m-%d %H:%M")
+        return dt.strftime("%Y-%m-%d")
+
+    def _series_x_values(results: list[dict]) -> list[float]:
+        """各時点の X 座標（1970-01-01 からの経過日数）。"""
+        xs: list[float] = []
+        for r in results:
+            try:
+                xs.append(datetime_to_plot_x(parse_series_datetime(r["date"])))
+            except ValueError:
+                xs.append(float(len(xs)))
+        return xs
+
+    def _plot_x_to_datetime(x: float) -> datetime:
+        return datetime.fromtimestamp(x * 86400.0)
+
+    def _nice_date_axis_ticks(
+        x_min: float,
+        x_max: float,
+        *,
+        max_ticks: int = 6,
+        show_time: bool = False,
+    ) -> list[tuple[float, str]]:
+        """X 軸目盛を日時ラベル付きで生成（連続スケール）。"""
+        if x_min == x_max:
+            dt = _plot_x_to_datetime(x_min)
+            return [(x_min, dt.strftime("%Y-%m-%d %H:%M" if show_time else "%Y-%m-%d"))]
+        span = x_max - x_min
+        raw_step = span / max(max_ticks - 1, 1)
+        mag = 10 ** math.floor(math.log10(raw_step)) if raw_step > 0 else 1.0
+        step = raw_step
+        for mult in (1, 2, 2.5, 5, 10):
+            candidate = mult * mag
+            if candidate >= raw_step:
+                step = candidate
+                break
+        lo = math.floor(x_min / step) * step
+        fmt = "%Y-%m-%d %H:%M" if show_time or span < 2.0 else "%Y-%m-%d"
+        ticks: list[tuple[float, str]] = []
+        x = lo
+        while x <= x_max + step * 0.5:
+            if x >= x_min - step * 0.01:
+                ticks.append((x, _plot_x_to_datetime(x).strftime(fmt)))
+            x += step
+        if len(ticks) < 2:
+            ticks = [
+                (x_min, _plot_x_to_datetime(x_min).strftime(fmt)),
+                (x_max, _plot_x_to_datetime(x_max).strftime(fmt)),
+            ]
+        return ticks
+
+    def _graph_show_time(results: list[dict]) -> bool:
+        for r in results:
+            try:
+                dt = parse_series_datetime(r["date"])
+                if dt.hour or dt.minute or dt.second:
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    def _nice_axis_range(vmin: float, vmax: float) -> tuple[float, float, float]:
+        """Y軸の min/max/目盛間隔を値に応じて決める（0 起点にしない）。"""
+        if vmin == vmax:
+            pad = abs(vmin) * 0.1 or 1.0
+            vmin, vmax = vmin - pad, vmax + pad
+        else:
+            pad = (vmax - vmin) * 0.12
+            vmin, vmax = vmin - pad, vmax + pad
+        span = vmax - vmin
+        raw_step = span / 4.0
+        mag = 10 ** math.floor(math.log10(raw_step)) if raw_step > 0 else 1.0
+        for mult in (1, 2, 2.5, 5, 10):
+            step = mult * mag
+            if step >= raw_step:
+                break
+        lo = math.floor(vmin / step) * step
+        hi = math.ceil(vmax / step) * step
+        return lo, hi, step
+
     def _refresh_graph() -> None:
         graph_area.controls.clear()
-        if not state.series_results:
-            return
-        rows = []
-        for r in state.series_results:
-            s = r["stats"]
-            rows.append(
-                ft.DataRow(cells=[
-                    ft.DataCell(ft.Text(r["date"])),
-                    ft.DataCell(ft.Text(f"{s['area_mm2']}")),
-                    ft.DataCell(ft.Text(f"{s['area_mm_sqrt']}")),
-                    ft.DataCell(ft.Text(format_gawain_display(s["gawain"]))),
-                    ft.DataCell(ft.Text(
-                        f"{s['dist_um']:.0f}" if s["dist_um"] is not None else "-")),
-                ])
+        results = state.series_results or []
+        graph_area.controls.append(graph_metric_dd)
+        if not results:
+            graph_area.controls.append(
+                ft.Text("時系列データがありません", size=12, color=T.TEXT_MUTED)
             )
+            return
+
+        metric = state.graph_metric
+        label, getter, color = _GRAPH_METRICS.get(metric, _GRAPH_METRICS["area_mm2"])
+        xs = _series_x_values(results)
+
+        pts, table_rows = [], []
+        for x, r in zip(xs, results):
+            v = getter(r["stats"])
+            if v is not None:
+                pts.append((x, float(v)))
+            table_rows.append((_format_series_datetime_label(r["date"]), v))
+
+        if len(pts) < 1:
+            graph_area.controls.append(
+                ft.Text(f"{label}: 有効な値がありません", size=12, color=T.TEXT_MUTED)
+            )
+        else:
+            ys = [p[1] for p in pts]
+            lo, hi, step = _nice_axis_range(min(ys), max(ys))
+            x_min = min(x for x, _ in pts)
+            x_max = max(x for x, _ in pts)
+            if x_min == x_max:
+                x_min -= 0.5
+                x_max += 0.5
+            data = ft.LineChartData(
+                data_points=[ft.LineChartDataPoint(x, y) for x, y in pts],
+                stroke_width=2,
+                color=color,
+                curved=False,
+                stroke_cap_round=True,
+                point=True,
+            )
+            y_labels = []
+            v = lo
+            while v <= hi + step * 0.5:
+                y_labels.append(ft.ChartAxisLabel(
+                    value=v,
+                    label=ft.Text(f"{v:.2f}".rstrip("0").rstrip("."), size=10, color=T.TEXT_MUTED),
+                ))
+                v += step
+            x_ticks = _nice_date_axis_ticks(
+                x_min, x_max, show_time=_graph_show_time(results),
+            )
+            x_labels = [
+                ft.ChartAxisLabel(
+                    value=x,
+                    label=ft.Text(_safe_text(lbl), size=9, color=T.TEXT_MUTED),
+                )
+                for x, lbl in x_ticks
+            ]
+            # 各データ点にも日時ラベル（目盛と重ならない位置）
+            for x, r in zip(xs, results):
+                x_labels.append(ft.ChartAxisLabel(
+                    value=x,
+                    label=ft.Text(
+                        _safe_text(_format_series_datetime_label(r["date"])),
+                        size=8,
+                        color=color,
+                    ),
+                ))
+            chart = ft.LineChart(
+                data_series=[data],
+                min_y=lo, max_y=hi,
+                min_x=x_min, max_x=x_max,
+                left_axis=ft.ChartAxis(labels=y_labels, labels_size=44, title=ft.Text(label, size=11, color=T.TEXT), title_size=18),
+                bottom_axis=ft.ChartAxis(
+                    labels=x_labels,
+                    labels_size=36,
+                    title=ft.Text("撮影日時", size=11, color=T.TEXT),
+                    title_size=18,
+                ),
+                tooltip_bgcolor=T.PANEL_BG,
+                border=ft.border.all(1, "#374151"),
+                horizontal_grid_lines=ft.ChartGridLines(interval=step, color="#374151", width=1),
+                expand=False,
+                height=320,
+                width=DISPLAY_WIDTH,
+            )
+            graph_area.controls.append(ft.Text(label, size=13, weight=ft.FontWeight.W_600, color=color))
+            graph_area.controls.append(chart)
+
+        fmt = "{:.0f}" if metric in ("dist_um", "gawain") else "{:.3f}"
+        rows = [
+            ft.DataRow(cells=[
+                ft.DataCell(ft.Text(_safe_text(d))),
+                ft.DataCell(ft.Text(fmt.format(v) if v is not None else "-")),
+            ])
+            for d, v in table_rows
+        ]
         graph_area.controls.append(
             ft.DataTable(
                 columns=[
                     ft.DataColumn(ft.Text("Date")),
-                    ft.DataColumn(ft.Text("GA mm2")),
-                    ft.DataColumn(ft.Text("GA mm [SQRT]")),
-                    ft.DataColumn(ft.Text(GAWAIN_LABEL, size=10)),
-                    ft.DataColumn(ft.Text("Dist um")),
+                    ft.DataColumn(ft.Text(_safe_text(label))),
                 ],
                 rows=rows,
                 border=ft.border.all(1, "#374151"),
@@ -1258,7 +1638,10 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     def refresh_results() -> None:
         results_col.controls.clear()
         stats = state.stats
-        if state.series_results and state.view_mode == "work":
+        if state.series_results and state.series_review_active:
+            idx = max(0, min(state.series_review_idx, len(state.series_results) - 1))
+            stats = state.series_results[idx]["stats"]
+        elif state.series_results and state.view_mode == "work":
             stats = state.series_results[state.series_time_idx]["stats"]
 
         age = int(age_field.value or state.age)
@@ -1347,21 +1730,36 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             results_col.controls.append(
                 btn_toolbar("個別結果", on_click=on_show_saved),
             )
-        if state.series_results:
+        if state.series_results and not state.series_review_active:
             n_tp = len(state.series_results)
             tp = min(state.series_time_idx, n_tp - 1) + 1
             n_files = len(state.files)
             saved = _batch_saved_count()
             cur = state.series_results[min(state.series_time_idx, n_tp - 1)]
+            reg_note = (
+                "位置合わせ済"
+                if state.series_registered
+                else "位置合わせなし（各画像の座標のまま）"
+            )
             results_col.controls.append(ft.Text(
                 _safe_text(
                     f"時系列 時点 {tp}/{n_tp}"
                     f" · 確定 {saved}/{n_files}"
+                    f" · {reg_note}"
                     f" · {cur['date']} {cur['filename']}"
                 ),
                 size=12,
                 color=T.PRIMARY,
             ))
+            if not state.series_registered:
+                results_col.controls.append(ft.Text(
+                    _safe_text(
+                        "位置合わせが必要な場合は左のトグルを ON にして"
+                        "「位置合わせを実行」を押してください。"
+                    ),
+                    size=11,
+                    color=T.TEXT_MUTED,
+                ))
             if saved < n_files:
                 results_col.controls.append(ft.Text(
                     _safe_text(
@@ -1686,7 +2084,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     def _commit_edit_stroke() -> None:
         if edit_state["changed"] and edit_state["preview_mask"] is not None:
             edit_state["undo_stack"].append(state.mask.copy())
-            state.mask = edit_state["preview_mask"].copy()
+            state.mask = _finalize_mask(edit_state["preview_mask"].copy())
             status.value = (
                 "削除を適用 — 続けて編集するか ✓ OK で確定"
                 if state.mode == "seg_erase"
@@ -1964,7 +2362,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         if removed == 0:
             edit_state["undo_stack"].pop()
         else:
-            state.mask = new_mask
+            state.mask = _finalize_mask(new_mask)
         state.clear_pts = []
         state.mode = "seg_review"
         edit_state["clear_outside"] = False
@@ -2025,6 +2423,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         p1, p2 = state.disc_draft_pts
         try:
             state.disc_pts = [p1, p2]
+            mid = disc_xy_from_pts(state.disc_pts)
             state.scale_um_px = calibration.compute_scale_um_per_px(
                 p1, p2, float(disc_field.value or state.disc_diameter_um))
             state.calibration_source = "disc"
@@ -2036,8 +2435,12 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.mode = None
         _invalidate_saved_results(reason="disc_ok")
         kept = _batch_saved_count()
+        mid_txt = (
+            f" · 乳頭中点 ({mid[0]:.0f},{mid[1]:.0f})"
+            if mid is not None else ""
+        )
         status.value = (
-            f"乳頭計測完了: {state.scale_um_px:.2f} μm/px"
+            f"乳頭計測完了: {state.scale_um_px:.2f} μm/px{mid_txt}"
             + (f" — 他画像の確定 {kept} 枚は保持" if kept else "")
             + " — 中心窩をタップしてください"
         )
@@ -2255,37 +2658,31 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         edit_state["changed"] = False
         edit_state["undo_stack"] = []
         edit_state["session_base"] = None
+        state.mask = _finalize_mask(state.mask)
         state.stats = ga_stats(state.mask, state.scale_um_px, state.fovea_xy)
         state.mode = None
         saved = 0
         n = len(state.files)
-        # 2枚以上確定で④時系列を自動起動（全枚数完了を待たない）
-        series_ready = False
+        # 確定後は自動起動せず、ユーザーが対象をチェックして④を押す運用。
         if state.batch_mode:
             _save_batch_result()
+            state.series_selected.setdefault(state.files[state.file_idx].name, True)
             saved = _batch_saved_count()
+            selected = _selected_count()
             pos = state.file_idx + 1
-            series_ready = saved >= 2
-            if series_ready:
-                missing = n - saved
-                extra = (
-                    f" - 時系列表示を開始します…"
-                    if missing == 0
-                    else f" - 時系列表示を開始（未確定 {missing} 枚は後から追加可）…"
+            if selected >= 2:
+                _set_status(
+                    f"確定 {saved}/{n} (画像 {pos}/{n}) · 対象 {selected} 枚"
+                    " - 「次へ ▶」で続行、または ④ 時系列を実行"
                 )
-                _set_status(f"確定済み {saved}/{n} (画像 {pos}/{n}){extra}")
             else:
                 _set_status(
-                    f"確定済み {saved}/{n} (画像 {pos}/{n})"
+                    f"確定 {saved}/{n} (画像 {pos}/{n})"
                     " - 結果を確認し「次へ ▶」で次画像"
-                    "（2枚以上で④時系列可）"
+                    "（対象2枚以上で④時系列可）"
                 )
         else:
             _set_status("解析完了")
-        if state.batch_mode and series_ready:
-            land_name = state.files[state.file_idx].name if state.files else None
-            _launch_series_display(auto=True, landing_filename=land_name)
-            return
         refresh_hint()
         update_confirm_visibility()
         refresh_image()
@@ -2340,30 +2737,314 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     def on_seg_draw_click(_=None) -> None:
         _begin_edit_mode("seg_draw")
 
-    def _launch_series_display(
+    review_state = {"diff": True}
+
+    def _review_current_idx() -> int:
+        results = state.series_results or []
+        if not results:
+            return 0
+        return max(0, min(state.series_review_idx, len(results) - 1))
+
+    def _all_reg_ok() -> bool:
+        results = state.series_results or []
+        return bool(results) and all(r.get("reg_ok") for r in results)
+
+    def _review_display_rgb() -> np.ndarray | None:
+        results = state.series_results or []
+        if not results:
+            return None
+        idx = _review_current_idx()
+        row = results[idx]
+        if review_state["diff"] and idx > 0:
+            from engine.overlay import registration_diff_overlay
+            return registration_diff_overlay(results[0]["image"], row["image"])
+        return state.series_overlays[idx] if state.series_overlays else _row_overlay(row)
+
+    def _refresh_review_panel() -> None:
+        panel = _ui.get("reg_review_panel")
+        if panel is None:
+            return
+        results = state.series_results or []
+        active = state.series_review_active and bool(results)
+        panel.visible = active
+        if not active:
+            return
+        idx = _review_current_idx()
+        row = results[idx]
+        n = len(results)
+        method_label = REGISTRATION_METHODS.get(
+            row.get("reg_method", "affine"), row.get("reg_method", "-")
+        )
+        is_ref = row.get("is_reference")
+        _ui["reg_review_title"].value = _safe_text(
+            f"位置合わせ確認 {idx + 1}/{n} · {row['date']} · {row['filename']}"
+        )
+        if is_ref:
+            lm = landmarks_from_snapshot(
+                state.per_file_results.get(row["filename"], row)
+            )
+            disc_note = (
+                f" · 乳頭 ({lm['disc_xy'][0]:.0f},{lm['disc_xy'][1]:.0f})"
+                if lm.get("disc_xy") else ""
+            )
+            fxy = lm.get("fovea_xy")
+            fovea_note = (
+                f"中心窩 ({fxy[0]:.0f},{fxy[1]:.0f}){disc_note}"
+                if fxy else "固定点なし"
+            )
+            _ui["reg_review_info"].value = _safe_text(
+                f"基準時点（最古）— 移動なし · {fovea_note}"
+            )
+        else:
+            mark = "OK" if row.get("reg_ok") else "未確認"
+            snap = state.per_file_results.get(row["filename"], {})
+            lm = landmarks_from_snapshot(snap) if snap else {}
+            disc_note = (
+                f" · 乳頭 ({lm['disc_xy'][0]:.0f},{lm['disc_xy'][1]:.0f})"
+                if lm.get("disc_xy") else ""
+            )
+            fxy = lm.get("fovea_xy")
+            fovea_note = (
+                f"固定点: 中心窩 ({fxy[0]:.0f},{fxy[1]:.0f}){disc_note}"
+                if fxy else "固定点: 中心窩なし"
+            )
+            _ui["reg_review_info"].value = _safe_text(
+                f"手法: {method_label} · 状態: {mark} · {fovea_note}"
+                " · 整列後は中心窩が基準点へ重なります（差分表示推奨）"
+            )
+        ok_count = sum(1 for r in results if r.get("reg_ok"))
+        _ui["reg_review_progress"].value = _safe_text(
+            f"確認済み {ok_count}/{n}"
+        )
+        _ui["reg_ok_btn"].disabled = is_ref
+        _ui["reg_redo_row"].visible = not is_ref
+        _ui["reg_finish_btn"].disabled = not _all_reg_ok()
+        _ui["reg_diff_switch"].value = review_state["diff"]
+        _ui["reg_diff_switch"].disabled = is_ref
+        _ui["reg_method_dd"].value = row.get("reg_method", "affine")
+
+    def _enter_registration_review() -> None:
+        state.series_review_active = True
+        _refresh_review_panel()
+        refresh_hint()
+        update_confirm_visibility()
+        refresh_image()
+        refresh_results()
+
+    def _goto_review(idx: int) -> None:
+        results = state.series_results or []
+        if not results:
+            return
+        state.series_review_idx = max(0, min(idx, len(results) - 1))
+        _refresh_review_panel()
+        refresh_image()
+        page.update()
+
+    def on_review_prev(_=None) -> None:
+        _goto_review(_review_current_idx() - 1)
+
+    def on_review_next(_=None) -> None:
+        _goto_review(_review_current_idx() + 1)
+
+    def on_review_diff_toggle(e) -> None:
+        review_state["diff"] = bool(e.control.value)
+        refresh_image()
+        page.update()
+
+    def on_review_ok(_=None) -> None:
+        results = state.series_results or []
+        idx = _review_current_idx()
+        if not results or idx <= 0:
+            return
+        results[idx]["reg_ok"] = True
+        # 次の未確認へ自動で進む
+        nxt = next(
+            (i for i in range(idx + 1, len(results)) if not results[i].get("reg_ok")),
+            None,
+        )
+        if nxt is not None:
+            state.series_review_idx = nxt
+        _refresh_review_panel()
+        refresh_image()
+        if _all_reg_ok():
+            _set_status("全時点の位置合わせを確認しました — 「確認完了」で結果表示へ")
+        page.update()
+
+    def on_review_redo(_=None) -> None:
+        """選択中の手法で現在時点を再位置合わせする。"""
+        results = state.series_results or []
+        idx = _review_current_idx()
+        if not results or idx <= 0:
+            return
+        method = _ui["reg_method_dd"].value or "affine"
+        _set_status(_safe_text(f"再位置合わせ中… ({REGISTRATION_METHODS.get(method, method)})"))
+        page.update()
+        try:
+            updated = reregister_timepoint(
+                results, idx, state.per_file_results, method=method,
+            )
+        except Exception as exc:
+            _set_status(f"再位置合わせエラー: {exc}")
+            page.update()
+            return
+        results[idx] = updated
+        state.series_methods[updated["filename"]] = method
+        # overlay / GIF / 進行速度を再構築
+        _rebuild_series_derived()
+        _refresh_review_panel()
+        refresh_image()
+        refresh_results()
+        _set_status(_safe_text(
+            f"{updated['filename']} を {REGISTRATION_METHODS.get(method, method)} で再位置合わせしました"
+        ))
+        page.update()
+
+    def on_review_finish(_=None) -> None:
+        if not _all_reg_ok():
+            _set_status("未確認の時点があります（各時点で OK を押してください）")
+            page.update()
+            return
+        state.series_review_active = False
+        state.series_registered = True
+        _refresh_review_panel()
+        _update_registration_controls()
+        n = len(state.series_results or [])
+        selected = _selected_count()
+        state.view_mode = "work"
+        view_mode.value = "work"
+        view_mode.visible = True
+        series_date_dd.visible = True
+        state.series_time_idx = _review_current_idx()
+        series_date_dd.value = str(state.series_time_idx)
+        _sync_file_idx_to_series_timepoint(update_dropdown=True)
+        _set_status(_safe_text(
+            f"時系列表示 ({n} 時点 / 対象 {selected} 枚) "
+            "— 撮影日 / 作業・GIF・グラフで切替"
+        ))
+        refresh_hint()
+        update_confirm_visibility()
+        refresh_image()
+        refresh_results()
+        page.update()
+
+    def _show_series_results_view(*, n: int, selected: int) -> None:
+        """位置合わせなしで時系列結果を表示（グラフ優先）。"""
+        state.series_registered = False
+        state.series_review_active = False
+        state.view_mode = "graph"
+        view_mode.value = "graph"
+        view_mode.visible = True
+        series_date_dd.visible = True
+        _refresh_review_panel()
+        _update_registration_controls()
+        _set_status(_safe_text(
+            f"時系列グラフ ({n} 時点 / 対象 {selected} 枚)"
+            " — 位置合わせ OFF（各画像の座標のまま）"
+        ))
+
+    def _run_registration_on_series(
         *,
-        auto: bool = False,
         landing_filename: str | None = None,
     ) -> bool:
-        """確定済み結果から時系列表示を構築する。"""
-        saved = _batch_saved_count()
-        n = len(state.files)
-        if saved < 2:
-            _set_status(f"時系列には2枚以上の確定結果が必要です (現在 {saved}/{n} 枚)")
+        """選択済み時系列に位置合わせを適用し、確認モードへ入る。"""
+        selected = _selected_count()
+        if selected < 2:
+            _set_status(f"位置合わせには対象2枚以上が必要です (現在 選択 {selected} 枚)")
+            page.update()
             return False
         prefer = landing_filename
-        if prefer is None and state.files:
+        if prefer is None and state.series_results:
+            prefer = state.series_results[
+                min(state.series_time_idx, len(state.series_results) - 1)
+            ]["filename"]
+        elif prefer is None and state.files:
             prefer = state.files[state.file_idx].name
-        dd_gen = _begin_series_launch_guard()
-        _set_status("時系列表示を構築中…")
-        # Do NOT page.update() here: flushing UI mid-build lets deferred
-        # file_dd on_change fire while series_results is still None.
+        selected_set = set(_selected_confirmed())
+        _ensure_selected_series_dates(selected_set)
+        _set_status("位置合わせを計算中…")
+        page.update()
         try:
             results = build_series_from_saved(
                 state.per_file_results,
                 state.files,
                 state.series_dates,
                 register=True,
+                selected=selected_set,
+                methods=state.series_methods,
+            )
+        except ValueError as exc:
+            _set_status(str(exc))
+            page.update()
+            return False
+        except Exception as exc:
+            _set_status(f"位置合わせエラー: {exc}")
+            page.update()
+            return False
+        _apply_series_results(results, landing_filename=prefer)
+        state.series_review_active = True
+        state.series_review_idx = 1 if len(results) > 1 else 0
+        view_mode.visible = False
+        series_date_dd.visible = False
+        _update_registration_controls()
+        _set_status(_safe_text(
+            f"位置合わせ確認 ({len(results)} 時点 / 対象 {selected} 枚)"
+            " — 各時点で OK / やり直しを選択してください"
+        ))
+        _enter_registration_review()
+        page.update()
+        return True
+
+    def on_registration_toggle(e: ft.ControlEvent) -> None:
+        state.series_registration_enabled = bool(e.control.value)
+        _update_registration_controls()
+        page.update()
+
+    def on_apply_registration(_=None) -> None:
+        if not state.series_registration_enabled:
+            _set_status("位置合わせトグルを ON にしてください")
+            page.update()
+            return
+        if state.series_results is None:
+            _set_status("先に ④ 時系列を実行してください")
+            page.update()
+            return
+        if state.series_registered:
+            _set_status("この時系列は既に位置合わせ済みです")
+            page.update()
+            return
+        _run_registration_on_series()
+
+    reg_apply_btn.on_click = on_apply_registration
+    registration_sw.on_change = on_registration_toggle
+
+    def _launch_series_display(
+        *,
+        auto: bool = False,
+        landing_filename: str | None = None,
+    ) -> bool:
+        """確定済み結果から時系列を構築。既定は位置合わせなしでグラフ表示。"""
+        selected = _selected_count()
+        saved = _batch_saved_count()
+        if selected < 2:
+            _set_status(f"時系列には対象2枚以上が必要です (現在 選択 {selected} 枚)")
+            page.update()
+            return False
+        prefer = landing_filename
+        if prefer is None and state.files:
+            prefer = state.files[state.file_idx].name
+        selected_set = set(_selected_confirmed())
+        _ensure_selected_series_dates(selected_set)
+        refresh_series_dates_ui()
+        dd_gen = _begin_series_launch_guard()
+        _set_status("時系列を構築中…")
+        try:
+            results = build_series_from_saved(
+                state.per_file_results,
+                state.files,
+                state.series_dates,
+                register=False,
+                selected=selected_set,
+                methods=state.series_methods,
             )
         except ValueError as exc:
             _end_series_launch_guard(dd_gen)
@@ -2377,26 +3058,18 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             return False
         state.disc_diameter_um = float(disc_field.value or 1800)
         _apply_series_results(results, landing_filename=prefer)
-        prefix = "時系列表示を開始" if auto else "時系列表示"
-        missing = n - saved
-        tip = (
-            f" — 未確定 {missing} 枚。残り確定後に④を再実行してください"
-            if missing > 0 else
-            " — 撮影日 / ◀▶ で時点切替、右の再解析で個別修正"
-        )
-        _set_status(f"{prefix} ({len(results)} 時点 / 確定 {saved}/{n}){tip}")
-        state.view_mode = "work"
-        view_mode.value = "work"
-        view_mode.visible = True
-        series_date_dd.visible = True
+        _show_series_results_view(n=len(results), selected=selected)
+        _update_batch_ui(refresh_dropdown=False)
+        _refresh_file_dropdown_labels()
         refresh_hint()
         update_confirm_visibility()
         refresh_image()
         refresh_results()
-        _update_batch_ui(refresh_dropdown=False)
-        _refresh_file_dropdown_labels()
         page.update()
         _end_series_launch_guard(dd_gen)
+
+        if state.series_registration_enabled:
+            return _run_registration_on_series(landing_filename=prefer)
         return True
 
     def on_series(_=None) -> None:
@@ -2419,6 +3092,13 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         page.update()
 
     view_mode.on_change = on_view_change
+
+    def on_graph_metric_change(e) -> None:
+        state.graph_metric = e.control.value or "area_mm2"
+        _refresh_graph()
+        page.update()
+
+    graph_metric_dd.on_change = on_graph_metric_change
 
     def on_series_date(e) -> None:
         if e.control.value is not None:
@@ -2446,7 +3126,15 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
 
     series_launch_btn = btn_primary("④ 時系列で表示", on_click=on_series)
     series_launch_btn.visible = False
-    series_launch_row = ft.Row([series_launch_btn], visible=False)
+    series_launch_row = ft.Column(
+        [
+            registration_sw,
+            ft.Row([series_launch_btn], spacing=8),
+            reg_apply_btn,
+        ],
+        spacing=6,
+        visible=False,
+    )
 
     toolbar = ft.Row(
         [
@@ -2655,10 +3343,73 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         ),
     )
 
+    reg_review_title = ft.Text("", size=13, weight=ft.FontWeight.W_600, color=T.PRIMARY)
+    reg_review_info = ft.Text("", size=12, color=T.TEXT)
+    reg_review_progress = ft.Text("", size=11, color=T.TEXT_MUTED)
+    reg_method_dd = ft.Dropdown(
+        label="やり直しの手法",
+        width=300,
+        text_size=12,
+        value="landmark",
+        options=[
+            ft.dropdown.Option(key=k, text=v)
+            for k, v in REGISTRATION_METHODS.items()
+        ],
+    )
+    reg_ok_btn = btn_ok("✓ この位置合わせでOK", on_click=on_review_ok)
+    reg_redo_btn = btn_outlined("↩ この手法でやり直し", on_click=on_review_redo)
+    reg_redo_row = ft.Row([reg_method_dd, reg_redo_btn], spacing=8, wrap=True)
+    reg_diff_switch = ft.Switch(
+        label="差分表示（緑=基準 / 桃=対象）", value=True,
+        on_change=on_review_diff_toggle,
+    )
+    reg_finish_btn = btn_primary("確認完了 → 結果表示", on_click=on_review_finish)
+    reg_review_nav = ft.Row(
+        [
+            btn_outlined("◀ 前", on_click=on_review_prev),
+            btn_outlined("次 ▶", on_click=on_review_next),
+            reg_review_progress,
+        ],
+        spacing=8,
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+    )
+    reg_review_panel = ft.Container(
+        visible=False,
+        bgcolor=T.PANEL_BG,
+        border=ft.border.all(1, "#374151"),
+        border_radius=8,
+        padding=ft.padding.all(12),
+        content=ft.Column(
+            [
+                reg_review_title,
+                reg_review_info,
+                reg_diff_switch,
+                reg_review_nav,
+                ft.Row([reg_ok_btn], spacing=8),
+                reg_redo_row,
+                ft.Divider(color="#374151"),
+                reg_finish_btn,
+            ],
+            spacing=8,
+            tight=True,
+        ),
+    )
+    _ui.update({
+        "reg_review_panel": reg_review_panel,
+        "reg_review_title": reg_review_title,
+        "reg_review_info": reg_review_info,
+        "reg_review_progress": reg_review_progress,
+        "reg_method_dd": reg_method_dd,
+        "reg_ok_btn": reg_ok_btn,
+        "reg_redo_row": reg_redo_row,
+        "reg_diff_switch": reg_diff_switch,
+        "reg_finish_btn": reg_finish_btn,
+    })
+
     left = ft.Column(
         [
             ft.Text("GA Segmentation Pro", size=22, weight=ft.FontWeight.BOLD, color=T.PRIMARY),
-            ft.Text("研究用", size=11, color=T.TEXT_MUTED),
+            ft.Text(f"研究用 · build {APP_VERSION}", size=10, color=T.TEXT_MUTED),
             toolbar,
             batch_progress,
             cancel_row,
@@ -2673,6 +3424,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             scale_info,
             status,
             series_launch_row,
+            reg_review_panel,
             view_mode,
             series_date_dd,
             img_stack,
