@@ -3,7 +3,6 @@ import pytest
 from datetime import date
 from pathlib import Path
 
-from engine.registration import register_stack
 from engine.timeseries import (
     build_series_from_saved,
     estimate_progression_rate_um_per_year,
@@ -13,21 +12,6 @@ from engine.timeseries import (
     overlays_to_gif_bytes,
     resize_to_reference,
 )
-
-
-def test_register_stack_recovers_translation():
-    base = np.zeros((120, 120), dtype=np.uint8)
-    cv2 = __import__('cv2')
-    cv2.circle(base, (60, 60), 20, 200, -1)
-
-    shifted = np.zeros_like(base)
-    shifted[5:115, 8:118] = base[0:110, 0:110]
-
-    stack = np.stack([base, shifted], axis=0)
-    aligned, matrices = register_stack(stack)
-    assert aligned.shape == stack.shape
-    assert len(matrices) == 2
-    assert not np.array_equal(aligned[1], shifted)
 
 
 def test_guess_image_date_from_filename():

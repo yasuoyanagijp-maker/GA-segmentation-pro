@@ -10,9 +10,6 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from engine import segmentation
-from engine.io_utils import load_gray
-from engine.registration import register_stack
 from engine.stats import ga_stats
 
 
@@ -176,49 +173,6 @@ def scale_landmarks(
     elif pts:
         dxy = disc_xy_from_pts(pts)
     return {"fovea_xy": fovea, "disc_pts": pts, "disc_xy": dxy}
-
-
-def analyze_time_series(
-    images: list[np.ndarray],
-    paths: list[Path],
-    dates: list[date],
-    scale_um_px: float,
-    fovea_xy: tuple[float, float],
-    *,
-    register: bool = True,
-    progress_callback=None,
-) -> list[dict]:
-    """各時点でセグメンテーションと指標を算出する。"""
-    if len(images) != len(paths) or len(images) != len(dates):
-        raise ValueError('images, paths, dates の長さが一致しません')
-    if not images:
-        return []
-
-    images = resize_to_reference(images)
-    stack = np.stack(images, axis=0)
-
-    if register and len(images) > 1:
-        stack, _ = register_stack(stack, progress_callback=progress_callback)
-
-    order = sorted(range(len(dates)), key=lambda i: dates[i])
-    results: list[dict] = []
-
-    for rank, idx in enumerate(order):
-        if progress_callback:
-            progress_callback(rank / len(order), f'Analyzing timepoint {rank + 1}/{len(order)}...')
-        img = stack[idx]
-        mask = segmentation.segment_ga(img)
-        stats = ga_stats(mask, scale_um_px, fovea_xy)
-        results.append({
-            'index': idx,
-            'path': str(paths[idx]),
-            'filename': paths[idx].name,
-            'date': dates[idx].isoformat(),
-            'image': img,
-            'mask': mask,
-            'stats': stats,
-        })
-    return results
 
 
 def _slope_per_year_from_results(
