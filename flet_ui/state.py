@@ -1,4 +1,4 @@
-"""アプリケーション状態（Streamlit session_state の代替）。"""
+"""Flet UI 用のアプリケーション状態（page.data に保持）。"""
 
 from __future__ import annotations
 
@@ -52,6 +52,9 @@ class GAAppState:
     series_methods: dict[str, str] = field(default_factory=dict)    # filename -> 位置合わせ手法
     series_registration_enabled: bool = False  # 位置合わせトグル（既定 OFF）
     series_registered: bool = False              # 現在の時系列に位置合わせ済みか
+    # 再解析後に位置合わせを再利用するためのメモリキャッシュ
+    # {selected: tuple[str], ref: str, confirmed: bool, by_file: {fname: {matrix, method}}}
+    series_reg_cache: dict | None = None
     series_results: list[dict] | None = None
     series_overlays: list[np.ndarray] | None = None
     series_gif: bytes | None = None
@@ -103,6 +106,7 @@ class GAAppState:
             self.series_dates_manual = {}
             self.series_registration_enabled = False
             self.series_registered = False
+            self.series_reg_cache = None
             self.batch_mode = False
 
     def cancel_mode(self) -> None:

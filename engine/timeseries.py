@@ -10,9 +10,6 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from engine import segmentation
-from engine.io_utils import load_gray
-from engine.registration import register_stack
 from engine.stats import ga_stats
 
 
@@ -178,49 +175,6 @@ def scale_landmarks(
     return {"fovea_xy": fovea, "disc_pts": pts, "disc_xy": dxy}
 
 
-def analyze_time_series(
-    images: list[np.ndarray],
-    paths: list[Path],
-    dates: list[date],
-    scale_um_px: float,
-    fovea_xy: tuple[float, float],
-    *,
-    register: bool = True,
-    progress_callback=None,
-) -> list[dict]:
-    """各時点でセグメンテーションと指標を算出する。"""
-    if len(images) != len(paths) or len(images) != len(dates):
-        raise ValueError('images, paths, dates の長さが一致しません')
-    if not images:
-        return []
-
-    images = resize_to_reference(images)
-    stack = np.stack(images, axis=0)
-
-    if register and len(images) > 1:
-        stack, _ = register_stack(stack, progress_callback=progress_callback)
-
-    order = sorted(range(len(dates)), key=lambda i: dates[i])
-    results: list[dict] = []
-
-    for rank, idx in enumerate(order):
-        if progress_callback:
-            progress_callback(rank / len(order), f'Analyzing timepoint {rank + 1}/{len(order)}...')
-        img = stack[idx]
-        mask = segmentation.segment_ga(img)
-        stats = ga_stats(mask, scale_um_px, fovea_xy)
-        results.append({
-            'index': idx,
-            'path': str(paths[idx]),
-            'filename': paths[idx].name,
-            'date': dates[idx].isoformat(),
-            'image': img,
-            'mask': mask,
-            'stats': stats,
-        })
-    return results
-
-
 def _slope_per_year_from_results(
     results: list[dict],
     getter,
@@ -288,6 +242,45 @@ def _compute_row_stats(mask, scale, fovea, fallback_stats):
     return fallback_stats
 
 
+def series_metric_regressions(results: list[dict]) -> list[str]:
+    """Detect implausible metric trends across chronological timepoints.
+
+    Returns short Japanese alert strings (empty if no regression).
+    Area / SQRT / GAWAIN should increase; dist_um should decrease toward fovea.
+    """
+    if len(results) < 2:
+        return []
+    # (key, label, expect_increase)
+    checks = (
+        ("area_mm2", "GA面積", True),
+        ("area_mm_sqrt", "SQRT面積", True),
+        ("gawain", "GAWAIN", True),
+        ("dist_um", "中心窩距離", False),
+    )
+    alerts: list[str] = []
+    for key, label, expect_increase in checks:
+        prev = None
+        for row in results:
+            stats = row.get("stats") or {}
+            val = stats.get(key)
+            if val is None:
+                continue
+            v = float(val)
+            if prev is not None:
+                if expect_increase and v < prev - 1e-9:
+                    alerts.append(
+                        f"{label}が時間経過で減少しています（再解析を推奨）"
+                    )
+                    break
+                if not expect_increase and v >= prev - 1e-9:
+                    alerts.append(
+                        f"{label}が時間経過で縮まっていません（再解析を推奨）"
+                    )
+                    break
+            prev = v
+    return alerts
+
+
 def disc_xy_from_pts(
     disc_pts: list | tuple | None,
 ) -> tuple[float, float] | None:
@@ -329,22 +322,28 @@ def build_series_from_saved(
     register: bool = True,
     selected: set[str] | None = None,
     methods: dict[str, str] | None = None,
+    prior_matrices: dict[str, np.ndarray] | None = None,
 ) -> list[dict]:
     """メモリ上の個別解析結果から時系列表示用データを構築（再セグメントなし）。
 
     - selected: 時系列対象に含めるファイル名の集合（None なら確定済み全件）。
     - methods: ファイル名 → 位置合わせ手法（redo 用。既定 "affine"）。
+    - prior_matrices: ファイル名 → 既知のアフィン行列。あれば再計算せず適用する。
 
     先頭時点（最古の撮影日）を基準に、各画像・マスク・中心窩を同じアフィン
     行列で整列する。中心窩は必ず基準の中心窩へ一致させる（fovea anchoring）。
-    面積等は基準フレームのスケールで再計測する。
+    面積等は基準画像の scale_um_px で全時点を再計測する（各画像固有スケールは使わない）。
     """
     from engine.series_registration import (
         default_method_for,
         register_moving_to_reference,
+        warp_image,
+        warp_mask,
+        warp_point,
     )
 
     methods = methods or {}
+    prior_matrices = prior_matrices or {}
 
     ordered = sorted(
         [
@@ -372,7 +371,10 @@ def build_series_from_saved(
     )
     ref_fovea = ref_lm["fovea_xy"]
     ref_disc = ref_lm["disc_xy"]
+    # Pixel→physical: always the reference image's scale for every timepoint.
     ref_scale = ref_snap.get("scale_um_px")
+    if ref_scale is None:
+        raise ValueError("基準画像に scale_um_px がありません")
 
     results: list[dict] = []
     for i, (snap, f) in enumerate(zip(snapshots, ordered)):
@@ -386,8 +388,7 @@ def build_series_from_saved(
         moving_fovea = lm["fovea_xy"]
         moving_disc = lm["disc_xy"]
         source_fovea = lm_raw["fovea_xy"]
-        # 整列後は全画像が基準フレームなので基準スケールで計測する。
-        scale = ref_scale or snap.get("scale_um_px")
+        scale = float(ref_scale)
         if i == 0 or not register:
             img = images[i]
             mask = masks[i]
@@ -396,6 +397,15 @@ def build_series_from_saved(
             disc_pts = lm["disc_pts"]
             matrix = np.eye(2, 3, dtype=np.float32)
             method = "reference" if i == 0 else methods.get(fname, "affine")
+        elif fname in prior_matrices:
+            method = methods.get(fname) or "affine"
+            matrix = np.asarray(prior_matrices[fname], dtype=np.float32)
+            h, w = ref_img.shape[:2]
+            img = warp_image(images[i], matrix, (w, h))
+            mask = warp_mask(masks[i], matrix, (w, h))
+            fovea = warp_point(moving_fovea, matrix) or ref_fovea
+            disc_xy = warp_point(moving_disc, matrix) or ref_disc
+            disc_pts = lm["disc_pts"]
         else:
             method = methods.get(fname) or default_method_for(
                 moving_fovea, moving_disc, ref_fovea, ref_disc,
@@ -432,7 +442,7 @@ def build_series_from_saved(
             "scale_um_px": scale,
             "reg_method": method,
             "reg_matrix": matrix,
-            "reg_ok": (i == 0),
+            "reg_ok": (i == 0) or (fname in prior_matrices),
             "is_reference": (i == 0),
         })
     return results
@@ -476,7 +486,9 @@ def reregister_timepoint(
     ref_fovea = ref_lm["fovea_xy"]
     ref_disc = ref_lm["disc_xy"]
     ref_scale = ref_snap.get("scale_um_px")
-    scale = ref_scale or snap.get("scale_um_px")
+    if ref_scale is None:
+        raise ValueError("基準画像に scale_um_px がありません")
+    scale = float(ref_scale)
 
     reg = register_moving_to_reference(
         images[1], masks[1], ref_img,

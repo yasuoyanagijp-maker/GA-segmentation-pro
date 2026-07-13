@@ -51,6 +51,7 @@ from engine.timeseries import (
     parse_series_datetime,
     parse_user_datetime_input,
     refresh_series_dates_for_files,
+    series_metric_regressions,
     sync_date_to_snapshots,
     landmarks_from_snapshot,
     overlays_to_gif_bytes,
@@ -272,6 +273,8 @@ def _growth_card(mm2_per_year: float | None, mm_sqrt_per_year: float | None) -> 
 
 
 async def build_main_view(page: ft.Page, state: GAAppState) -> None:
+    # Yield once so Flet web can finish the websocket handshake before heavy UI build.
+    await asyncio.sleep(0)
     status = ft.Text("", color=T.ACCENT_AMBER, size=13)
     hint = ft.Text("", color=T.TEXT_MUTED, size=13)
     img_ctrl = ft.Image(
@@ -411,6 +414,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     # Blocks load_image while series is being built (covers page.update races
     # before series_results is assigned).
     series_guard = {"launching": False, "gen": 0}
+    registration_guard = {"running": False}
+    _registration_controls: dict = {"redo_btn": None}
     seg_correction_stats: dict | None = None
     # 遅延生成されるコントロール（registration 確認パネル等）への参照置き場。
     _ui: dict = {}
@@ -548,7 +553,68 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.output_dir = str(out)
         return out
 
+    def _stash_reg_cache_from_series() -> None:
+        """位置合わせ済み（または確認中）の行列をメモリに残す。"""
+        results = state.series_results
+        if not results:
+            return
+        if not (state.series_registered or state.series_review_active):
+            return
+        by_file: dict = {}
+        for r in results:
+            if r.get("is_reference"):
+                continue
+            m = r.get("reg_matrix")
+            if m is None:
+                continue
+            by_file[r["filename"]] = {
+                "matrix": np.asarray(m, dtype=np.float32).copy(),
+                "method": r.get("reg_method", "affine"),
+            }
+        if not by_file:
+            return
+        state.series_reg_cache = {
+            "selected": tuple(sorted(r["filename"] for r in results)),
+            "ref": results[0]["filename"],
+            "confirmed": bool(state.series_registered),
+            "by_file": by_file,
+        }
+
+    def _clear_reg_cache() -> None:
+        state.series_reg_cache = None
+
+    def _prior_matrices_from_cache(
+        selected_set: set[str],
+        series_dates: dict[str, str],
+        series_methods: dict[str, str],
+    ) -> tuple[dict[str, np.ndarray] | None, bool]:
+        """再利用可能な prior_matrices と、以前確認完了済みか。"""
+        cache = state.series_reg_cache
+        if not cache:
+            return None, False
+        selected_key = tuple(sorted(selected_set))
+        if cache.get("selected") != selected_key:
+            return None, False
+        ordered = sorted(selected_set, key=lambda n: series_dates.get(n, ""))
+        if not ordered or ordered[0] != cache.get("ref"):
+            return None, False
+        by_file = cache.get("by_file") or {}
+        for fname, entry in by_file.items():
+            if fname not in selected_set:
+                return None, False
+            cached_method = entry.get("method", "affine")
+            wanted = series_methods.get(fname, cached_method)
+            if wanted != cached_method:
+                return None, False
+        prior = {
+            fname: entry["matrix"]
+            for fname, entry in by_file.items()
+            if fname in selected_set
+        }
+        return prior, bool(cache.get("confirmed"))
+
     def _clear_series_display() -> None:
+        _stash_reg_cache_from_series()
         state.series_results = None
         state.series_overlays = None
         state.series_gif = None
@@ -648,6 +714,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 status.value = _safe_text(
                     "対象画像を変更しました — ④ 時系列を再実行してください"
                 )
+            _clear_reg_cache()
             _update_batch_ui(refresh_dropdown=False)
             page.update()
         return _handler
@@ -684,15 +751,15 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         }
 
     def _row_overlay(row: dict) -> np.ndarray:
+        """時系列用: 位置合わせ後 FAF + GA マスク。乳頭計測線は描画しない。"""
         s = row["stats"]
         fxy = row.get("fovea_xy")
         scale = row.get("scale_um_px")
-        disc = row.get("disc_pts")
         return make_overlay(
             row["image"], row["mask"],
             fovea_xy=fxy,
             nearest_xy=s.get("nearest_xy"),
-            disc_pts=disc,
+            disc_pts=None,
             disc_diameter_um=state.disc_diameter_um,
             show_macula=True,
             scale_um_px=scale,
@@ -791,8 +858,10 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
 
     def _invalidate_series_after_date_edit() -> None:
         if not state.series_results:
+            _clear_reg_cache()
             return
         _clear_series_display()
+        _clear_reg_cache()
         status.value = "撮影日を変更しました — ④ 時系列を再実行してください"
 
     def _apply_series_date(fname: str, picked: date) -> None:
@@ -1272,6 +1341,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         snap = state.per_file_results.get(fname)
         if new_folder:
             state.reset_analysis(keep_series=True)
+            _clear_series_display()
+            _clear_reg_cache()
         else:
             state.reset_per_image()
         if snap and not force and not new_folder:
@@ -1775,6 +1846,13 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 _card("Cross Point", f"{cross} years" if cross is not None else "-", "#10B981"),
             )
         results_col.controls.extend(cards)
+        if is_series and state.series_results:
+            for alert in series_metric_regressions(state.series_results):
+                results_col.controls.append(ft.Text(
+                    _safe_text(f"⚠ {alert}"),
+                    color=T.ACCENT_AMBER,
+                    size=12,
+                ))
         if cross is not None:
             if cross < life_y:
                 results_col.controls.append(ft.Text(
@@ -2969,34 +3047,54 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             _set_status("全時点の位置合わせを確認しました — 「確認完了」で結果表示へ")
         page.update()
 
+    def _set_registration_busy(busy: bool) -> None:
+        registration_guard["running"] = busy
+        reg_apply_btn.disabled = busy
+        redo = _registration_controls.get("redo_btn")
+        if redo is not None:
+            redo.disabled = busy
+
     def on_review_redo(_=None) -> None:
         """選択中の手法で現在時点を再位置合わせする。"""
+        if registration_guard["running"]:
+            return
         results = state.series_results or []
         idx = _review_current_idx()
         if not results or idx <= 0:
             return
         method = _ui["reg_method_dd"].value or "affine"
-        _set_status(_safe_text(f"再位置合わせ中… ({REGISTRATION_METHODS.get(method, method)})"))
-        page.update()
-        try:
-            updated = reregister_timepoint(
-                results, idx, state.per_file_results, method=method,
-            )
-        except Exception as exc:
-            _set_status(f"再位置合わせエラー: {exc}")
+        per_file = state.per_file_results
+        method_label = REGISTRATION_METHODS.get(method, method)
+
+        async def _redo_task() -> None:
+            _set_registration_busy(True)
+            _set_status(_safe_text(f"再位置合わせ中… ({method_label})"))
             page.update()
-            return
-        results[idx] = updated
-        state.series_methods[updated["filename"]] = method
-        # overlay / GIF / 進行速度を再構築
-        _rebuild_series_derived()
-        _refresh_review_panel()
-        refresh_image()
-        refresh_results()
-        _set_status(_safe_text(
-            f"{updated['filename']} を {REGISTRATION_METHODS.get(method, method)} で再位置合わせしました"
-        ))
-        page.update()
+            try:
+                updated = await asyncio.to_thread(
+                    reregister_timepoint,
+                    results,
+                    idx,
+                    per_file,
+                    method=method,
+                )
+            except Exception as exc:
+                _set_status(f"再位置合わせエラー: {exc}")
+            else:
+                results[idx] = updated
+                state.series_methods[updated["filename"]] = method
+                _rebuild_series_derived()
+                _refresh_review_panel()
+                refresh_image()
+                refresh_results()
+                _set_status(_safe_text(
+                    f"{updated['filename']} を {method_label} で再位置合わせしました"
+                ))
+            finally:
+                _set_registration_busy(False)
+                page.update()
+
+        page.run_task(_redo_task)
 
     def on_review_finish(_=None) -> None:
         if not _all_reg_ok():
@@ -3005,6 +3103,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             return
         state.series_review_active = False
         state.series_registered = True
+        _stash_reg_cache_from_series()
         _refresh_review_panel()
         _update_registration_controls()
         n = len(state.series_results or [])
@@ -3044,13 +3143,15 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     def _run_registration_on_series(
         *,
         landing_filename: str | None = None,
-    ) -> bool:
-        """選択済み時系列に位置合わせを適用し、確認モードへ入る。"""
+    ) -> None:
+        """選択済み時系列に位置合わせを適用し、確認モードへ入る（非同期）。"""
+        if registration_guard["running"]:
+            return
         selected = _selected_count()
         if selected < 2:
             _set_status(f"位置合わせには対象2枚以上が必要です (現在 選択 {selected} 枚)")
             page.update()
-            return False
+            return
         prefer = landing_filename
         if prefer is None and state.series_results:
             prefer = state.series_results[
@@ -3060,38 +3161,77 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             prefer = state.files[state.file_idx].name
         selected_set = set(_selected_confirmed())
         _ensure_selected_series_dates(selected_set)
-        _set_status("位置合わせを計算中…")
-        page.update()
-        try:
-            results = build_series_from_saved(
-                state.per_file_results,
-                state.files,
-                state.series_dates,
-                register=True,
-                selected=selected_set,
-                methods=state.series_methods,
-            )
-        except ValueError as exc:
-            _set_status(str(exc))
+        per_file = state.per_file_results
+        files = state.files
+        series_dates = state.series_dates
+        series_methods = state.series_methods
+        prior_matrices, cache_confirmed = _prior_matrices_from_cache(
+            selected_set, series_dates, series_methods,
+        )
+
+        async def _registration_task() -> None:
+            _set_registration_busy(True)
+            if prior_matrices:
+                _set_status("保存済みの位置合わせ行列を適用中…")
+            else:
+                _set_status("位置合わせを計算中…")
             page.update()
-            return False
-        except Exception as exc:
-            _set_status(f"位置合わせエラー: {exc}")
-            page.update()
-            return False
-        _apply_series_results(results, landing_filename=prefer)
-        state.series_review_active = True
-        state.series_review_idx = 1 if len(results) > 1 else 0
-        view_mode.visible = False
-        series_date_dd.visible = False
-        _update_registration_controls()
-        _set_status(_safe_text(
-            f"位置合わせ確認 ({len(results)} 時点 / 対象 {selected} 枚)"
-            " — 各時点で OK / やり直しを選択してください"
-        ))
-        _enter_registration_review()
-        page.update()
-        return True
+            try:
+                results = await asyncio.to_thread(
+                    build_series_from_saved,
+                    per_file,
+                    files,
+                    series_dates,
+                    register=True,
+                    selected=selected_set,
+                    methods=series_methods,
+                    prior_matrices=prior_matrices,
+                )
+            except ValueError as exc:
+                _set_status(str(exc))
+            except Exception as exc:
+                _set_status(f"位置合わせエラー: {exc}")
+            else:
+                _apply_series_results(results, landing_filename=prefer)
+                if prior_matrices and cache_confirmed:
+                    # 再解析後の再利用: 確認フローを飛ばして結果表示へ
+                    state.series_review_active = False
+                    state.series_registered = True
+                    _stash_reg_cache_from_series()
+                    _refresh_review_panel()
+                    _update_registration_controls()
+                    state.view_mode = "work"
+                    view_mode.value = "work"
+                    view_mode.visible = True
+                    series_date_dd.visible = True
+                    _set_status(_safe_text(
+                        f"時系列表示 ({len(results)} 時点 / 対象 {selected} 枚)"
+                        " — 前回の位置合わせ行列を再利用"
+                    ))
+                    refresh_hint()
+                    update_confirm_visibility()
+                    refresh_image()
+                    refresh_results()
+                else:
+                    state.series_review_active = True
+                    state.series_review_idx = 1 if len(results) > 1 else 0
+                    view_mode.visible = False
+                    series_date_dd.visible = False
+                    _update_registration_controls()
+                    reused_note = (
+                        "（行列再利用・要確認）" if prior_matrices else ""
+                    )
+                    _set_status(_safe_text(
+                        f"位置合わせ確認 ({len(results)} 時点 / 対象 {selected} 枚)"
+                        f"{reused_note}"
+                        " — 各時点で OK / やり直しを選択してください"
+                    ))
+                    _enter_registration_review()
+            finally:
+                _set_registration_busy(False)
+                page.update()
+
+        page.run_task(_registration_task)
 
     def on_registration_toggle(e: ft.ControlEvent) -> None:
         state.series_registration_enabled = bool(e.control.value)
@@ -3120,14 +3260,15 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         *,
         auto: bool = False,
         landing_filename: str | None = None,
-    ) -> bool:
-        """確定済み結果から時系列を構築。既定は位置合わせなしでグラフ表示。"""
+    ) -> None:
+        """確定済み結果から時系列を構築。既定は位置合わせなしでグラフ表示（非同期）。"""
+        if registration_guard["running"] or series_guard["launching"]:
+            return
         selected = _selected_count()
-        saved = _batch_saved_count()
         if selected < 2:
             _set_status(f"時系列には対象2枚以上が必要です (現在 選択 {selected} 枚)")
             page.update()
-            return False
+            return
         prefer = landing_filename
         if prefer is None and state.files:
             prefer = state.files[state.file_idx].name
@@ -3136,51 +3277,63 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         refresh_series_dates_ui()
         dd_gen = _begin_series_launch_guard()
         _set_status("時系列を構築中…")
-        try:
-            results = build_series_from_saved(
-                state.per_file_results,
-                state.files,
-                state.series_dates,
-                register=False,
-                selected=selected_set,
-                methods=state.series_methods,
-            )
-        except ValueError as exc:
-            _end_series_launch_guard(dd_gen)
-            _set_status(str(exc))
-            page.update()
-            return False
-        except Exception as exc:
-            _end_series_launch_guard(dd_gen)
-            _set_status(f"時系列エラー: {exc}")
-            page.update()
-            return False
-        state.disc_diameter_um = float(disc_field.value or 1800)
-        _apply_series_results(results, landing_filename=prefer)
-        _show_series_results_view(n=len(results), selected=selected)
-        _update_batch_ui(refresh_dropdown=False)
-        _refresh_file_dropdown_labels()
-        refresh_hint()
-        update_confirm_visibility()
-        refresh_image()
-        refresh_results()
         page.update()
-        _end_series_launch_guard(dd_gen)
+        per_file = state.per_file_results
+        files = state.files
+        series_dates = state.series_dates
+        series_methods = state.series_methods
 
-        if state.series_registration_enabled:
-            return _run_registration_on_series(landing_filename=prefer)
-        return True
+        async def _series_task() -> None:
+            try:
+                results = await asyncio.to_thread(
+                    build_series_from_saved,
+                    per_file,
+                    files,
+                    series_dates,
+                    register=False,
+                    selected=selected_set,
+                    methods=series_methods,
+                )
+            except ValueError as exc:
+                _end_series_launch_guard(dd_gen)
+                _set_status(str(exc))
+                page.update()
+                return
+            except Exception as exc:
+                _end_series_launch_guard(dd_gen)
+                _set_status(f"時系列エラー: {exc}")
+                page.update()
+                return
+            state.disc_diameter_um = float(disc_field.value or 1800)
+            _apply_series_results(results, landing_filename=prefer)
+            _show_series_results_view(n=len(results), selected=selected)
+            _update_batch_ui(refresh_dropdown=False)
+            _refresh_file_dropdown_labels()
+            refresh_hint()
+            update_confirm_visibility()
+            refresh_image()
+            refresh_results()
+            page.update()
+            _end_series_launch_guard(dd_gen)
+            if state.series_registration_enabled:
+                _run_registration_on_series(landing_filename=prefer)
+
+        page.run_task(_series_task)
 
     def on_series(_=None) -> None:
         _launch_series_display(auto=False)
 
+    folder_picker_pending: dict = {"pick_input": False}
+
+    def on_folder_picker_result(e: ft.FilePickerResultEvent) -> None:
+        if folder_picker_pending.get("pick_input") and e.path:
+            input_field.value = e.path
+            on_load_files()
+        folder_picker_pending["pick_input"] = False
+
     def on_pick_folder(_=None) -> None:
-        async def _pick():
-            path = await folder_picker.get_directory_path(dialog_title="入力フォルダを選択")
-            if path:
-                input_field.value = path
-                on_load_files()
-        page.run_task(_pick)
+        folder_picker_pending["pick_input"] = True
+        folder_picker.get_directory_path(dialog_title="入力フォルダを選択")
 
     pdf_export_pending: dict = {"bytes": None}
 
@@ -3191,7 +3344,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             pdf_export_pending["bytes"] = None
             page.update()
 
-    folder_picker = ft.FilePicker(on_result=lambda _: None)
+    folder_picker = ft.FilePicker(on_result=on_folder_picker_result)
     pdf_picker = ft.FilePicker(on_result=on_pdf_picker_result)
     page.overlay.extend([folder_picker, pdf_picker, date_picker])
 
@@ -3467,6 +3620,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     )
     reg_ok_btn = btn_ok("✓ この位置合わせでOK", on_click=on_review_ok)
     reg_redo_btn = btn_outlined("↩ この手法でやり直し", on_click=on_review_redo)
+    _registration_controls["redo_btn"] = reg_redo_btn
     reg_redo_row = ft.Row([reg_method_dd, reg_redo_btn], spacing=8, wrap=True)
     reg_diff_switch = ft.Switch(
         label="差分表示（緑=基準 / 桃=対象）", value=True,
@@ -3600,12 +3754,40 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     _update_batch_ui()
 
     async def _deferred_auto_load() -> None:
-        import asyncio
         import os
         await asyncio.sleep(0.05)
         auto_dir = os.environ.get("GA_INPUT_DIR", "").strip()
-        if auto_dir:
-            input_field.value = auto_dir
-            on_load_files()
+        if not auto_dir:
+            return
+        input_field.value = auto_dir
+        folder = Path(auto_dir)
+        files = await asyncio.to_thread(list_images, folder)
+        state.input_dir = auto_dir
+        state.output_dir = output_field.value.strip()
+        state.files = files
+        init_series_dates(state.files)
+        refresh_series_dates_ui()
+        if state.files:
+            path = state.files[0]
+            gray = await asyncio.to_thread(load_gray, path)
+            state.reset_analysis(keep_series=True)
+            state.reset_per_image()
+            state.img_full = gray
+            state.img_gray = gray.copy()
+            state.crop_box = None
+            state.crop_pts = []
+            _refresh_image_width_label()
+            _refresh_scale_info()
+            _refresh_file_dropdown()
+            refresh_image()
+            _set_status(
+                f"{len(state.files)} 件読み込み ({', '.join(sorted(SUPPORTED_SUFFIXES))})"
+            )
+        else:
+            _set_status(f"画像なし: {folder}")
+            state.img_gray = None
+            refresh_image()
+        _update_batch_ui()
+        page.update()
 
     page.run_task(_deferred_auto_load)
