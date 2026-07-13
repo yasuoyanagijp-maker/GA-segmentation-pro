@@ -12,6 +12,16 @@ export FLET_PORT
 # 起動時に自動読込する入力フォルダ（任意）
 : "${GA_INPUT_DIR:=}"
 export GA_INPUT_DIR
+: "${GA_FORCE_RESTART:=0}"
+export GA_FORCE_RESTART
+
+server_healthy() {
+    curl -sf --max-time 2 "http://127.0.0.1:${FLET_PORT}/" >/dev/null 2>&1
+}
+
+open_browser() {
+    open "http://127.0.0.1:${FLET_PORT}/" 2>/dev/null || true
+}
 
 cleanup_port() {
     local port=$1
@@ -27,6 +37,14 @@ cleanup_port() {
     pkill -f "[G]A-segmentation-pro/main_app.py" 2>/dev/null || true
     sleep 1
 }
+
+# 既に正常起動中なら kill せずブラウザだけ開く（古いタブのグルグル化を防ぐ）
+if [ "$GA_FORCE_RESTART" != "1" ] && server_healthy; then
+    echo "Flet: 既に起動中 http://127.0.0.1:${FLET_PORT} — ブラウザを開きます"
+    open_browser
+    exit 0
+fi
+
 cleanup_port "$FLET_PORT"
 
 if [ -d "./myenv" ]; then
