@@ -24,6 +24,26 @@ def blend_mask_overlay(
     return cv2.addWeighted(overlay, alpha, base, 1.0 - alpha, 0)
 
 
+def registration_diff_overlay(
+    ref_gray: np.ndarray,
+    moving_gray: np.ndarray,
+) -> np.ndarray:
+    """位置合わせ確認用: 基準を緑、整列後の対象をマゼンタで重ねた RGB。
+
+    よく揃っていれば灰色（緑＋マゼンタ）に、ズレていれば緑／マゼンタの
+    フリンジとして視認できる。
+    """
+    ref = ref_gray
+    mov = moving_gray
+    if ref.shape[:2] != mov.shape[:2]:
+        mov = cv2.resize(mov, (ref.shape[1], ref.shape[0]), interpolation=cv2.INTER_LINEAR)
+    rgb = np.zeros((ref.shape[0], ref.shape[1], 3), dtype=np.uint8)
+    rgb[..., 0] = mov   # R (magenta = R+B)
+    rgb[..., 1] = ref   # G (reference)
+    rgb[..., 2] = mov   # B
+    return rgb
+
+
 def make_overlay(img_gray: np.ndarray, mask: np.ndarray,
                  fovea_xy: tuple | None = None,
                  nearest_xy: tuple | None = None,
@@ -73,6 +93,13 @@ def make_overlay(img_gray: np.ndarray, mask: np.ndarray,
         cv2.circle(rgb, p2, 7, amber, -1)
         cv2.circle(rgb, p2, 9, amber, 1)
         cv2.line(rgb, p1, p2, amber, 2)
+        # ライン中央 = registration 固定点（視神経乳頭）
+        mx = int((p1[0] + p2[0]) / 2)
+        my = int((p1[1] + p2[1]) / 2)
+        violet = (167, 139, 250)
+        cv2.circle(rgb, (mx, my), 6, violet, -1)
+        cv2.circle(rgb, (mx, my), 8, violet, 2)
+        cv2.drawMarker(rgb, (mx, my), violet, cv2.MARKER_CROSS, 12, 1)
 
     if crop_box is not None:
         x0, y0, x1, y1 = crop_box
