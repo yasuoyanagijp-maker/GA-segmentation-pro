@@ -1,4 +1,4 @@
-"""アプリケーション状態（Streamlit session_state の代替）。"""
+"""Flet UI 用のアプリケーション状態（page.data に保持）。"""
 
 from __future__ import annotations
 
