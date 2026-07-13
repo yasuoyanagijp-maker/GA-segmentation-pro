@@ -112,3 +112,115 @@ def test_build_series_from_saved():
     assert len(results) == 2
     assert results[0]["filename"] == "a.jpg"
     assert results[1]["stats"]["area_mm2"] == stats2["area_mm2"]
+
+
+def test_build_series_uses_reference_scale_for_all_timepoints():
+    """Later images with a different scale_um_px still get ref scale after rebuild."""
+    from engine.stats import ga_stats
+    from engine.timeseries import series_metric_regressions
+
+    img = np.zeros((40, 40), dtype=np.uint8)
+    mask1 = np.zeros((40, 40), dtype=np.uint8)
+    mask1[8:18, 8:18] = 255
+    mask2 = np.zeros((40, 40), dtype=np.uint8)
+    mask2[8:22, 8:22] = 255
+    fovea = (20.0, 20.0)
+    ref_scale = 5.0
+    other_scale = 12.0
+    stats1 = ga_stats(mask1, ref_scale, fovea)
+    # Intentionally store stats computed with the wrong (own) scale.
+    stats2_wrong = ga_stats(mask2, other_scale, fovea)
+    expected2 = ga_stats(mask2, ref_scale, fovea)
+    per_file = {
+        "a.jpg": {
+            "path": Path("/tmp/a.jpg"),
+            "filename": "a.jpg",
+            "date": "2020-01-01",
+            "image": img.copy(),
+            "mask": mask1,
+            "stats": stats1,
+            "fovea_xy": fovea,
+            "scale_um_px": ref_scale,
+        },
+        "b.jpg": {
+            "path": Path("/tmp/b.jpg"),
+            "filename": "b.jpg",
+            "date": "2021-01-01",
+            "image": img.copy(),
+            "mask": mask2,
+            "stats": stats2_wrong,
+            "fovea_xy": fovea,
+            "scale_um_px": other_scale,
+        },
+    }
+    files = [Path("/tmp/a.jpg"), Path("/tmp/b.jpg")]
+    dates = {"a.jpg": "2020-01-01", "b.jpg": "2021-01-01"}
+    results = build_series_from_saved(per_file, files, dates, register=False)
+    assert results[0]["scale_um_px"] == ref_scale
+    assert results[1]["scale_um_px"] == ref_scale
+    assert results[1]["stats"]["area_mm2"] == expected2["area_mm2"]
+    assert results[1]["stats"]["area_mm2"] != stats2_wrong["area_mm2"]
+
+
+def test_build_series_applies_prior_matrices_without_recompute():
+    from engine.stats import ga_stats
+
+    img1 = np.zeros((40, 40), dtype=np.uint8)
+    img2 = np.zeros((40, 40), dtype=np.uint8)
+    img2[5:15, 5:15] = 200
+    mask1 = np.zeros((40, 40), dtype=np.uint8)
+    mask2 = np.zeros((40, 40), dtype=np.uint8)
+    mask2[5:15, 5:15] = 255
+    fovea = (20.0, 20.0)
+    scale = 5.0
+    per_file = {
+        "a.jpg": {
+            "path": Path("/tmp/a.jpg"),
+            "filename": "a.jpg",
+            "date": "2020-01-01",
+            "image": img1,
+            "mask": mask1,
+            "stats": ga_stats(mask1, scale, fovea),
+            "fovea_xy": fovea,
+            "scale_um_px": scale,
+        },
+        "b.jpg": {
+            "path": Path("/tmp/b.jpg"),
+            "filename": "b.jpg",
+            "date": "2021-01-01",
+            "image": img2,
+            "mask": mask2,
+            "stats": ga_stats(mask2, scale, fovea),
+            "fovea_xy": fovea,
+            "scale_um_px": scale,
+        },
+    }
+    files = [Path("/tmp/a.jpg"), Path("/tmp/b.jpg")]
+    dates = {"a.jpg": "2020-01-01", "b.jpg": "2021-01-01"}
+    # Translate right by 3 px
+    prior = {"b.jpg": np.array([[1, 0, 3], [0, 1, 0]], dtype=np.float32)}
+    results = build_series_from_saved(
+        per_file, files, dates, register=True, prior_matrices=prior,
+    )
+    assert np.allclose(results[1]["reg_matrix"], prior["b.jpg"])
+    assert results[1]["reg_ok"] is True
+    # Mask content should have shifted right
+    assert int(results[1]["mask"][10, 8]) == 255
+    assert int(results[1]["mask"][10, 5]) == 0
+
+
+def test_series_metric_regressions_detects_decrease():
+    from engine.timeseries import series_metric_regressions
+
+    ok = [
+        {"stats": {"area_mm2": 1.0, "area_mm_sqrt": 1.0, "gawain": 10}},
+        {"stats": {"area_mm2": 1.2, "area_mm_sqrt": 1.1, "gawain": 12}},
+    ]
+    assert series_metric_regressions(ok) == []
+    bad = [
+        {"stats": {"area_mm2": 2.0, "area_mm_sqrt": 1.4, "gawain": 20}},
+        {"stats": {"area_mm2": 1.5, "area_mm_sqrt": 1.2, "gawain": 18}},
+    ]
+    alerts = series_metric_regressions(bad)
+    assert len(alerts) == 3
+    assert any("再解析" in a for a in alerts)
