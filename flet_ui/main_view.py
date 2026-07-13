@@ -26,7 +26,8 @@ from engine.region_growing import (
 )
 from engine.export import (
     build_batch_csv_bytes,
-    generate_pdf_report,
+    gawain_figure_png_from_context,
+    generate_pdf_report_bytes,
     suggested_csv_filename,
     suggested_pdf_filename,
 )
@@ -676,6 +677,10 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             "disc_xy": disc_xy,
             "scale_um_px": state.scale_um_px,
             "calibration_source": state.calibration_source,
+            "field_width_mm": state.field_width_mm,
+            "foveal_correction_applied": state.foveal_correction_applied,
+            "foveal_correction_skipped": state.foveal_correction_skipped,
+            "foveal_correction_strength": state.foveal_correction_strength,
         }
 
     def _row_overlay(row: dict) -> np.ndarray:
@@ -1238,6 +1243,14 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             state.scale_um_px = snap["scale_um_px"]
         if snap.get("calibration_source") is not None:
             state.calibration_source = snap["calibration_source"]
+        if snap.get("field_width_mm") is not None:
+            state.field_width_mm = snap["field_width_mm"]
+        if "foveal_correction_applied" in snap:
+            state.foveal_correction_applied = snap["foveal_correction_applied"]
+        if "foveal_correction_skipped" in snap:
+            state.foveal_correction_skipped = snap["foveal_correction_skipped"]
+        if snap.get("foveal_correction_strength") is not None:
+            state.foveal_correction_strength = snap["foveal_correction_strength"]
         state.mode = None
 
     def load_image_at(
@@ -1351,33 +1364,119 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         status.value = f"CSV 保存: {path}"
         page.update()
 
-    def on_export_pdf(_=None) -> None:
+    def _resolve_pdf_export_context() -> dict | None:
+        """PDF 出力用の filename / stats / overlay / GAWAIN 生成コンテキスト。"""
         if state.series_results and state.series_overlays:
             row = state.series_results[state.series_time_idx]
             overlay = state.series_overlays[state.series_time_idx]
-            stats = row["stats"]
-            fname = row["filename"]
-            date_str = row["date"]
-        elif state.stats is not None and state.mask is not None and state.img_gray is not None:
-            overlay = _build_rgb_frame()
-            stats = state.stats
+            snap = state.per_file_results.get(row["filename"], row)
+            return {
+                "filename": row["filename"],
+                "date": row["date"],
+                "stats": row["stats"],
+                "overlay_rgb": overlay,
+                "image": row.get("image") or snap.get("image"),
+                "mask": row.get("mask") or snap.get("mask"),
+                "fovea_xy": row.get("fovea_xy") or snap.get("fovea_xy"),
+                "scale_um_px": row.get("scale_um_px") or snap.get("scale_um_px"),
+                "calibration_source": snap.get("calibration_source"),
+                "field_width_mm": snap.get("field_width_mm"),
+                "foveal_correction_applied": snap.get("foveal_correction_applied"),
+                "foveal_correction_skipped": snap.get("foveal_correction_skipped"),
+                "foveal_correction_strength": snap.get("foveal_correction_strength"),
+            }
+        if state.stats is not None and state.mask is not None and state.img_gray is not None:
             fname = state.files[state.file_idx].name if state.files else "image"
-            date_str = state.series_dates.get(fname, "")
-        else:
+            snap = state.per_file_results.get(fname)
+            if snap:
+                return {
+                    "filename": fname,
+                    "date": snap.get("date") or state.series_dates.get(fname, ""),
+                    "stats": state.stats,
+                    "overlay_rgb": _build_rgb_frame(),
+                    "image": snap.get("image", state.img_gray),
+                    "mask": snap.get("mask", state.mask),
+                    "fovea_xy": snap.get("fovea_xy", state.fovea_xy),
+                    "scale_um_px": snap.get("scale_um_px", state.scale_um_px),
+                    "calibration_source": snap.get("calibration_source", state.calibration_source),
+                    "field_width_mm": snap.get("field_width_mm", state.field_width_mm),
+                    "foveal_correction_applied": snap.get(
+                        "foveal_correction_applied", state.foveal_correction_applied,
+                    ),
+                    "foveal_correction_skipped": snap.get(
+                        "foveal_correction_skipped", state.foveal_correction_skipped,
+                    ),
+                    "foveal_correction_strength": snap.get(
+                        "foveal_correction_strength", state.foveal_correction_strength,
+                    ),
+                }
+            return {
+                "filename": fname,
+                "date": state.series_dates.get(fname, ""),
+                "stats": state.stats,
+                "overlay_rgb": _build_rgb_frame(),
+                "image": state.img_gray,
+                "mask": state.mask,
+                "fovea_xy": state.fovea_xy,
+                "scale_um_px": state.scale_um_px,
+                "calibration_source": state.calibration_source,
+                "field_width_mm": state.field_width_mm,
+                "foveal_correction_applied": state.foveal_correction_applied,
+                "foveal_correction_skipped": state.foveal_correction_skipped,
+                "foveal_correction_strength": state.foveal_correction_strength,
+            }
+        return None
+
+    def on_export_pdf(_=None) -> None:
+        ctx = _resolve_pdf_export_context()
+        if ctx is None:
             status.value = "保存する解析結果がありません"
             page.update()
             return
-        out = _ensure_output_dir()
-        path = out / suggested_pdf_filename(fname)
-        generate_pdf_report(
-            filename=fname,
-            date=date_str,
-            stats=stats,
-            overlay_rgb=overlay,
-            output_path=path,
-        )
-        status.value = f"PDF 保存: {path}"
-        page.update()
+
+        async def _export_pdf_task() -> None:
+            status.value = "PDF 作成中…"
+            page.update()
+            try:
+                gawain_png = await asyncio.to_thread(
+                    gawain_figure_png_from_context, ctx,
+                )
+                pdf_bytes = await asyncio.to_thread(
+                    generate_pdf_report_bytes,
+                    filename=ctx["filename"],
+                    date=ctx["date"],
+                    stats=ctx["stats"],
+                    overlay_rgb=ctx["overlay_rgb"],
+                    gawain_figure_png=gawain_png,
+                    scale_um_px=ctx.get("scale_um_px"),
+                    calibration_source=ctx.get("calibration_source"),
+                    field_width_mm=ctx.get("field_width_mm"),
+                    fovea_xy=ctx.get("fovea_xy"),
+                    foveal_correction_applied=ctx.get("foveal_correction_applied"),
+                    foveal_correction_skipped=ctx.get("foveal_correction_skipped"),
+                    foveal_correction_strength=ctx.get("foveal_correction_strength"),
+                )
+                out = _ensure_output_dir()
+                path = out / suggested_pdf_filename(ctx["filename"])
+                path.write_bytes(pdf_bytes)
+                if page.web:
+                    status.value = f"PDF ダウンロード: {path}"
+                else:
+                    pdf_export_pending["bytes"] = pdf_bytes
+                    pdf_picker.save_file(
+                        dialog_title="PDF を保存",
+                        file_name=path.name,
+                        file_type=ft.FilePickerFileType.CUSTOM,
+                        allowed_extensions=["pdf"],
+                        initial_directory=str(out),
+                    )
+                    status.value = f"PDF 保存: {path}"
+            except Exception as exc:
+                _log.exception("PDF export failed")
+                status.value = f"PDF エラー: {exc}"
+            page.update()
+
+        page.run_task(_export_pdf_task)
 
     def on_reanalyze_timepoint(_=None) -> None:
         if not state.series_results:
@@ -1789,7 +1888,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 ft.Row(
                     [
                         btn_toolbar("CSV 保存", on_click=on_export_csv),
-                        btn_toolbar("PDF 保存", on_click=on_export_pdf),
+                        btn_toolbar("PDF ダウンロード", on_click=on_export_pdf),
                     ],
                     spacing=8,
                     wrap=True,
@@ -1797,7 +1896,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             )
         elif stats and state.mode is None and not state.series_results:
             results_col.controls.append(
-                btn_toolbar("PDF 保存", on_click=on_export_pdf),
+                btn_toolbar("PDF ダウンロード", on_click=on_export_pdf),
             )
         if fname and fname in state.per_file_results and state.batch_mode:
             results_col.controls.append(ft.Text(
@@ -3083,8 +3182,18 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 on_load_files()
         page.run_task(_pick)
 
+    pdf_export_pending: dict = {"bytes": None}
+
+    def on_pdf_picker_result(e: ft.FilePickerResultEvent) -> None:
+        if e.path and pdf_export_pending.get("bytes"):
+            Path(e.path).write_bytes(pdf_export_pending["bytes"])
+            status.value = f"PDF 保存: {e.path}"
+            pdf_export_pending["bytes"] = None
+            page.update()
+
     folder_picker = ft.FilePicker(on_result=lambda _: None)
-    page.overlay.extend([folder_picker, date_picker])
+    pdf_picker = ft.FilePicker(on_result=on_pdf_picker_result)
+    page.overlay.extend([folder_picker, pdf_picker, date_picker])
 
     def on_view_change(e) -> None:
         state.view_mode = e.control.value
