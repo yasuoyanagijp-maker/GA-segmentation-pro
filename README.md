@@ -1,6 +1,6 @@
 # GA Segmentation Pro
 
-FAF画像から地図状萎縮（GA）を自動セグメンテーションし、中心窩距離・進行予測を計算するStreamlitアプリ。
+FAF画像から地図状萎縮（GA）を自動セグメンテーションし、中心窩距離・進行予測を計算する Flet アプリ。
 
 ---
 
@@ -8,28 +8,40 @@ FAF画像から地図状萎縮（GA）を自動セグメンテーションし、
 
 ```
 ~/GA-segmentation-pro/
-├── ga_app.py              ← Streamlit メインアプリ（UI）
+├── main_app.py            ← Flet エントリポイント
+├── flet_ui/               ← Flet UI（main_view, state, theme）
+├── run_flet.sh            ← Flet 起動スクリプト
+├── scripts/
+│   ├── applications_launcher.sh  ← /Applications 用ランチャー（git pull + run_flet.sh）
+│   └── install_to_applications.sh
 ├── engine/                ← UI非依存のコアロジック
 │   ├── io_utils.py        ← 画像読み込み
 │   ├── segmentation.py    ← GAセグメンテーション（CLAHE→Otsu→形態学演算）
 │   ├── calibration.py     ← 乳頭径クリックからのスケール較正（um/px）
 │   ├── crop.py            ← 中心部矩形クロップ
+│   ├── foveal_correction.py ← 中心窩周辺の輝度補正
+│   ├── region_growing.py  ← リージョングローイング補助
 │   ├── stats.py           ← GA面積・病変別統計・中心窩距離・GAWAIN
 │   ├── gawain.py          ← GAWAIN指数計算
-│   └── overlay.py         ← オーバーレイ画像生成
+│   ├── gawain_figure.py   ← GAWAIN図の生成
+│   ├── life_table.py      ← 令和5年簡易生命表による平均余命ルックアップ
+│   ├── series_registration.py ← 複数時期の位置合わせ
+│   ├── timeseries.py      ← 複数時点の解析・GIF/グラフ用データ生成
+│   ├── overlay.py         ← オーバーレイ画像生成
+│   └── export.py          ← 結果のエクスポート
 ├── data/
 │   └── gawain_weights.csv ← GAWAIN 60環の面積係数・重み（Leonlevde/GAWAIN由来）
 │   └── life_table_jp_r5.csv ← 令和5年簡易生命表（死亡率.pdf由来）
 ├── tests/                 ← pytestテスト（engine配下のロジックを検証）
 ├── conftest.py            ← pytestがengineパッケージを解決するための設定
-├── requirements.txt       ← 依存パッケージ（バージョン固定）
-├── requirements-dev.txt   ← 開発用（pytest等）
+├── requirements.txt       ← 実行時依存（Flet UI + engine）
+├── requirements-flet.txt  ← requirements.txt へのエイリアス
+├── requirements-dev.txt   ← 開発用（pytest 等）
 ├── README.md              ← このファイル
 └── myenv/                 ← 仮想環境（Gitには含めない）
 ```
 
-> `engine/`はUI（Streamlit）に依存しないため、将来的にGAWAIN計算・複数時期レジストレーション・
-> stlite/デスクトップ化などのUI層を追加しても、ロジックを再利用できるようにしています。
+> `engine/` は UI に依存しないため、Flet UI からロジックをそのまま再利用できます。
 
 ---
 
@@ -61,13 +73,25 @@ pip install -r requirements.txt
 
 ## 起動方法
 
+リポジトリ直下の起動スクリプトは **`run_flet.sh`** です。`/Applications/GA Segmentation Pro/run.sh` は git pull とランチャー同期のあと `run_flet.sh` を呼ぶ **ラッパー** であり、旧 Streamlit 用の `run.sh` とは別物です。
+
+### コマンドライン
+
 ```bash
 cd ~/GA-segmentation-pro
 source myenv/bin/activate
-streamlit run ga_app.py
+./run_flet.sh
 ```
 
-ブラウザが自動で開く（`http://localhost:8501`）。
+ブラウザが自動で開く（`http://127.0.0.1:8551`）。ネイティブウィンドウで起動する場合は `FLET_USE_WEB=0 ./run_flet.sh`。
+
+### /Applications ランチャー
+
+```bash
+./scripts/install_to_applications.sh
+```
+
+インストール後、`/Applications/GA Segmentation Pro.app` をダブルクリック。起動のたびに `git pull` とランチャー同期のあと `run_flet.sh` が実行されます。
 
 ---
 
@@ -138,17 +162,21 @@ load_gray → CLAHE → Otsu閾値（反転）→ Morphological Open/Close/Dilat
 
 ---
 
-## 依存パッケージ（requirements.txt）
+## 依存パッケージ
+
+実行時依存は `requirements.txt` に集約されています（`requirements-flet.txt` は同内容への `-r` 参照）。
 
 ```
-streamlit==1.32.2
-streamlit-image-coordinates==0.2.2
+flet==0.28.3
+flet-desktop==0.28.3
 opencv-python==4.9.0.80
 numpy==1.26.4
 Pillow==10.3.0
 scikit-image==0.22.0
 scipy==1.13.0
+matplotlib==3.8.4
 tifffile==2024.2.12
+fpdf2==2.8.3
 ```
 
 > **注意**: Python 3.14では動作しない。必ず pyenv 経由の Python 3.12 を使うこと。
@@ -157,10 +185,11 @@ tifffile==2024.2.12
 
 ## トラブルシューティング
 
-### `streamlit: command not found`
-仮想環境が有効化されていない。
+### `flet: command not found`
+仮想環境が有効化されていない、または `requirements.txt` が未インストール。
 ```bash
 source myenv/bin/activate
+pip install -r requirements.txt
 ```
 
 ### `Pillow` のビルドエラー
@@ -169,9 +198,8 @@ Python 3.14 が使われている。`pyenv local 3.12.9` を確認してから v
 python3 --version  # → 3.12.x であること
 ```
 
-### `streamlit-image-coordinates` が見つからない
-pip が古い。
+### ポート 8551 が使用中
+`run_flet.sh` は起動時にポートを自動クリーンアップします。強制再起動する場合:
 ```bash
-pip install --upgrade pip
-pip install -r requirements.txt
+GA_FORCE_RESTART=1 ./run_flet.sh
 ```

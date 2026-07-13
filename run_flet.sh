@@ -16,7 +16,16 @@ export GA_INPUT_DIR
 export GA_FORCE_RESTART
 
 server_healthy() {
-    curl -sf --max-time 2 "http://127.0.0.1:${FLET_PORT}/" >/dev/null 2>&1
+    curl -sf --max-time 2 "http://127.0.0.1:${FLET_PORT}/" >/dev/null 2>&1 || return 1
+    # HTTP 200 alone is not enough: zombie/stuck Flet can still serve static HTML
+    # while the websocket never delivers the first frame (browser spinner forever).
+    local pids
+    pids=$(lsof -ti :"${FLET_PORT}" 2>/dev/null | sort -u)
+    [ -n "$pids" ] || return 1
+    local count
+    count=$(echo "$pids" | wc -l | tr -d ' ')
+    [ "$count" -eq 1 ] || return 1
+    ps -p "$(echo "$pids" | head -1)" -o command= 2>/dev/null | grep -q "main_app.py"
 }
 
 open_browser() {
@@ -26,15 +35,15 @@ open_browser() {
 cleanup_port() {
     local port=$1
     local pid
-    pid=$(lsof -ti :"$port" 2>/dev/null || true)
-    if [ -n "$pid" ]; then
-        echo "Port $port in use (PID $pid) — cleaning up"
-        kill -9 $pid 2>/dev/null || true
-        sleep 1
-    fi
     # 古い Flet プロセスが残るとブラウザがグルグルのままになる
     pkill -f "[f]let run.*${port}" 2>/dev/null || true
     pkill -f "[G]A-segmentation-pro/main_app.py" 2>/dev/null || true
+    sleep 1
+    while read -r pid; do
+        [ -n "$pid" ] || continue
+        echo "Port $port in use (PID $pid) — cleaning up"
+        kill -9 "$pid" 2>/dev/null || true
+    done < <(lsof -ti :"$port" 2>/dev/null | sort -u)
     sleep 1
 }
 
