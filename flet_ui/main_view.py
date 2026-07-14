@@ -39,6 +39,7 @@ from engine.foveal_correction import (
 from engine.gawain import GAWAIN_LABEL, format_gawain_display
 from engine.stats import ga_stats
 from engine.series_registration import REGISTRATION_METHODS
+from engine.series_roi_correction import apply_roi_correction_to_series
 from engine.timeseries import (
     build_series_from_saved,
     datetime_to_plot_x,
@@ -413,7 +414,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     dd_sync = {"skip": False, "gen": 0}
     # Blocks load_image while series is being built (covers page.update races
     # before series_results is assigned).
-    series_guard = {"launching": False, "gen": 0}
+    series_guard = {"launching": False, "gen": 0, "roi_running": False}
     registration_guard = {"running": False}
     _registration_controls: dict = {"redo_btn": None}
     seg_correction_stats: dict | None = None
@@ -623,6 +624,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.estimated_growth_mm_sqrt_per_year = None
         state.series_time_idx = 0
         state.series_review_active = False
+        state.series_roi_review_active = False
         state.series_review_idx = 0
         state.series_registered = False
         state.view_mode = "work"
@@ -633,6 +635,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         reg_apply_btn.visible = False
         if "reg_review_panel" in _ui:
             _ui["reg_review_panel"].visible = False
+        if "roi_review_panel" in _ui:
+            _ui["roi_review_panel"].visible = False
 
     def _update_registration_controls() -> None:
         """位置合わせトグル・実行ボタンの表示を同期。"""
@@ -642,6 +646,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             and state.series_results is not None
             and not state.series_registered
             and not state.series_review_active
+            and not state.series_roi_review_active
         )
 
     def _invalidate_saved_results(*, reason: str = "scale_change") -> None:
@@ -1575,6 +1580,19 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             if rgb is not None:
                 _push_image_rgb(rgb, do_update=do_update)
             return
+        if state.series_roi_review_active and state.series_results:
+            results = state.series_results
+            idx = max(0, min(state.series_review_idx, len(results) - 1))
+            rgb = (
+                state.series_overlays[idx]
+                if state.series_overlays
+                else _row_overlay(results[idx])
+            )
+            img_ctrl.visible = True
+            gif_img.visible = False
+            graph_area.visible = False
+            _push_image_rgb(rgb, do_update=do_update)
+            return
         if state.view_mode == "gif" and state.series_gif:
             gif_img.src_base64 = base64.b64encode(state.series_gif).decode("ascii")
             img_ctrl.visible = False
@@ -1808,7 +1826,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     def refresh_results() -> None:
         results_col.controls.clear()
         stats = state.stats
-        if state.series_results and state.series_review_active:
+        if state.series_results and (
+            state.series_review_active or state.series_roi_review_active
+        ):
             idx = max(0, min(state.series_review_idx, len(state.series_results) - 1))
             stats = state.series_results[idx]["stats"]
         elif state.series_results and state.view_mode == "work":
@@ -1907,7 +1927,11 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             results_col.controls.append(
                 btn_toolbar("個別結果", on_click=on_show_saved),
             )
-        if state.series_results and not state.series_review_active:
+        if (
+            state.series_results
+            and not state.series_review_active
+            and not state.series_roi_review_active
+        ):
             n_tp = len(state.series_results)
             tp = min(state.series_time_idx, n_tp - 1) + 1
             n_files = len(state.files)
@@ -2024,7 +2048,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             ),
         }
         hint.value = _safe_text(msgs.get(state.mode or "", ""))
-        if not state.mode and modality_dd.value == "hra" and state.scale_um_px is None:
+        if state.series_roi_review_active:
+            hint.value = "ROI補正確認 — 要レビュー時点で OK（採用）または 補正破棄"
+        elif not state.mode and modality_dd.value == "hra" and state.scale_um_px is None:
             hint.value = "HRA: 乳頭が見えない場合は「幅指定」でスケール設定"
         hint.color = T.PRIMARY if state.mode or hint.value else T.TEXT_MUTED
 
@@ -3013,7 +3039,10 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         if not results:
             return
         state.series_review_idx = max(0, min(idx, len(results) - 1))
-        _refresh_review_panel()
+        if state.series_roi_review_active:
+            _refresh_roi_review_panel()
+        else:
+            _refresh_review_panel()
         refresh_image()
         page.update()
 
@@ -3096,15 +3125,14 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
 
         page.run_task(_redo_task)
 
-    def on_review_finish(_=None) -> None:
-        if not _all_reg_ok():
-            _set_status("未確認の時点があります（各時点で OK を押してください）")
-            page.update()
-            return
+    def _finish_to_series_results_view() -> None:
+        """位置合わせ（およびROI確認）完了後の通常時系列表示へ。"""
         state.series_review_active = False
+        state.series_roi_review_active = False
         state.series_registered = True
-        _stash_reg_cache_from_series()
         _refresh_review_panel()
+        if "roi_review_panel" in _ui:
+            _refresh_roi_review_panel()
         _update_registration_controls()
         n = len(state.series_results or [])
         selected = _selected_count()
@@ -3125,10 +3153,183 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         refresh_results()
         page.update()
 
+    def _all_roi_ok() -> bool:
+        results = state.series_results or []
+        if not results:
+            return False
+        return all(
+            (not r.get("roi_needs_review")) or r.get("roi_ok")
+            for r in results
+        )
+
+    def _refresh_roi_review_panel() -> None:
+        panel = _ui.get("roi_review_panel")
+        if panel is None:
+            return
+        results = state.series_results or []
+        active = state.series_roi_review_active and bool(results)
+        panel.visible = active
+        if not active:
+            return
+        idx = _review_current_idx()
+        row = results[idx]
+        n = len(results)
+        reason = row.get("roi_reason") or "ok"
+        mark = "OK" if row.get("roi_ok") else "未確認"
+        _ui["roi_review_title"].value = _safe_text(
+            f"ROI補正確認 {idx + 1}/{n} · {row['date']} · {row['filename']}"
+        )
+        _ui["roi_review_info"].value = _safe_text(
+            f"理由: {reason} · 状態: {mark} · "
+            f"面積 {row.get('roi_raw_area', '?')} → {row.get('roi_corrected_area', '?')} px"
+        )
+        ok_count = sum(
+            1 for r in results
+            if (not r.get("roi_needs_review")) or r.get("roi_ok")
+        )
+        _ui["roi_review_progress"].value = _safe_text(f"確認済み {ok_count}/{n}")
+        needs = bool(row.get("roi_needs_review"))
+        _ui["roi_ok_btn"].disabled = (not needs) or bool(row.get("roi_ok"))
+        _ui["roi_reject_btn"].disabled = not needs
+        _ui["roi_finish_btn"].disabled = not _all_roi_ok()
+
+    def _enter_roi_review() -> None:
+        state.series_roi_review_active = True
+        view_mode.visible = False
+        series_date_dd.visible = False
+        _refresh_roi_review_panel()
+        refresh_hint()
+        update_confirm_visibility()
+        refresh_image()
+        refresh_results()
+
+    def on_roi_review_prev(_=None) -> None:
+        _goto_review(_review_current_idx() - 1)
+        _refresh_roi_review_panel()
+        page.update()
+
+    def on_roi_review_next(_=None) -> None:
+        _goto_review(_review_current_idx() + 1)
+        _refresh_roi_review_panel()
+        page.update()
+
+    def on_roi_review_ok(_=None) -> None:
+        results = state.series_results or []
+        idx = _review_current_idx()
+        if not results or not results[idx].get("roi_needs_review"):
+            return
+        results[idx]["roi_ok"] = True
+        nxt = next(
+            (
+                i for i in range(idx + 1, len(results))
+                if results[i].get("roi_needs_review") and not results[i].get("roi_ok")
+            ),
+            None,
+        )
+        if nxt is not None:
+            state.series_review_idx = nxt
+        _refresh_roi_review_panel()
+        refresh_image()
+        if _all_roi_ok():
+            _set_status("全時点のROI補正を確認しました — 「確認完了」で結果表示へ")
+        page.update()
+
+    def on_roi_review_reject(_=None) -> None:
+        """補正を破棄し、位置合わせ後の元マスクに戻す。"""
+        results = state.series_results or []
+        idx = _review_current_idx()
+        if not results or not results[idx].get("roi_needs_review"):
+            return
+        row = results[idx]
+        pre = row.get("mask_pre_roi")
+        if pre is None:
+            return
+        row["mask"] = pre.copy()
+        row["roi_corrected_area"] = int(np.count_nonzero(pre))
+        from engine.timeseries import _compute_row_stats as _crs
+        row["stats"] = _crs(
+            row["mask"], row.get("scale_um_px"), row.get("fovea_xy"), row.get("stats") or {},
+        )
+        row["roi_ok"] = True
+        row["roi_reason"] = "rejected_keep_registered"
+        _rebuild_series_derived()
+        nxt = next(
+            (
+                i for i in range(idx + 1, len(results))
+                if results[i].get("roi_needs_review") and not results[i].get("roi_ok")
+            ),
+            None,
+        )
+        if nxt is not None:
+            state.series_review_idx = nxt
+        _refresh_roi_review_panel()
+        refresh_image()
+        refresh_results()
+        page.update()
+
+    def on_roi_review_finish(_=None) -> None:
+        if not _all_roi_ok():
+            _set_status("未確認のROI時点があります（各時点で OK または 補正破棄）")
+            page.update()
+            return
+        _finish_to_series_results_view()
+
+    def _run_roi_correction_after_registration() -> None:
+        """位置合わせ確定後: 整列済みマスクに対しROI補正→要レビューなら確認UI。"""
+        if registration_guard["running"] or series_guard.get("roi_running"):
+            return
+        results = state.series_results
+        if not results:
+            return
+
+        async def _roi_task() -> None:
+            series_guard["roi_running"] = True
+            _set_status("ROI時系列補正を計算中…")
+            page.update()
+            try:
+                out = await asyncio.to_thread(apply_roi_correction_to_series, results)
+            except Exception as exc:
+                _set_status(f"ROI補正エラー: {exc}")
+                _finish_to_series_results_view()
+            else:
+                state.series_results = out["results"]
+                _rebuild_series_derived()
+                needs = out["needs_review_indices"]
+                if needs:
+                    state.series_review_idx = needs[0]
+                    _enter_roi_review()
+                    _set_status(_safe_text(
+                        f"ROI補正確認 ({len(needs)} 時点が要レビュー) "
+                        "— 各時点で OK / 補正破棄を選択"
+                    ))
+                else:
+                    _finish_to_series_results_view()
+                    _set_status(_safe_text(
+                        f"時系列表示 ({len(out['results'])} 時点) "
+                        "— ROI補正: 要レビューなし"
+                    ))
+            finally:
+                series_guard["roi_running"] = False
+                page.update()
+
+        page.run_task(_roi_task)
+
+    def on_review_finish(_=None) -> None:
+        if not _all_reg_ok():
+            _set_status("未確認の時点があります（各時点で OK を押してください）")
+            page.update()
+            return
+        state.series_review_active = False
+        state.series_registered = True
+        _stash_reg_cache_from_series()
+        _refresh_review_panel()
+        _run_roi_correction_after_registration()
+
     def _show_series_results_view(*, n: int, selected: int) -> None:
         """位置合わせなしで時系列結果を表示（グラフ優先）。"""
         state.series_registered = False
         state.series_review_active = False
+        state.series_roi_review_active = False
         state.view_mode = "graph"
         view_mode.value = "graph"
         view_mode.visible = True
@@ -3194,24 +3395,12 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             else:
                 _apply_series_results(results, landing_filename=prefer)
                 if prior_matrices and cache_confirmed:
-                    # 再解析後の再利用: 確認フローを飛ばして結果表示へ
+                    # 再解析後の再利用: 位置合わせ確認を飛ばし ROI 補正へ
                     state.series_review_active = False
                     state.series_registered = True
                     _stash_reg_cache_from_series()
                     _refresh_review_panel()
-                    _update_registration_controls()
-                    state.view_mode = "work"
-                    view_mode.value = "work"
-                    view_mode.visible = True
-                    series_date_dd.visible = True
-                    _set_status(_safe_text(
-                        f"時系列表示 ({len(results)} 時点 / 対象 {selected} 枚)"
-                        " — 前回の位置合わせ行列を再利用"
-                    ))
-                    refresh_hint()
-                    update_confirm_visibility()
-                    refresh_image()
-                    refresh_results()
+                    _run_roi_correction_after_registration()
                 else:
                     state.series_review_active = True
                     state.series_review_idx = 1 if len(results) > 1 else 0
@@ -3669,6 +3858,50 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         "reg_finish_btn": reg_finish_btn,
     })
 
+    roi_review_title = ft.Text("", size=13, weight=ft.FontWeight.W_600, color=T.PRIMARY)
+    roi_review_info = ft.Text("", size=12, color=T.TEXT)
+    roi_review_progress = ft.Text("", size=11, color=T.TEXT_MUTED)
+    roi_ok_btn = btn_ok("✓ この補正でOK", on_click=on_roi_review_ok)
+    roi_reject_btn = btn_outlined("補正破棄（登録後マスクへ戻す）", on_click=on_roi_review_reject)
+    roi_finish_btn = btn_primary("確認完了 → 結果表示", on_click=on_roi_review_finish)
+    roi_review_nav = ft.Row(
+        [
+            btn_outlined("◀ 前", on_click=on_roi_review_prev),
+            btn_outlined("次 ▶", on_click=on_roi_review_next),
+            roi_review_progress,
+        ],
+        spacing=8,
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+    )
+    roi_review_panel = ft.Container(
+        visible=False,
+        bgcolor=T.PANEL_BG,
+        border=ft.border.all(1, "#374151"),
+        border_radius=8,
+        padding=ft.padding.all(12),
+        content=ft.Column(
+            [
+                roi_review_title,
+                roi_review_info,
+                roi_review_nav,
+                ft.Row([roi_ok_btn, roi_reject_btn], spacing=8, wrap=True),
+                ft.Divider(color="#374151"),
+                roi_finish_btn,
+            ],
+            spacing=8,
+            tight=True,
+        ),
+    )
+    _ui.update({
+        "roi_review_panel": roi_review_panel,
+        "roi_review_title": roi_review_title,
+        "roi_review_info": roi_review_info,
+        "roi_review_progress": roi_review_progress,
+        "roi_ok_btn": roi_ok_btn,
+        "roi_reject_btn": roi_reject_btn,
+        "roi_finish_btn": roi_finish_btn,
+    })
+
     left = ft.Column(
         [
             ft.Text("GA Segmentation Pro", size=22, weight=ft.FontWeight.BOLD, color=T.PRIMARY),
@@ -3688,6 +3921,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             status,
             series_launch_row,
             reg_review_panel,
+            roi_review_panel,
             view_mode,
             series_date_dd,
             img_stack,
