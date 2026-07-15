@@ -171,6 +171,56 @@ def position_guided_monotonic_refine(image_u8: np.ndarray, curr_mask: np.ndarray
 
 
 # ---------------------------------------------------------------------------
+# 1c. 画像拘束付き単調封筒 (∪prev ∩ dilate(last) + band fit)
+# ---------------------------------------------------------------------------
+def image_guided_monotonic_envelope(
+    image_u8: np.ndarray,
+    curr_mask: np.ndarray,
+    *,
+    prev_mask: np.ndarray | None = None,
+    last_mask: np.ndarray | None = None,
+    last_margin_px: int = 3,
+    band_px: int = 12,
+    block_size: int = 35,
+    offset: float = 5.0,
+    dark_lesion: bool = True,
+) -> np.ndarray:
+    """
+    案B: 論理的な単調封筒のあと、境界帯だけ画像輝度でフィットする。
+
+      1) envelope = curr ∪ prev          （前フレームより縮めない）
+      2) envelope ∩= dilate(last, m)     （最終フレームを超えない）
+      3) band_adaptive_threshold(base=envelope) で輝度に境界を合わせる
+      4) 再度 ⊇ prev かつ ⊆ dilate(last) を強制（band で崩れた制約を戻す）
+
+    prev / last が無い場合はその制約をスキップする。
+    """
+    curr_b = _to_bool(curr_mask)
+    envelope = curr_b.copy()
+    if prev_mask is not None:
+        envelope = envelope | _to_bool(prev_mask)
+
+    upper = None
+    if last_mask is not None:
+        upper = _to_bool(last_mask)
+        if last_margin_px > 0:
+            upper = dilation(upper, disk(int(last_margin_px)))
+        envelope = envelope & upper
+
+    refined = band_adaptive_threshold_refine(
+        image_u8, curr_mask,
+        band_px=band_px, block_size=block_size, offset=offset,
+        dark_lesion=dark_lesion, base_mask=envelope.astype(np.uint8),
+    )
+    refined_b = _to_bool(refined)
+    if prev_mask is not None:
+        refined_b = refined_b | _to_bool(prev_mask)
+    if upper is not None:
+        refined_b = refined_b & upper
+    return _clean(refined_b).astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
 # 2. Active Contour (Morphological Chan-Vese)
 # ---------------------------------------------------------------------------
 def chan_vese_refine(image_u8: np.ndarray, mask: np.ndarray,
@@ -291,6 +341,7 @@ def slic_boundary_snap(image_u8: np.ndarray, mask: np.ndarray,
 METHODS = {
     "band_adaptive_threshold": band_adaptive_threshold_refine,
     "position_guided_monotonic": position_guided_monotonic_refine,  # 特殊シグネチャ(prev/next_maskが必要)
+    "image_guided_monotonic": image_guided_monotonic_envelope,  # 特殊シグネチャ(prev/last_maskが必要)
     "chan_vese": chan_vese_refine,
     "geodesic_prior_reconstruction": geodesic_prior_reconstruction,  # 特殊シグネチャ(prev_maskが必要)
     "grabcut": grabcut_refine,

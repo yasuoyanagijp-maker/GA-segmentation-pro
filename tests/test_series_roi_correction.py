@@ -17,7 +17,7 @@ if str(_PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(_PKG_ROOT))
 
 from ga_roi_correction.aligned_correct import choose_refine_method  # noqa: E402
-from ga_roi_correction.qc import AnomalyThresholds, dice  # noqa: E402
+from ga_roi_correction.qc import AnomalyThresholds, check_endpoint_containment, dice  # noqa: E402
 from ga_roi_correction.refine import (  # noqa: E402
     interpolate_prior_mask,
     position_guided_monotonic_refine,
@@ -58,10 +58,11 @@ def test_apply_roi_correction_to_series_shrink_and_flag():
     for i, img in enumerate(images):
         m = _circle(size, center, 20 + 2 * i) > 0
         img[m] = 50
+    # Growing series: first ⊆ last (gate ok). Middle is oversized vs neighbors.
     masks = [
-        _circle(size, center, 40),   # oversized first
-        _circle(size, center, 22),
-        _circle(size, center, 10),   # shrink anomaly
+        _circle(size, center, 18),
+        _circle(size, center, 40),   # oversized middle
+        _circle(size, center, 26),
     ]
     results = [
         {
@@ -77,31 +78,133 @@ def test_apply_roi_correction_to_series_shrink_and_flag():
         for i in range(3)
     ]
     out = apply_roi_correction_to_series(results)
+    assert out["gate_failed"] is False
     assert len(out["results"]) == 3
     assert "mask_pre_roi" in out["results"][0]
     assert out["results"][0]["mask"].shape == (size, size)
-    areas_raw = [int(np.count_nonzero(m)) for m in masks]
+    # Endpoints locked as anchors
+    assert np.array_equal(out["results"][0]["mask"] > 0, masks[0] > 0)
+    assert np.array_equal(out["results"][2]["mask"] > 0, masks[2] > 0)
+    assert out["refine_methods"][0] is None
+    assert out["refine_methods"][2] is None
     areas_corr = [int(np.count_nonzero(r["mask"])) for r in out["results"]]
-    assert areas_corr[0] <= areas_raw[0]
-    assert any(r.get("roi_needs_review") for r in out["results"]) or areas_corr != areas_raw
-    # anomalous frames that were refined must use an allowed method
-    for method in out["refine_methods"]:
-        if method is not None:
-            assert method in (
-                "band_adaptive_threshold", "chan_vese", "grabcut",
-            )
-    # frame0 is largely oversized vs frame1 → should escalate past band
-    assert out["refine_methods"][0] in ("chan_vese", "grabcut")
-    # CSV エクスポート用 QC ログ（SOP 11章相当 + filename/refine_method）
+    areas_raw = [int(np.count_nonzero(m)) for m in masks]
+    assert areas_corr[1] <= areas_raw[1]
+    # Middle must stay within dilate(last, 3)
+    from skimage.morphology import dilation, disk
+    upper = dilation(masks[2] > 0, disk(3))
+    assert not ((out["results"][1]["mask"] > 0) & ~upper).any()
+    # anomalous middle that was refined must use an allowed method
+    if out["refine_methods"][1] is not None:
+        assert out["refine_methods"][1] in (
+            "band_adaptive_threshold", "chan_vese", "grabcut",
+            "position_guided_monotonic", "endpoint_bounds",
+            "image_guided_monotonic",
+        )
+    # 案B: middle ⊇ prev and ⊆ dilate(last)
+    mid = out["results"][1]["mask"] > 0
+    prev = out["results"][0]["mask"] > 0
+    assert not (prev & ~mid).any()
     qc_log = out["qc_log"]
     assert len(qc_log) == 3
     assert qc_log[0]["filename"] == "f0.jpg"
-    assert qc_log[0]["refine_method"] == out["refine_methods"][0]
     for key in (
         "raw_area", "corrected_area", "dice_with_prev_raw",
         "dice_with_prev_corrected", "needs_review", "reason",
     ):
         assert key in qc_log[0]
+
+
+def test_image_guided_monotonic_envelope_union_and_clip():
+    from ga_roi_correction.refine import image_guided_monotonic_envelope
+    from skimage.morphology import dilation, disk
+
+    size = 160
+    center = (80, 80)
+    image = np.full((size, size), 160, dtype=np.uint8)
+    true_mid = _circle(size, center, 28) > 0
+    image[true_mid] = 50
+    prev = _circle(size, center, 24) > 0
+    # curr shrinks vs prev and also spills outside last
+    curr = _circle(size, center, 18) > 0
+    last = _circle(size, center, 32) > 0
+    # add a blob outside last
+    curr = curr | (_circle(size, (130, 80), 8) > 0)
+
+    out = image_guided_monotonic_envelope(
+        image, curr, prev_mask=prev, last_mask=last, last_margin_px=3,
+    ) > 0
+    assert not (prev & ~out).any()
+    upper = dilation(last, disk(3))
+    assert not (out & ~upper).any()
+    # Should recover toward the dark lesion better than raw shrunk curr
+    assert dice(out, true_mid) > dice(curr & upper, true_mid)
+
+
+def test_roi_containment_gate_blocks_when_first_not_in_last():
+    size = 120
+    center = (60, 60)
+    images = [np.full((size, size), 160, dtype=np.uint8) for _ in range(2)]
+    masks = [
+        _circle(size, center, 40),
+        _circle(size, center, 15),
+    ]
+    results = [
+        {
+            "image": images[i],
+            "mask": masks[i],
+            "date": f"2026-0{i + 1}-01",
+            "filename": f"f{i}.jpg",
+            "scale_um_px": 10.0,
+            "fovea_xy": (60.0, 60.0),
+            "stats": {"area_mm2": 1.0, "dist_um": 100.0},
+            "reg_method": "reference" if i == 0 else "affine",
+        }
+        for i in range(2)
+    ]
+    out = apply_roi_correction_to_series(results)
+    assert out["gate_failed"] is False
+    assert out["gate"]["ok"] is False
+    assert out["endpoint_reconcile"] is not None
+    assert out["endpoint_reconcile"]["removed_from_first_px"] > 0
+    assert out["endpoint_reconcile"]["added_to_last_px"] > 0
+    # After reconcile + lock: first ⊆ dilate(last, 3)
+    first = out["results"][0]["mask"] > 0
+    last = out["results"][1]["mask"] > 0
+    from skimage.morphology import dilation, disk
+    assert not (first & ~dilation(last, disk(3))).any()
+    # Leak pixels moved onto last
+    assert int(np.count_nonzero(last)) >= int(np.count_nonzero(masks[1] > 0))
+
+
+def test_check_endpoint_containment_margin():
+    size = 80
+    first = _circle(size, (40, 40), 10)
+    last = _circle(size, (40, 40), 12)
+    assert check_endpoint_containment(first, last, margin_px=3)["ok"] is True
+    # Shifted first leaks outside last even with margin
+    first_shift = _circle(size, (55, 40), 10)
+    bad = check_endpoint_containment(first_shift, last, margin_px=3)
+    assert bad["ok"] is False
+    assert bad["leak_pixels"] > 0
+
+
+def test_reconcile_endpoint_masks_transfers_leak():
+    from ga_roi_correction.qc import reconcile_endpoint_masks
+
+    size = 80
+    first = _circle(size, (40, 40), 20) > 0
+    last = _circle(size, (40, 40), 10) > 0
+    out = reconcile_endpoint_masks(first, last, margin_px=3)
+    assert out["changed"] is True
+    assert out["removed_from_first_px"] == out["added_to_last_px"] > 0
+    first_n = out["first_mask"].astype(bool)
+    last_n = out["last_mask"].astype(bool)
+    from skimage.morphology import dilation, disk
+    assert not (first_n & ~dilation(last_n, disk(3))).any()
+    # Pixels removed from first appear on last
+    leak = first & ~dilation(last, disk(3))
+    assert (last_n & leak).sum() == leak.sum()
 
 
 def test_interpolate_prior_mask_midpoint():

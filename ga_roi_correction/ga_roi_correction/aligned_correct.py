@@ -32,6 +32,13 @@ class AlignedCorrectConfig:
     # monotonicity constraint (prev ⊆ result ⊆ dilate(next, margin)).
     enable_position_guided_refine: bool = True
     position_next_margin_px: int = 3
+    # Trust first/last masks as anchors: never refine endpoints; clamp
+    # middle frames to first ⊆ result ⊆ dilate(last, endpoint_bound_margin_px).
+    lock_endpoints: bool = True
+    endpoint_bound_margin_px: int = 3
+    # 案B: after each middle frame, enforce ∪prev ∩ dilate(last) then
+    # refit the boundary with band_adaptive_threshold (image-guided).
+    enable_image_guided_monotonic: bool = True
 
 
 def _area_severity_tier(
@@ -92,6 +99,42 @@ def choose_refine_method(
     return default_method
 
 
+def _enforce_endpoint_bounds(
+    mask: np.ndarray,
+    first_mask: np.ndarray,
+    last_mask: np.ndarray,
+    margin_px: int,
+) -> np.ndarray:
+    """Force first ⊆ result ⊆ dilate(last, margin) for middle frames."""
+    from skimage.morphology import dilation, disk
+
+    from .refine import _clean
+
+    m = mask.astype(bool) | first_mask.astype(bool)
+    upper = last_mask.astype(bool)
+    if margin_px > 0:
+        upper = dilation(upper, disk(int(margin_px)))
+    m = m & upper
+    return _clean(m).astype(np.uint8)
+
+
+def _apply_image_guided_monotonic(
+    analysis_img: np.ndarray,
+    curr: np.ndarray,
+    prev_m: Optional[np.ndarray],
+    last_anchor: np.ndarray,
+    cfg: AlignedCorrectConfig,
+) -> np.ndarray:
+    """案B: ∪prev ∩ dilate(last) + band fit + re-enforce bounds."""
+    return rf.image_guided_monotonic_envelope(
+        analysis_img,
+        curr,
+        prev_mask=prev_m,
+        last_mask=last_anchor,
+        last_margin_px=cfg.endpoint_bound_margin_px,
+    )
+
+
 def correct_aligned_series(
     images: list[np.ndarray],
     masks: list[np.ndarray],
@@ -142,12 +185,23 @@ def correct_aligned_series(
 
     corrected: list[np.ndarray] = [None] * n  # type: ignore
     corrected[0] = aligned_masks[0]
+    if n >= 2 and cfg.lock_endpoints:
+        corrected[n - 1] = aligned_masks[n - 1]
     refine_methods: list[Optional[str]] = [None] * n
     dice_neighbor_prior: list[Optional[float]] = [None] * n
+    first_anchor = aligned_masks[0]
+    last_anchor = aligned_masks[n - 1] if n >= 2 else aligned_masks[0]
 
     for i in range(n):
+        # Endpoints are trusted anchors when lock_endpoints is on.
+        if cfg.lock_endpoints and (i == 0 or i == n - 1):
+            corrected[i] = aligned_masks[i]
+            continue
+
         prev_m = corrected[i - 1] if i > 0 else None
         next_m = aligned_masks[i + 1] if i < n - 1 else None
+        before = aligned_masks[i]
+        method_tag: Optional[str] = None
 
         # Position check runs before the area checks: a frame whose area is
         # in range can still be grossly shifted, which area QC cannot see.
@@ -159,41 +213,69 @@ def correct_aligned_series(
             if prior is not None:
                 dice_neighbor_prior[i] = qc.dice(aligned_masks[i], prior)
             if qc.detect_position_anomaly(dice_neighbor_prior[i], pcfg.thresholds):
-                refine_methods[i] = "position_guided_monotonic"
-                corrected[i] = rf.position_guided_monotonic_refine(
+                method_tag = "position_guided_monotonic"
+                curr = rf.position_guided_monotonic_refine(
                     analysis[i], aligned_masks[i],
                     prev_mask=prev_m, next_mask=next_m,
                     next_margin_px=cfg.position_next_margin_px,
                 )
-                continue
-
-        prev_a = qc.mask_area(corrected[i - 1]) if i > 0 else None
-        next_a = raw_areas[i + 1] if i < n - 1 else None
-        is_anom = qc.detect_area_anomaly(prev_a, raw_areas[i], next_a, pcfg.thresholds)
-
-        if not is_anom:
-            corrected[i] = aligned_masks[i]
-            continue
-
-        curr = aligned_masks[i]
-        if i > 0 and prev_a is not None and raw_areas[i] < prev_a * (1 - pcfg.thresholds.rel_drop):
-            curr = rf.geodesic_prior_reconstruction(
-                curr, corrected[i - 1], pcfg.reconstruction_margin_px,
-            )
+            else:
+                curr = None
         else:
-            neighbor = corrected[i - 1] if i > 0 else aligned_masks[min(i + 1, n - 1)]
-            if i == n - 1 and prev_a is not None:
-                neighbor = corrected[i - 1]
-            elif i == 0 and next_a is not None:
-                neighbor = aligned_masks[1]
-            curr = _cap_to_neighbor(curr, neighbor, pcfg.cap_margin_px)
+            curr = None
 
-        method = choose_refine_method(
-            prev_a, raw_areas[i], next_a, pcfg.thresholds, cfg.refine_method,
+        if curr is None:
+            prev_a = qc.mask_area(corrected[i - 1]) if i > 0 else None
+            next_a = raw_areas[i + 1] if i < n - 1 else None
+            is_anom = qc.detect_area_anomaly(prev_a, raw_areas[i], next_a, pcfg.thresholds)
+
+            if not is_anom:
+                curr = aligned_masks[i]
+            else:
+                curr = aligned_masks[i]
+                if i > 0 and prev_a is not None and raw_areas[i] < prev_a * (1 - pcfg.thresholds.rel_drop):
+                    curr = rf.geodesic_prior_reconstruction(
+                        curr, corrected[i - 1], pcfg.reconstruction_margin_px,
+                    )
+                else:
+                    neighbor = corrected[i - 1] if i > 0 else aligned_masks[min(i + 1, n - 1)]
+                    if i == n - 1 and prev_a is not None:
+                        neighbor = corrected[i - 1]
+                    elif i == 0 and next_a is not None:
+                        neighbor = aligned_masks[1]
+                    curr = _cap_to_neighbor(curr, neighbor, pcfg.cap_margin_px)
+
+                method_tag = choose_refine_method(
+                    prev_a, raw_areas[i], next_a, pcfg.thresholds, cfg.refine_method,
+                )
+                prev_for_refine = corrected[i - 1] if i > 0 else None
+                curr = _apply_refine(method_tag, analysis[i], curr, prev_for_refine)
+
+        # Endpoint envelope (logical) when anchors are locked.
+        if cfg.lock_endpoints and n >= 2:
+            curr = _enforce_endpoint_bounds(
+                curr, first_anchor, last_anchor, cfg.endpoint_bound_margin_px,
+            )
+
+        # 案B: ∪prev ∩ dilate(last) + band fit on the envelope.
+        use_igm = (
+            cfg.enable_image_guided_monotonic
+            and cfg.lock_endpoints
+            and n >= 3
+            and prev_m is not None
         )
-        refine_methods[i] = method
-        prev_for_refine = corrected[i - 1] if i > 0 else None
-        curr = _apply_refine(method, analysis[i], curr, prev_for_refine)
+        if use_igm:
+            before_igm = curr
+            curr = _apply_image_guided_monotonic(
+                analysis[i], curr, prev_m, last_anchor, cfg,
+            )
+            if method_tag is None:
+                if not np.array_equal(curr.astype(bool), before_igm.astype(bool)):
+                    method_tag = "image_guided_monotonic"
+                elif not np.array_equal(before_igm.astype(bool), before.astype(bool)):
+                    method_tag = "endpoint_bounds"
+
+        refine_methods[i] = method_tag
         corrected[i] = curr
 
     corrected_areas = [qc.mask_area(m) for m in corrected]
@@ -212,6 +294,20 @@ def correct_aligned_series(
         modes, ccs, pcfg.thresholds,
         dice_neighbor_prior=dice_neighbor_prior,
     )
+    # Locked endpoints are trusted: do not flag them for area_anomaly alone.
+    if cfg.lock_endpoints and n >= 2:
+        for i in (0, n - 1):
+            rec = records[i]
+            if not rec.area_anomaly:
+                continue
+            reasons = [r for r in rec.reason.split(";") if r and r != "area_anomaly"]
+            rec.area_anomaly = False
+            if reasons:
+                rec.reason = ";".join(reasons)
+                rec.needs_review = True
+            else:
+                rec.reason = "ok"
+                rec.needs_review = False
     return {
         "corrected_masks": corrected,
         "raw_masks": aligned_masks,

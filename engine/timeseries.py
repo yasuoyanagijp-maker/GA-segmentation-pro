@@ -7,7 +7,8 @@ import logging
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -318,12 +319,14 @@ def build_series_from_saved(
     selected: set[str] | None = None,
     methods: dict[str, str] | None = None,
     prior_matrices: dict[str, np.ndarray] | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> list[dict]:
     """メモリ上の個別解析結果から時系列表示用データを構築（再セグメントなし）。
 
     - selected: 時系列対象に含めるファイル名の集合（None なら確定済み全件）。
     - methods: ファイル名 → 位置合わせ手法（redo 用。既定 "affine"）。
     - prior_matrices: ファイル名 → 既知のアフィン行列。あれば再計算せず適用する。
+    - progress_callback: (done, total, label) — 移動側時点の進捗（UI 用）。
 
     先頭時点（最古の撮影日）を基準に、各画像・マスク・中心窩を同じアフィン
     行列で整列する。中心窩は必ず基準の中心窩へ一致させる（fovea anchoring）。
@@ -393,6 +396,15 @@ def build_series_from_saved(
             lm["fovea_xy"], lm["disc_xy"], ref_fovea, ref_disc,
         )
 
+    total_moving = max(len(ordered) - 1, 0) if register else 0
+    progress_done = {"n": 0}
+
+    def _report_progress(label: str) -> None:
+        if progress_callback is None or total_moving <= 0:
+            return
+        progress_done["n"] += 1
+        progress_callback(progress_done["n"], total_moving, label)
+
     def _register_one(i: int) -> tuple[int, dict]:
         fname = ordered[i].name
         method = reg_methods[i]
@@ -421,10 +433,16 @@ def build_series_from_saved(
         if max_workers <= 1:
             for i in sorted(reg_methods):
                 reg_out[i] = _register_one(i)[1]
+                _report_progress(f"計算 {ordered[i].name}")
         else:
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                for i, reg in ex.map(_register_one, sorted(reg_methods)):
+                futures = {
+                    ex.submit(_register_one, i): i for i in sorted(reg_methods)
+                }
+                for fut in as_completed(futures):
+                    i, reg = fut.result()
                     reg_out[i] = reg
+                    _report_progress(f"計算 {ordered[i].name}")
 
     results: list[dict] = []
     for i, (snap, f) in enumerate(zip(snapshots, ordered)):
@@ -452,6 +470,7 @@ def build_series_from_saved(
             fovea = warp_point(moving_fovea, matrix) or ref_fovea
             disc_xy = warp_point(moving_disc, matrix) or ref_disc
             disc_pts = lm["disc_pts"]
+            _report_progress(f"適用 {fname}")
         else:
             method = reg_methods[i]
             reg = reg_out[i]

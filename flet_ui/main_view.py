@@ -349,6 +349,14 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     )
     reg_apply_btn = btn_toolbar("位置合わせを実行", on_click=lambda _: None)
     reg_apply_btn.visible = False
+    reg_progress_bar = ft.ProgressBar(
+        value=0,
+        bar_height=8,
+        color=T.PRIMARY,
+        bgcolor="#374151",
+        visible=False,
+    )
+    reg_progress_label = ft.Text("", size=11, color=T.TEXT_MUTED, visible=False)
     series_dates_section = ft.Column(
         [
             ft.Text("時系列（撮影日）", size=12, weight=ft.FontWeight.W_600, color=T.PRIMARY),
@@ -3179,6 +3187,22 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         redo = _registration_controls.get("redo_btn")
         if redo is not None:
             redo.disabled = busy
+        if not busy:
+            reg_progress_bar.visible = False
+            reg_progress_label.visible = False
+
+    def _show_registration_progress(done: int, total: int, label: str) -> None:
+        """位置合わせ進捗をステータス＋バーに反映（メインスレッド想定）。"""
+        total = max(int(total), 1)
+        done = max(0, min(int(done), total))
+        reg_progress_bar.value = done / total
+        reg_progress_bar.visible = True
+        detail = f" · {label}" if label else ""
+        reg_progress_label.value = _safe_text(
+            f"位置合わせ {done}/{total}{detail}"
+        )
+        reg_progress_label.visible = True
+        _set_status(_safe_text(f"位置合わせ中… {done}/{total}{detail}"))
 
     def on_review_redo(_=None) -> None:
         """選択中の手法で現在時点を再位置合わせする。"""
@@ -3440,6 +3464,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         補正前マスクは各行の mask_pre_roi に保持され、トグル OFF で
         _revert_series_roi_correction により補正前へ戻せる。
         QCログ（SOP 11章相当）は series_roi_qc に保持し CSV へ出力する。
+
+        先頭ROIが末尾ROI(+3px)に含まれない場合は、漏れ領域を先頭から削除し
+        末尾へ追加してから refine する（手動修正ダイアログは出さない）。
         """
         if registration_guard["running"] or series_guard.get("roi_running"):
             return
@@ -3476,19 +3503,29 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 _rebuild_series_derived(overlays=overlays)
                 needs = out["needs_review_indices"]
                 n_corr = sum(1 for m in out["refine_methods"] if m)
+                recon = out.get("endpoint_reconcile")
+                recon_note = ""
+                if recon:
+                    recon_note = (
+                        f" · 端点自動調整"
+                        f"（先頭−{recon['removed_from_first_px']}px"
+                        f" / 末尾+{recon['added_to_last_px']}px）"
+                    )
                 if needs:
                     state.series_review_idx = needs[0]
                     _enter_roi_review()
                     _set_status(_safe_text(
                         f"ROI補正確認 ({len(needs)} 時点が要レビュー) "
                         "— 各時点で OK / 補正破棄を選択"
+                        f"{recon_note}"
                     ))
                 else:
                     _finish_to_series_results_view()
-                    if n_corr:
+                    if n_corr or recon:
                         _set_status(_safe_text(
                             f"時系列表示 ({len(out['results'])} 時点) "
-                            f"— マスクQC補正 {n_corr} 時点（要レビューなし）"
+                            f"— マスクQC補正 {n_corr} 時点"
+                            f"{recon_note}"
                         ))
                     else:
                         _set_status(_safe_text(
@@ -3570,11 +3607,28 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
 
         async def _registration_task() -> None:
             _set_registration_busy(True)
+            proceed_to_roi = False
+            loop = asyncio.get_running_loop()
             if prior_matrices:
                 _set_status("保存済みの位置合わせ行列を適用中…")
             else:
                 _set_status("位置合わせを計算中…")
+            reg_progress_bar.value = 0
+            reg_progress_bar.visible = True
+            reg_progress_label.value = ""
+            reg_progress_label.visible = True
             page.update()
+
+            def _on_progress(done: int, total: int, label: str) -> None:
+                def _apply() -> None:
+                    _show_registration_progress(done, total, label)
+                    page.update()
+
+                try:
+                    loop.call_soon_threadsafe(_apply)
+                except RuntimeError:
+                    _apply()
+
             try:
                 results = await asyncio.to_thread(
                     build_series_from_saved,
@@ -3585,6 +3639,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                     selected=selected_set,
                     methods=series_methods,
                     prior_matrices=prior_matrices,
+                    progress_callback=_on_progress,
                 )
             except ValueError as exc:
                 _set_status(str(exc))
@@ -3601,11 +3656,13 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 if prior_matrices and cache_confirmed:
                     # 再解析後の再利用: 位置合わせ確認を飛ばし ROI 補正へ
                     # （トグル OFF 時は _run_... 側で結果表示に直行する）
+                    # 注意: registration_guard 中に ROI を呼ぶと即 return するため、
+                    # busy 解除後に proceed_to_roi で起動する。
                     state.series_review_active = False
                     state.series_registered = True
                     _stash_reg_cache_from_series()
                     _refresh_review_panel()
-                    _run_roi_correction_after_registration()
+                    proceed_to_roi = True
                 else:
                     state.series_review_active = True
                     state.series_review_idx = 1 if len(results) > 1 else 0
@@ -3627,6 +3684,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 _finish_launch_guard()
                 _set_registration_busy(False)
                 page.update()
+            # busy 解除後に ROI を起動（ガード衝突でハングしないように）
+            if proceed_to_roi:
+                _run_roi_correction_after_registration()
 
         page.run_task(_registration_task)
 
@@ -3813,6 +3873,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             roi_correction_sw,
             ft.Row([series_launch_btn], spacing=8),
             reg_apply_btn,
+            reg_progress_label,
+            reg_progress_bar,
         ],
         spacing=6,
         visible=False,
