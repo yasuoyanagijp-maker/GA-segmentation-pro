@@ -50,8 +50,10 @@ class GAAppState:
     series_dates_manual: dict[str, bool] = field(default_factory=dict)  # 手動入力した撮影日時
     series_selected: dict[str, bool] = field(default_factory=dict)  # filename -> 時系列に含める
     series_methods: dict[str, str] = field(default_factory=dict)    # filename -> 位置合わせ手法
-    series_registration_enabled: bool = False  # 位置合わせトグル（既定 OFF）
+    series_registration_enabled: bool = True  # 位置合わせトグル（既定 ON）
     series_registered: bool = False              # 現在の時系列に位置合わせ済みか
+    series_roi_enabled: bool = True   # マスクQC補正トグル（既定 ON、位置合わせ確認後に適用）
+    series_roi_applied: bool = False  # 現在の時系列にQC補正適用済みか
     # 再解析後に位置合わせを再利用するためのメモリキャッシュ
     # {selected: tuple[str], ref: str, confirmed: bool, by_file: {fname: {matrix, method}}}
     series_reg_cache: dict | None = None
@@ -104,8 +106,10 @@ class GAAppState:
             self.series_selected = {}
             self.series_methods = {}
             self.series_dates_manual = {}
-            self.series_registration_enabled = False
+            self.series_registration_enabled = True
             self.series_registered = False
+            self.series_roi_enabled = True
+            self.series_roi_applied = False
             self.series_reg_cache = None
             self.batch_mode = False
 

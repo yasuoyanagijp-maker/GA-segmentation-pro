@@ -336,7 +336,15 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     registration_sw = ft.Switch(
         label="位置合わせ (Registration)",
         value=state.series_registration_enabled,
-        tooltip="OFF: 各画像の座標のまま時系列・グラフ表示。ON: 位置合わせを実行",
+        tooltip="ON（既定）: ④で位置合わせを実行し確認モードへ。OFF: 各画像の座標のまま時系列・グラフ表示",
+    )
+    roi_correction_sw = ft.Switch(
+        label="マスクQC補正",
+        value=state.series_roi_enabled,
+        tooltip=(
+            "ON（既定）: 位置合わせ確認後、面積が時系列で異常な時点のマスクを"
+            "QC補正（band/chan_vese/grabcut）し統計を再計算。OFF: 補正前マスクに戻す"
+        ),
     )
     reg_apply_btn = btn_toolbar("位置合わせを実行", on_click=lambda _: None)
     reg_apply_btn.visible = False
@@ -625,6 +633,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.series_review_active = False
         state.series_review_idx = 0
         state.series_registered = False
+        state.series_roi_applied = False
         state.view_mode = "work"
         view_mode.value = "work"
         view_mode.visible = False
@@ -635,8 +644,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             _ui["reg_review_panel"].visible = False
 
     def _update_registration_controls() -> None:
-        """位置合わせトグル・実行ボタンの表示を同期。"""
+        """位置合わせ・QC補正トグル・実行ボタンの表示を同期。"""
         registration_sw.value = state.series_registration_enabled
+        roi_correction_sw.value = state.series_roi_enabled
         reg_apply_btn.visible = (
             state.series_registration_enabled
             and state.series_results is not None
@@ -1892,6 +1902,32 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                     color=T.ACCENT_AMBER,
                     size=12,
                 ))
+        if is_series and state.series_roi_applied and state.series_results:
+            corrected = [
+                r for r in state.series_results if r.get("roi_refine_method")
+            ]
+            if corrected:
+                labels = ", ".join(
+                    f"{_format_series_datetime_label(r['date'])}"
+                    f" ({r['roi_refine_method']})"
+                    for r in corrected
+                )
+                results_col.controls.append(ft.Text(
+                    _safe_text(f"マスクQC補正済み: {labels}"),
+                    color=T.ACCENT_CYAN,
+                    size=11,
+                ))
+            for r in state.series_results:
+                if r.get("roi_needs_review"):
+                    reason = r.get("roi_reason") or "面積異常"
+                    results_col.controls.append(ft.Text(
+                        _safe_text(
+                            f"⚠ QC要確認 "
+                            f"{_format_series_datetime_label(r['date'])}: {reason}"
+                        ),
+                        color=T.ACCENT_AMBER,
+                        size=12,
+                    ))
         if cross is not None:
             if cross < life_y:
                 results_col.controls.append(ft.Text(
@@ -3172,6 +3208,122 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         refresh_image()
         refresh_results()
         page.update()
+        if state.series_roi_enabled:
+            _apply_series_roi_correction()
+
+    roi_guard = {"running": False}
+
+    def _apply_series_roi_correction() -> None:
+        """位置合わせ確認済みの時系列にマスクQC補正を適用する（非同期）。
+
+        面積が時系列で異常な時点だけマスクを補正（band_adaptive_threshold /
+        chan_vese / grabcut を重症度で選択）し、stats を補正後マスクで再計算
+        する。補正前マスクは各行の mask_pre_roi に保持し、トグル OFF で戻せる。
+        """
+        if roi_guard["running"]:
+            return
+        results = state.series_results
+        if (
+            not results
+            or not state.series_registered
+            or state.series_review_active
+            or state.series_roi_applied
+        ):
+            return
+
+        async def _roi_task() -> None:
+            roi_guard["running"] = True
+            _set_status("マスクQC補正を適用中…")
+            page.update()
+            try:
+                # pandas / skimage を含む重い import は初回適用時まで遅延
+                from engine.series_roi_correction import (
+                    apply_roi_correction_to_series,
+                )
+                out = await asyncio.to_thread(
+                    apply_roi_correction_to_series, results,
+                )
+            except Exception as exc:
+                _log.exception("ROI correction failed")
+                _set_status(f"マスクQC補正エラー: {exc}")
+            else:
+                if state.series_results is not results:
+                    # 適用中に時系列が破棄/再構築された — 結果は捨てる
+                    return
+                updated = out["results"]
+                overlays = await asyncio.to_thread(
+                    lambda: [_row_overlay(r) for r in updated],
+                )
+                state.series_results = updated
+                state.series_overlays = overlays
+                state.series_gif = None
+                state.series_roi_applied = True
+                _recompute_series_estimates()
+                n_corr = sum(1 for m in out["refine_methods"] if m)
+                n_review = len(out["needs_review_indices"])
+                if n_corr or n_review:
+                    _set_status(_safe_text(
+                        f"マスクQC補正: 補正 {n_corr} 時点 / 要確認 {n_review} 時点"
+                        " — 統計は補正後マスクで再計算済み"
+                    ))
+                else:
+                    _set_status("マスクQC補正: 面積異常なし（マスク変更なし）")
+                refresh_image()
+                refresh_results()
+            finally:
+                roi_guard["running"] = False
+                page.update()
+
+        page.run_task(_roi_task)
+
+    def _revert_series_roi_correction() -> None:
+        """QC補正を解除し、各時点を補正前マスク（mask_pre_roi）に戻す。"""
+        results = state.series_results
+        if not results or not state.series_roi_applied:
+            return
+        from engine.timeseries import _compute_row_stats
+        for row in results:
+            pre = row.pop("mask_pre_roi", None)
+            if pre is not None:
+                row["mask"] = pre
+                row["stats"] = _compute_row_stats(
+                    pre,
+                    row.get("scale_um_px"),
+                    row.get("fovea_xy"),
+                    row.get("stats") or {},
+                )
+            for key in (
+                "roi_needs_review", "roi_reason", "roi_ok",
+                "roi_raw_area", "roi_corrected_area", "roi_refine_method",
+            ):
+                row.pop(key, None)
+        state.series_roi_applied = False
+        _rebuild_series_derived()
+        _set_status("マスクQC補正を解除しました（補正前マスクに戻しました）")
+        refresh_image()
+        refresh_results()
+
+    def on_roi_correction_toggle(e: ft.ControlEvent) -> None:
+        state.series_roi_enabled = bool(e.control.value)
+        if not state.series_roi_enabled:
+            if state.series_roi_applied:
+                _revert_series_roi_correction()
+            page.update()
+            return
+        if (
+            state.series_results
+            and state.series_registered
+            and not state.series_roi_applied
+        ):
+            _apply_series_roi_correction()
+        elif state.series_results and not state.series_registered:
+            _set_status(
+                "マスクQC補正は位置合わせ済みの時系列に適用されます"
+                "（位置合わせ確認完了後に自動適用）"
+            )
+        page.update()
+
+    roi_correction_sw.on_change = on_roi_correction_toggle
 
     def _show_series_results_view(*, n: int, selected: int) -> None:
         """位置合わせなしで時系列結果を表示（グラフ優先）。"""
@@ -3277,6 +3429,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                     update_confirm_visibility()
                     refresh_image()
                     refresh_results()
+                    if state.series_roi_enabled:
+                        _apply_series_roi_correction()
                 else:
                     state.series_review_active = True
                     state.series_review_idx = 1 if len(results) > 1 else 0
@@ -3331,9 +3485,10 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     ) -> None:
         """確定済み結果から時系列を構築（非同期）。
 
-        位置合わせトグル OFF: register=False で構築しグラフ表示。
-        トグル ON: 中間ビルドを作らず直接 register=True で1回だけ構築し、
-        確認モード（または行列再利用時は結果表示）へ進む。
+        位置合わせトグル ON（既定）: 中間ビルドを作らず直接 register=True で
+        1回だけ構築し、確認モード（または行列再利用時は結果表示）へ進む。
+        確認完了後、マスクQC補正トグル ON（既定）なら QC 補正を自動適用。
+        トグル OFF: register=False で構築しグラフ表示。
         """
         if registration_guard["running"] or series_guard["launching"]:
             return
@@ -3480,6 +3635,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     series_launch_row = ft.Column(
         [
             registration_sw,
+            roi_correction_sw,
             ft.Row([series_launch_btn], spacing=8),
             reg_apply_btn,
         ],
