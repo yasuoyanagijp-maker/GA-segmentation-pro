@@ -63,6 +63,7 @@ class GAAppState:
     series_gif: bytes | None = None
     series_time_idx: int = 0
     series_review_active: bool = False  # registration 確認モード中
+    series_roi_review_active: bool = False  # ROI時系列補正の確認モード中
     series_review_idx: int = 0
     graph_metric: str = "area_mm2"  # area_mm2 | area_mm_sqrt | gawain | dist_um
     estimated_prog: float | None = None
@@ -99,6 +100,7 @@ class GAAppState:
             self.series_overlays = None
             self.series_gif = None
             self.series_review_active = False
+            self.series_roi_review_active = False
             self.series_review_idx = 0
             self.estimated_prog = None
             self.estimated_growth_mm2_per_year = None

@@ -9,6 +9,10 @@ FAF連続画像における GA(地図状萎縮)ROI の時系列自動補正パ�
 Diceが 0.31→0.90 / 0.46→0.97 / 0.47→0.97 まで回復することを合成データで確認済みです
 (`demo_synthetic.py` で再現可能)。
 
+さらに「面積は正常なのに位置が大きくずれたROI」も、前後フレーム誘導 +
+単調性制約(下記 1b)で Dice 0.09→0.94 まで回復することを確認済みです
+(`demo_position_shift.py` で再現可能)。
+
 > **GA Segmentation Pro アプリからの利用について**
 > アプリ（④ 時系列の「マスクQC補正」）は、自前の位置合わせ
 > （`engine/series_registration.py`）で整列済みの系列に対して
@@ -16,9 +20,9 @@ Diceが 0.31→0.90 / 0.46→0.97 / 0.47→0.97 まで回復することを合�
 > `engine/series_roi_correction.py` 経由で呼び出します。そのため
 > 本パッケージ内の `registration.py`（ECC位置合わせ）と
 > `pipeline.correct_ga_series`（位置合わせ込みのフルパイプライン）は
-> **アプリからは使用されません**（スタンドアロン利用・`demo_synthetic.py`
-> 用として維持）。QCログ（SOP 11章相当）はアプリの CSV エクスポートに
-> 「ROI QC correction log」として出力されます。
+> **アプリからは使用されません**（スタンドアロン利用・`demo_synthetic.py` /
+> `demo_position_shift.py` 用として維持）。QCログ（SOP 11章相当）は
+> アプリの CSV エクスポートに「ROI QC correction log」として出力されます。
 
 ## 1. 構成
 
@@ -27,10 +31,11 @@ ga_roi_correction/
   __init__.py
   preprocessing.py   SOP 6章: CLAHE・ノイズ低減・登録用/解析用画像の分離
   registration.py    SOP 7章: ECC(Euclidean→Affine)による基準フレーム登録
-  refine.py          セグメンテーション境界改善 5手法(下記2章)
+  refine.py          セグメンテーション境界改善 5手法 + 位置ずれ補正(下記2章)
   qc.py              SOP 8/10/11章: 異常判定・Dice・CSVログ
   pipeline.py         全体オーケストレーション + オーバーレイ画像出力
 demo_synthetic.py    実データなしで動作検証できる合成テスト
+demo_position_shift.py  位置ずれROIの検出・補正を検証する合成テスト
 requirements.txt
 ```
 
@@ -43,7 +48,26 @@ requirements.txt
 1. **境界帯の局所適応閾値化 (`band_adaptive_threshold`)**
    現マスク境界の±数px帯だけを局所閾値で再判定。画像全体ではなく帯領域に
    限定することで、FAFの背景輝度ムラに引きずられず、境界のギザギザ・
-   食い込みを補正できます。
+   食い込みを補正できます。`base_mask` 引数で帯の中心を別マスク
+   (例: 前後フレームから作った位置prior)に置き換えられます。
+
+1b. **位置ずれ補正: 前後フレーム誘導 + 単調性制約 (`position_guided_monotonic`)**
+   当該フレームのROIが「面積は正常なのに場所が大きくずれている」場合、
+   面積ベースの異常検知では検出できません。そこで、
+   (1) 登録済みの前後フレームROIから shape-based interpolation
+   (符号付き距離変換の補間)で位置priorを作り(現マスクの位置は信頼しない)、
+   (2) そのpriorを基準に band_adaptive_threshold で実際の画像輝度に
+   境界をフィットさせ、
+   (3) GAの非退行性の仮定に基づく単調性制約
+   `prev_mask ⊆ result ⊆ dilate(next_mask, margin)`
+   (前フレームより縮めない・次フレーム+マージンより広げない)を強制します。
+   検出は `dice_with_neighbor_prior`(前後補間priorとのDice)が
+   `AnomalyThresholds.min_dice_with_neighbor_prior`(既定0.3)未満かどうかで
+   行い、QCログには `position_anomaly` として記録されます。
+   両隣が存在し互いに整合するフレームのみが対象です(片側しか隣が無い
+   端フレームでは、どちらがずれているか判定できないため対象外)。
+   `PipelineConfig(enable_position_guided_refine=True)` が既定で有効。
+   旧来どおりの挙動にしたい場合は `False` にします。
 
 2. **Active Contour / Morphological Chan-Vese (`chan_vese`)**
    現マスクを初期輪郭として、領域内外の輝度均質性エネルギーで境界を
@@ -106,7 +130,8 @@ result["corrected_masks_original"]  # 各フレーム元座標系での補正後
 ```python
 from ga_roi_correction.qc import AnomalyThresholds
 th = AnomalyThresholds(rel_drop=0.05, rel_jump=0.20, first_ratio=1.5,
-                        last_ratio=1.5, min_dice_with_prev=0.5, min_registration_cc=0.5)
+                        last_ratio=1.5, min_dice_with_prev=0.5, min_registration_cc=0.5,
+                        min_dice_with_neighbor_prior=0.3)
 config = PipelineConfig(thresholds=th)
 ```
 
