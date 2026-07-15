@@ -185,14 +185,55 @@ def test_build_series_applies_prior_matrices_without_recompute():
     dates = {"a.jpg": "2020-01-01", "b.jpg": "2021-01-01"}
     # Translate right by 3 px
     prior = {"b.jpg": np.array([[1, 0, 3], [0, 1, 0]], dtype=np.float32)}
+    events: list[tuple[int, int, str]] = []
     results = build_series_from_saved(
         per_file, files, dates, register=True, prior_matrices=prior,
+        progress_callback=lambda d, t, lab: events.append((d, t, lab)),
     )
     assert np.allclose(results[1]["reg_matrix"], prior["b.jpg"])
     assert results[1]["reg_ok"] is True
     # Mask content should have shifted right
     assert int(results[1]["mask"][10, 8]) == 255
     assert int(results[1]["mask"][10, 5]) == 0
+    assert events == [(1, 1, "適用 b.jpg")]
+
+
+def test_build_series_progress_callback_counts_moving_frames():
+    """progress_callback reports one tick per non-reference timepoint."""
+    from engine.stats import ga_stats
+    from engine.timeseries import build_series_from_saved
+
+    fovea = (20.0, 20.0)
+    scale = 5.0
+    per_file = {}
+    files = []
+    dates = {}
+    for i, name in enumerate(["a.jpg", "b.jpg", "c.jpg"]):
+        img = np.zeros((40, 40), dtype=np.uint8)
+        mask = np.zeros((40, 40), dtype=np.uint8)
+        per_file[name] = {
+            "path": Path(f"/tmp/{name}"),
+            "filename": name,
+            "date": f"2020-0{i + 1}-01",
+            "image": img,
+            "mask": mask,
+            "stats": ga_stats(mask, scale, fovea),
+            "fovea_xy": fovea,
+            "scale_um_px": scale,
+        }
+        files.append(Path(f"/tmp/{name}"))
+        dates[name] = f"2020-0{i + 1}-01"
+    prior = {
+        "b.jpg": np.eye(2, 3, dtype=np.float32),
+        "c.jpg": np.eye(2, 3, dtype=np.float32),
+    }
+    events: list[tuple[int, int, str]] = []
+    build_series_from_saved(
+        per_file, files, dates, register=True, prior_matrices=prior,
+        progress_callback=lambda d, t, lab: events.append((d, t, lab)),
+    )
+    assert [e[:2] for e in events] == [(1, 2), (2, 2)]
+    assert all("適用" in e[2] for e in events)
 
 
 def test_series_metric_regressions_detects_decrease():

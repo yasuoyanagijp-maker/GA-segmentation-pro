@@ -82,6 +82,78 @@ def detect_position_anomaly(dice_with_neighbor_prior: Optional[float],
     return dice_with_neighbor_prior < th.min_dice_with_neighbor_prior
 
 
+def check_endpoint_containment(
+    first_mask: np.ndarray,
+    last_mask: np.ndarray,
+    *,
+    margin_px: int = 3,
+) -> dict:
+    """先頭ROIが末尾ROI(+margin)に含まれるか（GA非退行の最低条件）。
+
+    Returns
+    -------
+    dict with keys:
+      ok : bool
+      leak_pixels : int  — first にあって dilate(last) に無い画素数
+      first_area, last_area : int
+      margin_px : int
+    """
+    from skimage.morphology import dilation, disk
+
+    first_b = first_mask.astype(bool)
+    last_b = last_mask.astype(bool)
+    if margin_px > 0:
+        upper = dilation(last_b, disk(int(margin_px)))
+    else:
+        upper = last_b
+    leak = int(np.count_nonzero(first_b & ~upper))
+    return {
+        "ok": leak == 0,
+        "leak_pixels": leak,
+        "first_area": int(np.count_nonzero(first_b)),
+        "last_area": int(np.count_nonzero(last_b)),
+        "margin_px": int(margin_px),
+    }
+
+
+def reconcile_endpoint_masks(
+    first_mask: np.ndarray,
+    last_mask: np.ndarray,
+    *,
+    margin_px: int = 3,
+) -> dict:
+    """先頭・末尾ROIの包含不一致を自動解消する。
+
+    leak = first \\ dilate(last, margin) について:
+      - 先頭から削除: first' = first ∩ dilate(last, margin)
+      - 末尾へ追加:   last'  = last ∪ leak
+        （= last ∪ (first \\ dilate(last))）
+
+    これにより常に first' ⊆ dilate(last', margin) が成り立つ。
+    """
+    from skimage.morphology import dilation, disk
+
+    first_b = first_mask.astype(bool)
+    last_b = last_mask.astype(bool)
+    if margin_px > 0:
+        upper = dilation(last_b, disk(int(margin_px)))
+    else:
+        upper = last_b
+    leak = first_b & ~upper
+    first_new = first_b & upper
+    last_new = last_b | leak
+    removed = int(np.count_nonzero(leak))
+    added = removed  # same pixels transferred to last
+    return {
+        "first_mask": first_new.astype(np.uint8),
+        "last_mask": last_new.astype(np.uint8),
+        "removed_from_first_px": removed,
+        "added_to_last_px": added,
+        "changed": removed > 0,
+        "margin_px": int(margin_px),
+    }
+
+
 def build_qc_records(dates, raw_areas, corrected_areas, dice_prev_raw, dice_prev_corr,
                       reg_modes, reg_ccs, th: AnomalyThresholds,
                       dice_neighbor_prior=None) -> list[FrameQCRecord]:

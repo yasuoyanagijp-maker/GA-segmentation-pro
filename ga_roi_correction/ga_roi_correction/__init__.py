@@ -20,6 +20,7 @@ from .aligned_correct import (
 from .refine import (
     interpolate_prior_mask,
     position_guided_monotonic_refine,
+    image_guided_monotonic_envelope,
     trusted_prior_mask,
 )
 
@@ -31,6 +32,7 @@ __all__ = [
     "choose_refine_method",
     "interpolate_prior_mask",
     "position_guided_monotonic_refine",
+    "image_guided_monotonic_envelope",
     "trusted_prior_mask",
 ]
 __version__ = "0.1.0"
