@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import io
+import logging
 import re
+import time
 from datetime import date, datetime
 from pathlib import Path
 
@@ -11,6 +13,8 @@ import numpy as np
 from PIL import Image
 
 from engine.stats import ga_stats
+
+_perf_log = logging.getLogger("ga.reg.timing")
 
 
 _DATE_PATTERNS = (
@@ -410,6 +414,7 @@ def build_series_from_saved(
             method = methods.get(fname) or default_method_for(
                 moving_fovea, moving_disc, ref_fovea, ref_disc,
             )
+            t0 = time.perf_counter()
             reg = register_moving_to_reference(
                 images[i], masks[i], ref_img,
                 method=method,
@@ -418,6 +423,11 @@ def build_series_from_saved(
                 moving_disc=moving_disc,
                 ref_disc=ref_disc,
                 anchor_fovea=True,
+            )
+            _perf_log.info(
+                "timepoint %d/%d %s (method=%s): %.1f s",
+                i + 1, len(ordered), fname, method,
+                time.perf_counter() - t0,
             )
             img = reg["image"]
             mask = reg["mask"]

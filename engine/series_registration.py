@@ -26,11 +26,38 @@ from __future__ import annotations
 
 import logging
 import math
+import time
+from contextlib import contextmanager
 
 import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# ステージ別の実行時間ログ（ボトルネック調査用）。
+# flet_ui の "ga.batch" と同様に、アプリ側で logging 未設定でも
+# コンソールに出るよう専用ハンドラを付ける。
+perf_logger = logging.getLogger("ga.reg.timing")
+if not perf_logger.handlers:
+    _perf_handler = logging.StreamHandler()
+    _perf_handler.setFormatter(logging.Formatter("[reg-timing] %(message)s"))
+    perf_logger.addHandler(_perf_handler)
+    perf_logger.setLevel(logging.INFO)
+    perf_logger.propagate = False
+
+
+@contextmanager
+def _perf(stage: str, detail: str = ""):
+    """ステージ実行時間を INFO で記録するコンテキストマネージャ。"""
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        ms = (time.perf_counter() - t0) * 1000.0
+        if detail:
+            perf_logger.info("%s (%s): %.0f ms", stage, detail, ms)
+        else:
+            perf_logger.info("%s: %.0f ms", stage, ms)
 
 # UI 表示用（キー: 内部名, 値: 日本語ラベル）
 REGISTRATION_METHODS: dict[str, str] = {
@@ -645,13 +672,15 @@ def _image_registration_candidates(
 
     candidates: list[np.ndarray | None] = [np.eye(2, 3, dtype=np.float32)]
 
-    zoom = _zoom_scale_sweep_initial(ref_c, mov_c)
+    with _perf("zoom_sweep"):
+        zoom = _zoom_scale_sweep_initial(ref_c, mov_c)
     zoom_scale = _matrix_similarity_scale(zoom) if zoom is not None else None
     zoom_mae = _alignment_mae(ref_c, mov_c, zoom) if zoom is not None else None
     if zoom is not None:
         candidates.append(zoom)
 
-    phase = _phase_translation_initial(ref_c, mov_c)
+    with _perf("phase_translation"):
+        phase = _phase_translation_initial(ref_c, mov_c)
     if phase is not None:
         candidates.append(phase)
     if initial is not None:
@@ -678,23 +707,25 @@ def _image_registration_candidates(
     if not sift_inits:
         sift_inits = [None]
 
-    for init in sift_inits:
-        sift = _sift_ransac_forward(
-            ref_c, mov_c,
-            model="similarity",
-            initial=init,
-        )
+    for i, init in enumerate(sift_inits):
+        with _perf("sift_similarity", f"init {i + 1}/{len(sift_inits)}"):
+            sift = _sift_ransac_forward(
+                ref_c, mov_c,
+                model="similarity",
+                initial=init,
+            )
         if sift is not None:
             candidates.append(sift)
 
     # affine は landmark/sift 候補が弱いときだけ追加（wild affine を避ける）
     if method == "affine":
-        for init in sift_inits:
-            sift_a = _sift_ransac_forward(
-                ref_c, mov_c,
-                model="affine",
-                initial=init,
-            )
+        for i, init in enumerate(sift_inits):
+            with _perf("sift_affine", f"init {i + 1}/{len(sift_inits)}"):
+                sift_a = _sift_ransac_forward(
+                    ref_c, mov_c,
+                    model="affine",
+                    initial=init,
+                )
             if sift_a is not None:
                 candidates.append(sift_a)
 
@@ -705,26 +736,29 @@ def _image_registration_candidates(
     if not ecc_inits:
         ecc_inits = [None]
 
-    for init in ecc_inits:
-        ecc = _ecc_refine_forward(
-            ref_img, moving_img, motion, initial=init,
-        )
+    for i, init in enumerate(ecc_inits):
+        with _perf("ecc_refine", f"init {i + 1}/{len(ecc_inits)}"):
+            ecc = _ecc_refine_forward(
+                ref_img, moving_img, motion, initial=init,
+            )
         if ecc is not None:
             candidates.append(ecc)
 
-    inv_map = _ecc_inverse_map(ref_img, moving_img, motion)
+    with _perf("ecc_pyramid"):
+        inv_map = _ecc_inverse_map(ref_img, moving_img, motion)
     candidates.append(_invert_affine(inv_map))
 
-    return _pick_best_matrix(
-        ref_c, mov_c, candidates,
-        moving_fovea=moving_fovea,
-        ref_fovea=ref_fovea,
-        moving_disc=moving_disc,
-        ref_disc=ref_disc,
-        have_pair=have_pair,
-        zoom_scale=zoom_scale,
-        zoom_mae=zoom_mae,
-    )
+    with _perf("pick_best", f"{len(candidates)} candidates"):
+        return _pick_best_matrix(
+            ref_c, mov_c, candidates,
+            moving_fovea=moving_fovea,
+            ref_fovea=ref_fovea,
+            moving_disc=moving_disc,
+            ref_disc=ref_disc,
+            have_pair=have_pair,
+            zoom_scale=zoom_scale,
+            zoom_mae=zoom_mae,
+        )
 
 
 def build_gaussian_pyramid(img: np.ndarray, min_size: int = 64) -> list[np.ndarray]:
@@ -882,22 +916,24 @@ def compute_forward_matrix(
         return np.eye(2, 3, dtype=np.float32)
 
     if method in ("landmark", "sift", "affine", "rigid", "translation"):
-        best = _image_registration_candidates(
-            ref_img, moving_img,
-            method=method,
-            initial=initial,
-            moving_fovea=moving_fovea,
-            ref_fovea=ref_fovea,
-            moving_disc=moving_disc,
-            ref_disc=ref_disc,
-            have_pair=have_pair,
-        )
+        with _perf("compute_forward_matrix TOTAL", f"method={method}"):
+            best = _image_registration_candidates(
+                ref_img, moving_img,
+                method=method,
+                initial=initial,
+                moving_fovea=moving_fovea,
+                ref_fovea=ref_fovea,
+                moving_disc=moving_disc,
+                ref_disc=ref_disc,
+                have_pair=have_pair,
+            )
         if anchor_fovea and method != "sift" and not have_pair:
             best = _anchor_fovea(best, moving_fovea, ref_fovea)
         return best
 
     motion_type = _MOTION_TYPES.get(method, cv2.MOTION_AFFINE)
-    inv_map = _ecc_inverse_map(ref_img, moving_img, motion_type)
+    with _perf("compute_forward_matrix TOTAL", f"method={method} (ecc only)"):
+        inv_map = _ecc_inverse_map(ref_img, moving_img, motion_type)
     forward = _invert_affine(inv_map)
 
     if anchor_fovea and moving_fovea is not None and ref_fovea is not None:
