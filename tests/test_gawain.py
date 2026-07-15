@@ -61,3 +61,47 @@ def test_ga_stats_includes_gawain():
     mask = np.zeros((100, 100), dtype=np.uint8)
     result = ga_stats(mask, scale_um_px=5.0, fovea_xy=(50, 50))
     assert result['gawain'] == pytest.approx(100.0, abs=0.05)
+
+
+def _compute_gawain_reference(mask, fovea_xy, scale_um_px):
+    """ベクトル化前の素朴な実装（環ごとに全画面マスク）— 等価性検証用。"""
+    h, w = mask.shape
+    fx, fy = fovea_xy
+    yy, xx = np.ogrid[:h, :w]
+    dist_mm = np.sqrt((xx - fx) ** 2 + (yy - fy) ** 2) * scale_um_px / 1000.0
+    ga = (mask > 0).astype(np.float32)
+    macula = dist_mm <= 3.0
+    total = 0.0
+    for spec in load_annulus_weights():
+        ring = macula & (dist_mm >= spec['inner_mm']) & (dist_mm < spec['outer_mm'])
+        n_ring = int(ring.sum())
+        ga_fraction = float(ga[ring].mean()) if n_ring else 0.0
+        total += 100.0 * (1.0 - ga_fraction) * spec['area_mm2'] * spec['weight'] / 100.0
+    return round(total, 2)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3])
+def test_gawain_vectorized_matches_reference(seed):
+    rng = np.random.default_rng(seed)
+    size = 300
+    scale = float(rng.uniform(8.0, 20.0))
+    fovea = (
+        float(rng.uniform(size * 0.2, size * 0.8)),
+        float(rng.uniform(size * 0.2, size * 0.8)),
+    )
+    mask = (rng.random((size, size)) < 0.3).astype(np.uint8) * 255
+    got = compute_gawain(mask, fovea, scale)['gawain']
+    want = _compute_gawain_reference(mask, fovea, scale)
+    assert got == pytest.approx(want, abs=0.01)
+
+
+def test_gawain_vectorized_matches_reference_fovea_near_edge():
+    """黄斑が画像端で切れるケースでも旧実装と一致する。"""
+    size = 200
+    scale = 25.0  # 半径3mm = 120px、fovea を端に置くと大きくはみ出す
+    mask = np.zeros((size, size), np.uint8)
+    mask[:, :60] = 255
+    for fovea in [(5.0, 5.0), (0.0, 100.0), (199.0, 199.0), (100.0, -10.0)]:
+        got = compute_gawain(mask, fovea, scale)['gawain']
+        want = _compute_gawain_reference(mask, fovea, scale)
+        assert got == pytest.approx(want, abs=0.01), fovea

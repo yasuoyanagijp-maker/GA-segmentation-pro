@@ -337,7 +337,15 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     registration_sw = ft.Switch(
         label="位置合わせ (Registration)",
         value=state.series_registration_enabled,
-        tooltip="OFF: 各画像の座標のまま時系列・グラフ表示。ON: 位置合わせを実行",
+        tooltip="ON（既定）: ④で位置合わせを実行し確認モードへ。OFF: 各画像の座標のまま時系列・グラフ表示",
+    )
+    roi_correction_sw = ft.Switch(
+        label="マスクQC補正",
+        value=state.series_roi_enabled,
+        tooltip=(
+            "ON（既定）: 位置合わせ確認後、面積が時系列で異常な時点のマスクを"
+            "QC補正（band/chan_vese/grabcut）し統計を再計算。OFF: 補正前マスクに戻す"
+        ),
     )
     reg_apply_btn = btn_toolbar("位置合わせを実行", on_click=lambda _: None)
     reg_apply_btn.visible = False
@@ -627,6 +635,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.series_roi_review_active = False
         state.series_review_idx = 0
         state.series_registered = False
+        state.series_roi_applied = False
+        state.series_roi_qc = None
         state.view_mode = "work"
         view_mode.value = "work"
         view_mode.visible = False
@@ -639,8 +649,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             _ui["roi_review_panel"].visible = False
 
     def _update_registration_controls() -> None:
-        """位置合わせトグル・実行ボタンの表示を同期。"""
+        """位置合わせ・QC補正トグル・実行ボタンの表示を同期。"""
         registration_sw.value = state.series_registration_enabled
+        roi_correction_sw.value = state.series_roi_enabled
         reg_apply_btn.visible = (
             state.series_registration_enabled
             and state.series_results is not None
@@ -770,24 +781,61 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             scale_um_px=scale,
         )
 
-    def _rebuild_series_derived() -> None:
-        """state.series_results から overlay / GIF / 進行速度を再構築する。"""
+    def _recompute_series_estimates() -> None:
+        """進行速度3種（線形回帰）を state.series_results から再計算する。"""
         results = state.series_results or []
-        overlays = [_row_overlay(row) for row in results]
-        state.series_overlays = overlays
-        state.series_gif = overlays_to_gif_bytes(overlays) if overlays else None
         state.estimated_prog = estimate_progression_rate_um_per_year(results)
         state.estimated_growth_mm2_per_year = estimate_growth_mm2_per_year(results)
         state.estimated_growth_mm_sqrt_per_year = estimate_growth_mm_sqrt_per_year(results)
         prog_field.value = str(int(state.estimated_prog)) if state.estimated_prog else ""
 
+    def _rebuild_series_derived(
+        *,
+        overlays: list[np.ndarray] | None = None,
+    ) -> None:
+        """state.series_results から overlay / 進行速度を再構築する。
+
+        overlays を渡すと再生成しない（ワーカースレッドで事前計算した結果を
+        受け取る用）。GIF はここでは作らず、GIF ビュー表示時に遅延生成する。
+        """
+        results = state.series_results or []
+        if overlays is None:
+            overlays = [_row_overlay(row) for row in results]
+        state.series_overlays = overlays
+        state.series_gif = None  # 次回 GIF ビュー表示時に再生成
+        _recompute_series_estimates()
+
+    def _series_gif_bytes() -> bytes | None:
+        """GIF ビュー用アニメGIF（表示幅で遅延生成し、キャッシュする）。
+
+        原寸ではなく表示幅（DISPLAY_WIDTH）で生成する: エンコードが
+        約9倍速く、UI へ送るペイロードも約1/7 になる。原寸が必要な
+        PDF 出力は overlay（原寸）を使うため影響しない。
+        """
+        if state.series_gif is not None:
+            return state.series_gif
+        overlays = state.series_overlays
+        if not overlays:
+            return None
+        frames = [
+            cv2.resize(
+                o,
+                (DISPLAY_WIDTH, max(1, int(o.shape[0] * DISPLAY_WIDTH / o.shape[1]))),
+                interpolation=cv2.INTER_AREA,
+            )
+            for o in overlays
+        ]
+        state.series_gif = overlays_to_gif_bytes(frames)
+        return state.series_gif
+
     def _apply_series_results(
         results: list[dict],
         *,
         landing_filename: str | None = None,
+        overlays: list[np.ndarray] | None = None,
     ) -> None:
         state.series_results = results
-        _rebuild_series_derived()
+        _rebuild_series_derived(overlays=overlays)
         series_date_dd.visible = True
         series_date_dd.options = [
             ft.dropdown.Option(
@@ -1436,9 +1484,28 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             return
         out = _ensure_output_dir()
         path = out / suggested_csv_filename()
-        path.write_bytes(build_batch_csv_bytes(state.series_results))
+        path.write_bytes(build_batch_csv_bytes(
+            state.series_results,
+            roi_qc=state.series_roi_qc,
+        ))
         status.value = f"CSV 保存: {path}"
         page.update()
+
+    def _roi_qc_note_for_row(row: dict) -> str | None:
+        """PDF 用のマスクQC補正1行サマリ（未適用時は None）。"""
+        if "roi_raw_area" not in row:
+            return None
+        method = row.get("roi_refine_method")
+        if method:
+            note = (
+                f"corrected ({method}): {row['roi_raw_area']}"
+                f" -> {row['roi_corrected_area']} px"
+            )
+        else:
+            note = "no anomaly (mask unchanged)"
+        if row.get("roi_needs_review"):
+            note += f"; needs review: {row.get('roi_reason') or ''}"
+        return note
 
     def _resolve_pdf_export_context() -> dict | None:
         """PDF 出力用の filename / stats / overlay / GAWAIN 生成コンテキスト。"""
@@ -1447,6 +1514,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             overlay = state.series_overlays[state.series_time_idx]
             snap = state.per_file_results.get(row["filename"], row)
             return {
+                "roi_qc_note": _roi_qc_note_for_row(row),
                 "filename": row["filename"],
                 "date": row["date"],
                 "stats": row["stats"],
@@ -1531,6 +1599,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                     foveal_correction_applied=ctx.get("foveal_correction_applied"),
                     foveal_correction_skipped=ctx.get("foveal_correction_skipped"),
                     foveal_correction_strength=ctx.get("foveal_correction_strength"),
+                    roi_qc_note=ctx.get("roi_qc_note"),
                 )
                 out = _ensure_output_dir()
                 path = out / suggested_pdf_filename(ctx["filename"])
@@ -1593,12 +1662,14 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             graph_area.visible = False
             _push_image_rgb(rgb, do_update=do_update)
             return
-        if state.view_mode == "gif" and state.series_gif:
-            gif_img.src_base64 = base64.b64encode(state.series_gif).decode("ascii")
-            img_ctrl.visible = False
-            gif_img.visible = True
-            graph_area.visible = False
-            return
+        if state.view_mode == "gif" and state.series_results:
+            gif = _series_gif_bytes()
+            if gif:
+                gif_img.src_base64 = base64.b64encode(gif).decode("ascii")
+                img_ctrl.visible = False
+                gif_img.visible = True
+                graph_area.visible = False
+                return
         if state.view_mode == "graph" and state.series_results:
             img_ctrl.visible = False
             gif_img.visible = False
@@ -1873,6 +1944,32 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                     color=T.ACCENT_AMBER,
                     size=12,
                 ))
+        if is_series and state.series_roi_applied and state.series_results:
+            corrected = [
+                r for r in state.series_results if r.get("roi_refine_method")
+            ]
+            if corrected:
+                labels = ", ".join(
+                    f"{_format_series_datetime_label(r['date'])}"
+                    f" ({r['roi_refine_method']})"
+                    for r in corrected
+                )
+                results_col.controls.append(ft.Text(
+                    _safe_text(f"マスクQC補正済み: {labels}"),
+                    color=T.ACCENT_CYAN,
+                    size=11,
+                ))
+            for r in state.series_results:
+                if r.get("roi_needs_review"):
+                    reason = r.get("roi_reason") or "面積異常"
+                    results_col.controls.append(ft.Text(
+                        _safe_text(
+                            f"⚠ QC要確認 "
+                            f"{_format_series_datetime_label(r['date'])}: {reason}"
+                        ),
+                        color=T.ACCENT_AMBER,
+                        size=12,
+                    ))
         if cross is not None:
             if cross < life_y:
                 results_col.controls.append(ft.Text(
@@ -3112,7 +3209,16 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             else:
                 results[idx] = updated
                 state.series_methods[updated["filename"]] = method
-                _rebuild_series_derived()
+                # 変わったのは 1 時点だけなので、その行の overlay だけ差し替える
+                if (
+                    state.series_overlays is not None
+                    and idx < len(state.series_overlays)
+                ):
+                    state.series_overlays[idx] = _row_overlay(updated)
+                    state.series_gif = None
+                    _recompute_series_estimates()
+                else:
+                    _rebuild_series_derived()
                 _refresh_review_panel()
                 refresh_image()
                 refresh_results()
@@ -3152,6 +3258,59 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         refresh_image()
         refresh_results()
         page.update()
+
+    def _revert_series_roi_correction() -> None:
+        """QC補正を解除し、各時点を補正前マスク（mask_pre_roi）に戻す。"""
+        results = state.series_results
+        if not results or not state.series_roi_applied:
+            return
+        from engine.timeseries import _compute_row_stats
+        for row in results:
+            pre = row.pop("mask_pre_roi", None)
+            if pre is not None:
+                row["mask"] = pre
+                row["stats"] = _compute_row_stats(
+                    pre,
+                    row.get("scale_um_px"),
+                    row.get("fovea_xy"),
+                    row.get("stats") or {},
+                )
+            for key in (
+                "roi_needs_review", "roi_reason", "roi_ok",
+                "roi_raw_area", "roi_corrected_area", "roi_refine_method",
+            ):
+                row.pop(key, None)
+        state.series_roi_applied = False
+        state.series_roi_qc = None
+        _rebuild_series_derived()
+        if state.series_roi_review_active:
+            # 確認モード中に解除された場合は結果表示へ戻す
+            _finish_to_series_results_view()
+        _set_status("マスクQC補正を解除しました（補正前マスクに戻しました）")
+        refresh_image()
+        refresh_results()
+
+    def on_roi_correction_toggle(e: ft.ControlEvent) -> None:
+        state.series_roi_enabled = bool(e.control.value)
+        if not state.series_roi_enabled:
+            if state.series_roi_applied:
+                _revert_series_roi_correction()
+            page.update()
+            return
+        if (
+            state.series_results
+            and state.series_registered
+            and not state.series_roi_applied
+        ):
+            _run_roi_correction_after_registration()
+        elif state.series_results and not state.series_registered:
+            _set_status(
+                "マスクQC補正は位置合わせ済みの時系列に適用されます"
+                "（位置合わせ確認完了後に自動適用）"
+            )
+        page.update()
+
+    roi_correction_sw.on_change = on_roi_correction_toggle
 
     def _all_roi_ok() -> bool:
         results = state.series_results or []
@@ -3275,11 +3434,23 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         _finish_to_series_results_view()
 
     def _run_roi_correction_after_registration() -> None:
-        """位置合わせ確定後: 整列済みマスクに対しROI補正→要レビューなら確認UI。"""
+        """位置合わせ確定後: 整列済みマスクに対しROI補正→要レビューなら確認UI。
+
+        「マスクQC補正」トグル OFF の場合は補正せず結果表示へ直行する。
+        補正前マスクは各行の mask_pre_roi に保持され、トグル OFF で
+        _revert_series_roi_correction により補正前へ戻せる。
+        QCログ（SOP 11章相当）は series_roi_qc に保持し CSV へ出力する。
+        """
         if registration_guard["running"] or series_guard.get("roi_running"):
             return
         results = state.series_results
         if not results:
+            return
+        if not state.series_roi_enabled:
+            _finish_to_series_results_view()
+            return
+        if state.series_roi_applied:
+            _finish_to_series_results_view()
             return
 
         async def _roi_task() -> None:
@@ -3289,12 +3460,22 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             try:
                 out = await asyncio.to_thread(apply_roi_correction_to_series, results)
             except Exception as exc:
+                _log.exception("ROI correction failed")
                 _set_status(f"ROI補正エラー: {exc}")
                 _finish_to_series_results_view()
             else:
+                if state.series_results is not results:
+                    # 適用中に時系列が破棄/再構築された — 結果は捨てる
+                    return
+                overlays = await asyncio.to_thread(
+                    lambda: [_row_overlay(r) for r in out["results"]],
+                )
                 state.series_results = out["results"]
-                _rebuild_series_derived()
+                state.series_roi_applied = True
+                state.series_roi_qc = out["qc_log"]
+                _rebuild_series_derived(overlays=overlays)
                 needs = out["needs_review_indices"]
+                n_corr = sum(1 for m in out["refine_methods"] if m)
                 if needs:
                     state.series_review_idx = needs[0]
                     _enter_roi_review()
@@ -3304,10 +3485,16 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                     ))
                 else:
                     _finish_to_series_results_view()
-                    _set_status(_safe_text(
-                        f"時系列表示 ({len(out['results'])} 時点) "
-                        "— ROI補正: 要レビューなし"
-                    ))
+                    if n_corr:
+                        _set_status(_safe_text(
+                            f"時系列表示 ({len(out['results'])} 時点) "
+                            f"— マスクQC補正 {n_corr} 時点（要レビューなし）"
+                        ))
+                    else:
+                        _set_status(_safe_text(
+                            f"時系列表示 ({len(out['results'])} 時点) "
+                            "— マスクQC補正: 異常なし（マスク変更なし）"
+                        ))
             finally:
                 series_guard["roi_running"] = False
                 page.update()
@@ -3344,12 +3531,23 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     def _run_registration_on_series(
         *,
         landing_filename: str | None = None,
+        launch_guard_gen: int | None = None,
     ) -> None:
-        """選択済み時系列に位置合わせを適用し、確認モードへ入る（非同期）。"""
+        """選択済み時系列に位置合わせを適用し、確認モードへ入る（非同期）。
+
+        launch_guard_gen: ④ からの直行パス（案1）で引き継いだ series 起動
+        ガード。登録完了（またはエラー）時にこの関数側で解除する。
+        """
+        def _finish_launch_guard() -> None:
+            if launch_guard_gen is not None:
+                _end_series_launch_guard(launch_guard_gen)
+
         if registration_guard["running"]:
+            _finish_launch_guard()
             return
         selected = _selected_count()
         if selected < 2:
+            _finish_launch_guard()
             _set_status(f"位置合わせには対象2枚以上が必要です (現在 選択 {selected} 枚)")
             page.update()
             return
@@ -3393,9 +3591,16 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             except Exception as exc:
                 _set_status(f"位置合わせエラー: {exc}")
             else:
-                _apply_series_results(results, landing_filename=prefer)
+                # overlay 生成（数百ms〜）はイベントループを塞がないよう別スレッドで
+                overlays = await asyncio.to_thread(
+                    lambda: [_row_overlay(row) for row in results],
+                )
+                _apply_series_results(
+                    results, landing_filename=prefer, overlays=overlays,
+                )
                 if prior_matrices and cache_confirmed:
                     # 再解析後の再利用: 位置合わせ確認を飛ばし ROI 補正へ
+                    # （トグル OFF 時は _run_... 側で結果表示に直行する）
                     state.series_review_active = False
                     state.series_registered = True
                     _stash_reg_cache_from_series()
@@ -3416,7 +3621,10 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                         " — 各時点で OK / やり直しを選択してください"
                     ))
                     _enter_registration_review()
+                _update_batch_ui(refresh_dropdown=False)
+                _refresh_file_dropdown_labels()
             finally:
+                _finish_launch_guard()
                 _set_registration_busy(False)
                 page.update()
 
@@ -3450,7 +3658,13 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         auto: bool = False,
         landing_filename: str | None = None,
     ) -> None:
-        """確定済み結果から時系列を構築。既定は位置合わせなしでグラフ表示（非同期）。"""
+        """確定済み結果から時系列を構築（非同期）。
+
+        位置合わせトグル ON（既定）: 中間ビルドを作らず直接 register=True で
+        1回だけ構築し、確認モード（または行列再利用時は結果表示）へ進む。
+        確認完了後、マスクQC補正トグル ON（既定）なら QC 補正を自動適用。
+        トグル OFF: register=False で構築しグラフ表示。
+        """
         if registration_guard["running"] or series_guard["launching"]:
             return
         selected = _selected_count()
@@ -3473,6 +3687,16 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         series_methods = state.series_methods
 
         async def _series_task() -> None:
+            if state.series_registration_enabled:
+                # 位置合わせ ON: register=False の中間ビルド（すぐ捨てられる）
+                # を作らず、直接 register=True で1回だけ構築する。
+                # 起動ガードは登録タスク側で解除する。
+                state.disc_diameter_um = float(disc_field.value or 1800)
+                _run_registration_on_series(
+                    landing_filename=prefer,
+                    launch_guard_gen=dd_gen,
+                )
+                return
             try:
                 results = await asyncio.to_thread(
                     build_series_from_saved,
@@ -3494,7 +3718,13 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 page.update()
                 return
             state.disc_diameter_um = float(disc_field.value or 1800)
-            _apply_series_results(results, landing_filename=prefer)
+            # overlay 生成（数百ms〜）はイベントループを塞がないよう別スレッドで
+            overlays = await asyncio.to_thread(
+                lambda: [_row_overlay(row) for row in results],
+            )
+            _apply_series_results(
+                results, landing_filename=prefer, overlays=overlays,
+            )
             _show_series_results_view(n=len(results), selected=selected)
             _update_batch_ui(refresh_dropdown=False)
             _refresh_file_dropdown_labels()
@@ -3580,6 +3810,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     series_launch_row = ft.Column(
         [
             registration_sw,
+            roi_correction_sw,
             ft.Row([series_launch_btn], spacing=8),
             reg_apply_btn,
         ],

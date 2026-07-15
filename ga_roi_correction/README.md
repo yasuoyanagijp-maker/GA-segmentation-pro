@@ -13,6 +13,17 @@ Diceが 0.31→0.90 / 0.46→0.97 / 0.47→0.97 まで回復することを合�
 単調性制約(下記 1b)で Dice 0.09→0.94 まで回復することを確認済みです
 (`demo_position_shift.py` で再現可能)。
 
+> **GA Segmentation Pro アプリからの利用について**
+> アプリ（④ 時系列の「マスクQC補正」）は、自前の位置合わせ
+> （`engine/series_registration.py`）で整列済みの系列に対して
+> `aligned_correct.correct_aligned_series` を
+> `engine/series_roi_correction.py` 経由で呼び出します。そのため
+> 本パッケージ内の `registration.py`（ECC位置合わせ）と
+> `pipeline.correct_ga_series`（位置合わせ込みのフルパイプライン）は
+> **アプリからは使用されません**（スタンドアロン利用・`demo_synthetic.py` /
+> `demo_position_shift.py` 用として維持）。QCログ（SOP 11章相当）は
+> アプリの CSV エクスポートに「ROI QC correction log」として出力されます。
+
 ## 1. 構成
 
 ```

@@ -167,6 +167,30 @@ def test_series_ready_at_two_confirmed_not_all():
     assert series_ready is True
 
 
+def test_registration_and_roi_defaults_on():
+    """④ の既定動作: 位置合わせ ON・マスクQC補正 ON（リセット後も維持）。"""
+    state = GAAppState()
+    assert state.series_registration_enabled is True
+    assert state.series_roi_enabled is True
+    assert state.series_roi_applied is False
+
+    # フルリセット後も既定は ON に戻る
+    state.series_registration_enabled = False
+    state.series_roi_enabled = False
+    state.series_roi_applied = True
+    state.reset_analysis()
+    assert state.series_registration_enabled is True
+    assert state.series_roi_enabled is True
+    assert state.series_roi_applied is False
+
+    # keep_series=True では時系列設定は温存される
+    state.series_registration_enabled = False
+    state.series_roi_enabled = False
+    state.reset_analysis(keep_series=True)
+    assert state.series_registration_enabled is False
+    assert state.series_roi_enabled is False
+
+
 def test_scale_recal_keeps_other_confirmed_results():
     """2枚目で乳頭/幅指定しても1枚目の確定は消えない（チェック保持）。"""
     state = GAAppState()

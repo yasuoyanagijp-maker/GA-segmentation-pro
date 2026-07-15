@@ -26,11 +26,38 @@ from __future__ import annotations
 
 import logging
 import math
+import time
+from contextlib import contextmanager
 
 import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# ステージ別の実行時間ログ（ボトルネック調査用）。
+# flet_ui の "ga.batch" と同様に、アプリ側で logging 未設定でも
+# コンソールに出るよう専用ハンドラを付ける。
+perf_logger = logging.getLogger("ga.reg.timing")
+if not perf_logger.handlers:
+    _perf_handler = logging.StreamHandler()
+    _perf_handler.setFormatter(logging.Formatter("[reg-timing] %(message)s"))
+    perf_logger.addHandler(_perf_handler)
+    perf_logger.setLevel(logging.INFO)
+    perf_logger.propagate = False
+
+
+@contextmanager
+def _perf(stage: str, detail: str = ""):
+    """ステージ実行時間を INFO で記録するコンテキストマネージャ。"""
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        ms = (time.perf_counter() - t0) * 1000.0
+        if detail:
+            perf_logger.info("%s (%s): %.0f ms", stage, detail, ms)
+        else:
+            perf_logger.info("%s: %.0f ms", stage, ms)
 
 # UI 表示用（キー: 内部名, 値: 日本語ラベル）
 REGISTRATION_METHODS: dict[str, str] = {
@@ -65,6 +92,8 @@ _SCALE_PENALTY_WEIGHT = 18.0
 # 候補の MAE が zoom より明らかに良いときはスケール罰則を免除（SIFT/ECC が勝てるように）
 _SCALE_PENALTY_MAE_WAIVE = 0.0
 _AFFINE_DEVIATION_WEIGHT = 35.0
+# 二段 ECC の縮小段の長辺（原寸段の初期値づくり）
+_ECC_COARSE_MAX_SIDE = 768
 
 
 def _to_gray_uint8(img: np.ndarray) -> np.ndarray:
@@ -112,6 +141,101 @@ def _prepare_registration_pair(
     return ref_g[:h, :w], mov_g[:h, :w]
 
 
+class _PairContext:
+    """1ペアの登録処理内で共有する前処理・マスク・縮小版のキャッシュ。
+
+    同じ ref/mov クロップに対する CLAHE＋血管強調・特徴マスク・縮小版・
+    SIFT 特徴量（ref 側）は候補生成の各段で完全に同一なので、1回だけ
+    計算して使い回す。計算内容は従来のその場計算と同一（結果は不変）。
+    """
+
+    def __init__(self, ref_crop: np.ndarray, mov_crop: np.ndarray):
+        self.ref_crop = ref_crop
+        self.mov_crop = mov_crop
+        self.ref_pp = _preprocess_for_registration(ref_crop)
+        self.mov_pp = _preprocess_for_registration(mov_crop)
+        self.ref_pp_f32 = self.ref_pp.astype(np.float32)
+        self.mov_pp_f32 = self.mov_pp.astype(np.float32)
+        # グレークロップ由来（MAE / ECC / 位相相関 / zoom sweep 用）
+        self.mask_crop = _feature_detection_mask(ref_crop)
+        # 前処理画像由来（SIFT 用 — 従来どおり ref_pp から計算）
+        self.mask_pp = _feature_detection_mask(self.ref_pp)
+        # zoom sweep / 縮小 MAE 共通の縮小ペア（max_side=320）
+        self.ref_s, self.mov_s, self.mask_s, self.factor = _downscale_pair(
+            self.ref_pp_f32, self.mov_pp_f32, self.mask_crop,
+        )
+        self._sift = None
+        self._ref_features: tuple | None = None
+        self._matched_points: dict[bytes, tuple[np.ndarray, np.ndarray] | None] = {}
+
+    @property
+    def sift(self) -> cv2.SIFT:
+        if self._sift is None:
+            self._sift = cv2.SIFT_create(
+                nfeatures=_SIFT_NFEATURES,
+                contrastThreshold=0.04,
+                edgeThreshold=15,
+            )
+        return self._sift
+
+    def ref_features(self) -> tuple:
+        """ref 側 SIFT keypoints/descriptors（初期値によらず不変なので1回だけ）。"""
+        if self._ref_features is None:
+            self._ref_features = self.sift.detectAndCompute(
+                self.ref_pp, self.mask_pp,
+            )
+        return self._ref_features
+
+    def matched_points(
+        self, initial: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """初期値ごとの SIFT 対応点 (pts_mov, pts_ref)。
+
+        対応点はモデル（similarity / affine）に依存しないため、同じ初期値で
+        両モデルを推定するときの検出・マッチング重複を除く。
+        不足時（特徴点 <4 または good マッチ < _SIFT_MIN_MATCHES）は None。
+        """
+        key = b"none" if initial is None else (
+            np.asarray(initial, np.float32).tobytes()
+        )
+        if key not in self._matched_points:
+            self._matched_points[key] = self._compute_matched_points(initial)
+        return self._matched_points[key]
+
+    def _compute_matched_points(
+        self, initial: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        kp_ref, desc_ref = self.ref_features()
+        mov_pp = self.mov_pp
+        if initial is not None:
+            h, w = self.ref_pp.shape[:2]
+            mov_pp = cv2.warpAffine(mov_pp, initial, (w, h))
+        kp_mov, desc_mov = self.sift.detectAndCompute(mov_pp, self.mask_pp)
+        if (
+            desc_ref is None or desc_mov is None
+            or len(kp_ref) < 4 or len(kp_mov) < 4
+        ):
+            return None
+        matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+        knn = matcher.knnMatch(desc_mov, desc_ref, k=2)
+        good = []
+        for pair in knn:
+            if len(pair) < 2:
+                continue
+            best, second = pair
+            if best.distance < _SIFT_RATIO * second.distance:
+                good.append(best)
+        if len(good) < _SIFT_MIN_MATCHES:
+            return None
+        pts_mov = np.float32(
+            [kp_mov[m.queryIdx].pt for m in good],
+        ).reshape(-1, 1, 2)
+        pts_ref = np.float32(
+            [kp_ref[m.trainIdx].pt for m in good],
+        ).reshape(-1, 1, 2)
+        return pts_mov, pts_ref
+
+
 def _similarity_about_center(
     scale: float,
     angle_deg: float,
@@ -150,13 +274,12 @@ def _alignment_mae_downscaled(
     mov_crop: np.ndarray,
     matrix: np.ndarray,
     *,
-    max_side: int = 320,
+    ctx: "_PairContext | None" = None,
 ) -> float:
-    """スイープ用: 縮小画像で MAE を計算（zoom 候補の選別向け）。"""
-    ref_pp = _preprocess_for_registration(ref_crop).astype(np.float32)
-    mov_pp = _preprocess_for_registration(mov_crop).astype(np.float32)
-    mask = _feature_detection_mask(ref_crop)
-    ref_s, mov_s, mask_s, factor = _downscale_pair(ref_pp, mov_pp, mask, max_side=max_side)
+    """スイープ用: 縮小画像で MAE を計算（zoom 候補の選別向け、max_side=320）。"""
+    if ctx is None:
+        ctx = _PairContext(ref_crop, mov_crop)
+    ref_s, mov_s, mask_s, factor = ctx.ref_s, ctx.mov_s, ctx.mask_s, ctx.factor
     if factor < 0.999:
         mat = matrix.copy().astype(np.float64)
         mat[0, 2] *= factor
@@ -195,6 +318,8 @@ def _downscale_pair(
 def _zoom_scale_sweep_initial(
     ref_crop: np.ndarray,
     mov_crop: np.ndarray,
+    *,
+    ctx: "_PairContext | None" = None,
 ) -> np.ndarray | None:
     """ズーム差向け: スケール×回転スイープ＋位相相関で相似変換の初期推定。
 
@@ -202,14 +327,16 @@ def _zoom_scale_sweep_initial(
     位相相関の response だけでは誤ったスケールを選ぶことがあるため、
     候補ごとに縮小 MAE でも評価し、大ズレ時は回転探索幅を広げる。
     """
-    ref_pp = _preprocess_for_registration(ref_crop).astype(np.float32)
-    mov_pp = _preprocess_for_registration(mov_crop).astype(np.float32)
-    mask_full = _feature_detection_mask(ref_crop)
+    if ctx is None:
+        ctx = _PairContext(ref_crop, mov_crop)
+    ref_pp = ctx.ref_pp_f32
+    mov_pp = ctx.mov_pp_f32
+    mask_full = ctx.mask_crop
     window_full = mask_full.astype(np.float64) / 255.0
     if float(window_full.sum()) < 100.0:
         return None
 
-    ref_s, mov_s, mask_s, factor = _downscale_pair(ref_pp, mov_pp, mask_full)
+    ref_s, mov_s, mask_s, factor = ctx.ref_s, ctx.mov_s, ctx.mask_s, ctx.factor
     window = mask_s.astype(np.float64) / 255.0
     hs, ws = ref_s.shape[:2]
     center_s = (ws * 0.5, hs * 0.5)
@@ -228,7 +355,7 @@ def _zoom_scale_sweep_initial(
             scale, angle, center,
             dx_s * inv_f, dy_s * inv_f,
         )
-        mae = _alignment_mae_downscaled(ref_crop, mov_crop, cand)
+        mae = _alignment_mae_downscaled(ref_crop, mov_crop, cand, ctx=ctx)
         # response は補助: MAE が同等なら位相相関が高い方を優先
         score = mae - 2.0 * min(resp, 0.35)
         return score, cand
@@ -350,47 +477,21 @@ def _sift_ransac_forward(
     *,
     model: str = "similarity",
     initial: np.ndarray | None = None,
+    ctx: "_PairContext | None" = None,
 ) -> np.ndarray | None:
     """SIFT + Lowe ratio test + RANSAC で moving→ref の順方向 2x3 行列を返す。
 
     model: "similarity"（estimateAffinePartial2D）または "affine"。
     initial があれば moving を事前整列してから SIFT し、結果と合成する。
+    ctx があれば ref 側特徴量と初期値ごとの対応点を使い回す。
     失敗時は None。
     """
-    ref_pp = _preprocess_for_registration(ref_img)
-    mov_pp = _preprocess_for_registration(moving_img)
-    feat_mask = _feature_detection_mask(ref_pp)
-    if initial is not None:
-        h, w = ref_pp.shape[:2]
-        mov_pp = cv2.warpAffine(mov_pp, initial, (w, h))
-
-    sift = cv2.SIFT_create(
-        nfeatures=_SIFT_NFEATURES,
-        contrastThreshold=0.04,
-        edgeThreshold=15,
-    )
-    kp_ref, desc_ref = sift.detectAndCompute(ref_pp, feat_mask)
-    kp_mov, desc_mov = sift.detectAndCompute(mov_pp, feat_mask)
-    if (
-        desc_ref is None or desc_mov is None
-        or len(kp_ref) < 4 or len(kp_mov) < 4
-    ):
+    if ctx is None:
+        ctx = _PairContext(ref_img, moving_img)
+    matched = ctx.matched_points(initial)
+    if matched is None:
         return None
-
-    matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
-    knn = matcher.knnMatch(desc_mov, desc_ref, k=2)
-    good = []
-    for pair in knn:
-        if len(pair) < 2:
-            continue
-        best, second = pair
-        if best.distance < _SIFT_RATIO * second.distance:
-            good.append(best)
-    if len(good) < _SIFT_MIN_MATCHES:
-        return None
-
-    pts_mov = np.float32([kp_mov[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-    pts_ref = np.float32([kp_ref[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    pts_mov, pts_ref = matched
 
     kwargs = dict(
         method=cv2.RANSAC,
@@ -428,30 +529,81 @@ def _landmark_initial_matrix(
     )
 
 
+def _rescale_ecc_warp(warp: np.ndarray, factor: float) -> np.ndarray:
+    """縮小画像座標系の ECC warp を原寸座標系へ変換（平行移動を 1/factor 倍）。"""
+    s = np.array(
+        [[factor, 0.0, 0.0], [0.0, factor, 0.0], [0.0, 0.0, 1.0]], np.float64,
+    )
+    s_inv = np.array(
+        [[1.0 / factor, 0.0, 0.0], [0.0, 1.0 / factor, 0.0], [0.0, 0.0, 1.0]],
+        np.float64,
+    )
+    m = np.vstack([warp.astype(np.float64), [0.0, 0.0, 1.0]])
+    return (s_inv @ m @ s)[:2, :].astype(np.float32)
+
+
 def _ecc_refine_forward(
     ref_img: np.ndarray,
     moving_img: np.ndarray,
     motion_type: int,
     *,
     initial: np.ndarray | None = None,
+    ctx: "_PairContext | None" = None,
 ) -> np.ndarray | None:
-    """SIFT 失敗時: マスク付き ECC で moving→ref の順方向行列を返す。"""
-    ref_crop, mov_crop = _prepare_registration_pair(ref_img, moving_img)
-    ref_pp = _preprocess_for_registration(ref_crop).astype(np.float32)
-    mov_pp = _preprocess_for_registration(mov_crop).astype(np.float32)
-    mask = _feature_detection_mask(ref_crop)
+    """SIFT 失敗時: マスク付き ECC で moving→ref の順方向行列を返す。
+
+    coarse-to-fine の二段構成:
+    1. 縮小画像（長辺 _ECC_COARSE_MAX_SIDE）で収束させ、
+    2. その結果を初期値に原寸で仕上げる（eps 収束なので数反復で停止）。
+    原寸のみの一発 ECC と同じ criteria（反復上限・eps）を使い、
+    縮小段や初期値付き原寸段が失敗した場合は従来どおり
+    原寸・単位行列初期値へフォールバックする。
+    """
+    if ctx is None:
+        ref_crop, mov_crop = _prepare_registration_pair(ref_img, moving_img)
+        ctx = _PairContext(ref_crop, mov_crop)
+    ref_pp = ctx.ref_pp_f32
+    mov_pp = ctx.mov_pp_f32
+    mask = ctx.mask_crop
     if initial is not None:
         mov_pp = cv2.warpAffine(mov_pp, initial, (ref_pp.shape[1], ref_pp.shape[0]))
 
-    inv_map = np.eye(2, 3, dtype=np.float32)
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-5)
-    try:
-        _, inv_map = cv2.findTransformECC(
-            ref_pp, mov_pp, inv_map, motion_type, criteria,
-            inputMask=mask,
-        )
-    except cv2.error:
-        return initial
+
+    init_full: np.ndarray | None = None
+    ref_c, mov_c, mask_c, factor = _downscale_pair(
+        ref_pp, mov_pp, mask, max_side=_ECC_COARSE_MAX_SIDE,
+    )
+    if factor < 0.999:
+        warp_c = np.eye(2, 3, dtype=np.float32)
+        try:
+            _, warp_c = cv2.findTransformECC(
+                ref_c, mov_c, warp_c, motion_type, criteria,
+                inputMask=mask_c,
+            )
+            init_full = _rescale_ecc_warp(warp_c, factor)
+        except cv2.error:
+            init_full = None
+
+    inv_map: np.ndarray | None = None
+    if init_full is not None:
+        try:
+            _, inv_map = cv2.findTransformECC(
+                ref_pp, mov_pp, init_full.copy(), motion_type, criteria,
+                inputMask=mask,
+            )
+        except cv2.error:
+            inv_map = None
+    if inv_map is None:
+        # 従来どおりの原寸・単位行列初期値へフォールバック
+        try:
+            _, inv_map = cv2.findTransformECC(
+                ref_pp, mov_pp, np.eye(2, 3, dtype=np.float32),
+                motion_type, criteria,
+                inputMask=mask,
+            )
+        except cv2.error:
+            return initial
     forward = _invert_affine(inv_map)
     if initial is not None:
         return _compose_forward(forward, initial)
@@ -475,11 +627,15 @@ def _anchor_fovea(
 def _phase_translation_initial(
     ref_crop: np.ndarray,
     mov_crop: np.ndarray,
+    *,
+    ctx: "_PairContext | None" = None,
 ) -> np.ndarray | None:
     """位相相関で平行移動の初期推定（小ズレ向け）。"""
-    ref_pp = _preprocess_for_registration(ref_crop)
-    mov_pp = _preprocess_for_registration(mov_crop)
-    window = _feature_detection_mask(ref_crop).astype(np.float64) / 255.0
+    if ctx is None:
+        ctx = _PairContext(ref_crop, mov_crop)
+    ref_pp = ctx.ref_pp
+    mov_pp = ctx.mov_pp
+    window = ctx.mask_crop.astype(np.float64) / 255.0
     if float(window.sum()) < 100.0:
         return None
     try:
@@ -499,14 +655,18 @@ def _alignment_mae(
     ref_crop: np.ndarray,
     mov_crop: np.ndarray,
     matrix: np.ndarray,
+    *,
+    ctx: "_PairContext | None" = None,
 ) -> float:
     """マスク領域の平均絶対差（小さいほど整列が良い）。"""
-    ref_pp = _preprocess_for_registration(ref_crop).astype(np.float32)
-    mov_pp = _preprocess_for_registration(mov_crop).astype(np.float32)
+    if ctx is None:
+        ctx = _PairContext(ref_crop, mov_crop)
+    ref_pp = ctx.ref_pp_f32
+    mov_pp = ctx.mov_pp_f32
     aligned = cv2.warpAffine(
         mov_pp, matrix, (ref_pp.shape[1], ref_pp.shape[0]),
     )
-    mask = _feature_detection_mask(ref_crop) > 0
+    mask = ctx.mask_crop > 0
     diff = np.abs(ref_pp - aligned)
     if mask.any():
         return float(diff[mask].mean())
@@ -543,8 +703,9 @@ def _alignment_score(
     have_pair: bool = False,
     zoom_scale: float | None = None,
     zoom_mae: float | None = None,
+    ctx: "_PairContext | None" = None,
 ) -> float:
-    mae = _alignment_mae(ref_crop, mov_crop, matrix)
+    mae = _alignment_mae(ref_crop, mov_crop, matrix, ctx=ctx)
     score = mae
     if have_pair:
         lm_err = _landmark_penalty(
@@ -584,6 +745,7 @@ def _pick_best_matrix(
     have_pair: bool = False,
     zoom_scale: float | None = None,
     zoom_mae: float | None = None,
+    ctx: "_PairContext | None" = None,
 ) -> np.ndarray:
     best = np.eye(2, 3, dtype=np.float32)
     best_score = float("inf")
@@ -604,6 +766,7 @@ def _pick_best_matrix(
             have_pair=have_pair,
             zoom_scale=zoom_scale,
             zoom_mae=zoom_mae,
+            ctx=ctx,
         )
         if score < best_score:
             best_score = score
@@ -642,16 +805,22 @@ def _image_registration_candidates(
 ) -> np.ndarray:
     """複数推定を試し、マスク領域 MAE が最小の行列を返す。"""
     ref_c, mov_c = _prepare_registration_pair(ref_img, moving_img)
+    with _perf("preprocess_cache"):
+        ctx = _PairContext(ref_c, mov_c)
 
     candidates: list[np.ndarray | None] = [np.eye(2, 3, dtype=np.float32)]
 
-    zoom = _zoom_scale_sweep_initial(ref_c, mov_c)
+    with _perf("zoom_sweep"):
+        zoom = _zoom_scale_sweep_initial(ref_c, mov_c, ctx=ctx)
     zoom_scale = _matrix_similarity_scale(zoom) if zoom is not None else None
-    zoom_mae = _alignment_mae(ref_c, mov_c, zoom) if zoom is not None else None
+    zoom_mae = (
+        _alignment_mae(ref_c, mov_c, zoom, ctx=ctx) if zoom is not None else None
+    )
     if zoom is not None:
         candidates.append(zoom)
 
-    phase = _phase_translation_initial(ref_c, mov_c)
+    with _perf("phase_translation"):
+        phase = _phase_translation_initial(ref_c, mov_c, ctx=ctx)
     if phase is not None:
         candidates.append(phase)
     if initial is not None:
@@ -678,23 +847,27 @@ def _image_registration_candidates(
     if not sift_inits:
         sift_inits = [None]
 
-    for init in sift_inits:
-        sift = _sift_ransac_forward(
-            ref_c, mov_c,
-            model="similarity",
-            initial=init,
-        )
+    for i, init in enumerate(sift_inits):
+        with _perf("sift_similarity", f"init {i + 1}/{len(sift_inits)}"):
+            sift = _sift_ransac_forward(
+                ref_c, mov_c,
+                model="similarity",
+                initial=init,
+                ctx=ctx,
+            )
         if sift is not None:
             candidates.append(sift)
 
     # affine は landmark/sift 候補が弱いときだけ追加（wild affine を避ける）
     if method == "affine":
-        for init in sift_inits:
-            sift_a = _sift_ransac_forward(
-                ref_c, mov_c,
-                model="affine",
-                initial=init,
-            )
+        for i, init in enumerate(sift_inits):
+            with _perf("sift_affine", f"init {i + 1}/{len(sift_inits)}"):
+                sift_a = _sift_ransac_forward(
+                    ref_c, mov_c,
+                    model="affine",
+                    initial=init,
+                    ctx=ctx,
+                )
             if sift_a is not None:
                 candidates.append(sift_a)
 
@@ -705,26 +878,30 @@ def _image_registration_candidates(
     if not ecc_inits:
         ecc_inits = [None]
 
-    for init in ecc_inits:
-        ecc = _ecc_refine_forward(
-            ref_img, moving_img, motion, initial=init,
-        )
+    for i, init in enumerate(ecc_inits):
+        with _perf("ecc_refine", f"init {i + 1}/{len(ecc_inits)}"):
+            ecc = _ecc_refine_forward(
+                ref_img, moving_img, motion, initial=init, ctx=ctx,
+            )
         if ecc is not None:
             candidates.append(ecc)
 
-    inv_map = _ecc_inverse_map(ref_img, moving_img, motion)
+    with _perf("ecc_pyramid"):
+        inv_map = _ecc_inverse_map(ref_img, moving_img, motion, ctx=ctx)
     candidates.append(_invert_affine(inv_map))
 
-    return _pick_best_matrix(
-        ref_c, mov_c, candidates,
-        moving_fovea=moving_fovea,
-        ref_fovea=ref_fovea,
-        moving_disc=moving_disc,
-        ref_disc=ref_disc,
-        have_pair=have_pair,
-        zoom_scale=zoom_scale,
-        zoom_mae=zoom_mae,
-    )
+    with _perf("pick_best", f"{len(candidates)} candidates"):
+        return _pick_best_matrix(
+            ref_c, mov_c, candidates,
+            moving_fovea=moving_fovea,
+            ref_fovea=ref_fovea,
+            moving_disc=moving_disc,
+            ref_disc=ref_disc,
+            have_pair=have_pair,
+            zoom_scale=zoom_scale,
+            zoom_mae=zoom_mae,
+            ctx=ctx,
+        )
 
 
 def build_gaussian_pyramid(img: np.ndarray, min_size: int = 64) -> list[np.ndarray]:
@@ -737,16 +914,24 @@ def build_gaussian_pyramid(img: np.ndarray, min_size: int = 64) -> list[np.ndarr
     return pyramid
 
 
-def _ecc_inverse_map(ref: np.ndarray, moving: np.ndarray, motion_type: int) -> np.ndarray:
+def _ecc_inverse_map(
+    ref: np.ndarray,
+    moving: np.ndarray,
+    motion_type: int,
+    *,
+    ctx: "_PairContext | None" = None,
+) -> np.ndarray:
     """多重解像度 ECC で ref(template)→moving(input) の 2x3 行列を返す。
 
     返り値は WARP_INVERSE_MAP と組み合わせて moving を ref フレームへ整列する
     向き（＝ ref 座標 → moving 座標）。
     """
-    ref_crop, mov_crop = _prepare_registration_pair(ref, moving)
-    mask = _feature_detection_mask(ref_crop)
-    ref_f = _preprocess_for_registration(ref_crop).astype(np.float32)
-    mov_f = _preprocess_for_registration(mov_crop).astype(np.float32)
+    if ctx is None:
+        ref_crop, mov_crop = _prepare_registration_pair(ref, moving)
+        ctx = _PairContext(ref_crop, mov_crop)
+    mask = ctx.mask_crop
+    ref_f = ctx.ref_pp_f32
+    mov_f = ctx.mov_pp_f32
     ref_pyr = build_gaussian_pyramid(ref_f, min_size=64)
     mov_pyr = build_gaussian_pyramid(mov_f, min_size=64)
     levels = min(len(ref_pyr), len(mov_pyr))
@@ -882,22 +1067,24 @@ def compute_forward_matrix(
         return np.eye(2, 3, dtype=np.float32)
 
     if method in ("landmark", "sift", "affine", "rigid", "translation"):
-        best = _image_registration_candidates(
-            ref_img, moving_img,
-            method=method,
-            initial=initial,
-            moving_fovea=moving_fovea,
-            ref_fovea=ref_fovea,
-            moving_disc=moving_disc,
-            ref_disc=ref_disc,
-            have_pair=have_pair,
-        )
+        with _perf("compute_forward_matrix TOTAL", f"method={method}"):
+            best = _image_registration_candidates(
+                ref_img, moving_img,
+                method=method,
+                initial=initial,
+                moving_fovea=moving_fovea,
+                ref_fovea=ref_fovea,
+                moving_disc=moving_disc,
+                ref_disc=ref_disc,
+                have_pair=have_pair,
+            )
         if anchor_fovea and method != "sift" and not have_pair:
             best = _anchor_fovea(best, moving_fovea, ref_fovea)
         return best
 
     motion_type = _MOTION_TYPES.get(method, cv2.MOTION_AFFINE)
-    inv_map = _ecc_inverse_map(ref_img, moving_img, motion_type)
+    with _perf("compute_forward_matrix TOTAL", f"method={method} (ecc only)"):
+        inv_map = _ecc_inverse_map(ref_img, moving_img, motion_type)
     forward = _invert_affine(inv_map)
 
     if anchor_fovea and moving_fovea is not None and ref_fovea is not None:

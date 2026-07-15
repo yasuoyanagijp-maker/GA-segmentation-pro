@@ -64,6 +64,9 @@ def compute_gawain(mask: np.ndarray,
                    return_annuli: bool = False) -> dict:
     """GA二値マスクと中心窩位置から GAWAIN 指数を算出する。
 
+    黄斑（半径3mm）のバウンディングボックスに切り出し、環インデックスを
+    1パスで集計する（環ごとに全画面マスクを作る旧実装と同値・高速）。
+
     Args:
         mask: GA領域が255のuint8二値マスク。
         fovea_xy: 中心窩座標 (x=col, y=row)。
@@ -76,26 +79,46 @@ def compute_gawain(mask: np.ndarray,
     if scale_um_px <= 0:
         raise ValueError('scale_um_px must be positive')
 
+    specs = load_annulus_weights()
+    inner = np.array([s['inner_mm'] for s in specs], dtype=np.float64)
+    outer = np.array([s['outer_mm'] for s in specs], dtype=np.float64)
+
     h, w = mask.shape
     fx, fy = fovea_xy
-    yy, xx = np.ogrid[:h, :w]
-    dist_px = np.sqrt((xx - fx) ** 2 + (yy - fy) ** 2)
-    dist_mm = dist_px * scale_um_px / 1000.0
+    r_px = macula_radius_px(scale_um_px)
+    x0 = max(0, int(np.floor(fx - r_px)))
+    x1 = min(w, int(np.ceil(fx + r_px)) + 1)
+    y0 = max(0, int(np.floor(fy - r_px)))
+    y1 = min(h, int(np.ceil(fy + r_px)) + 1)
 
-    ga = (mask > 0).astype(np.float32)
-    macula = dist_mm <= MACULA_RADIUS_MM
+    n_ring = np.zeros(NUM_ANNULI, dtype=np.int64)
+    ga_ring = np.zeros(NUM_ANNULI, dtype=np.float64)
+    if x0 < x1 and y0 < y1:
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        dist_mm = (
+            np.sqrt((xx - fx) ** 2 + (yy - fy) ** 2) * scale_um_px / 1000.0
+        )
+        d = dist_mm.ravel()
+        ga = (mask[y0:y1, x0:x1].ravel() > 0)
+        # 環 i の条件: dist <= 3mm（黄斑内）かつ inner_i <= dist < outer_i
+        idx = np.searchsorted(outer, d, side='right')
+        ok = (idx < NUM_ANNULI) & (d <= MACULA_RADIUS_MM)
+        idx_ok = idx[ok]
+        keep = d[ok] >= inner[idx_ok]
+        idx_ok = idx_ok[keep]
+        ga_ok = ga[ok][keep]
+        n_ring = np.bincount(idx_ok, minlength=NUM_ANNULI)
+        ga_ring = np.bincount(
+            idx_ok, weights=ga_ok.astype(np.float64), minlength=NUM_ANNULI,
+        )
 
     total = 0.0
     annuli_out: list[dict] = []
-
-    for spec in load_annulus_weights():
-        ring = macula & (dist_mm >= spec['inner_mm']) & (dist_mm < spec['outer_mm'])
-        n_ring = int(ring.sum())
-        if n_ring == 0:
+    for i, spec in enumerate(specs):
+        if n_ring[i] == 0:
             ga_fraction = 0.0
         else:
-            ga_fraction = float(ga[ring].mean())
-
+            ga_fraction = float(ga_ring[i] / n_ring[i])
         healthy_pct = 100.0 * (1.0 - ga_fraction)
         contribution = healthy_pct * spec['area_mm2'] * spec['weight'] / 100.0
         total += contribution

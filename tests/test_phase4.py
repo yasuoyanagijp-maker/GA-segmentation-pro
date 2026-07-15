@@ -8,15 +8,15 @@ from engine.timeseries import (
     estimate_progression_rate_um_per_year,
     estimate_growth_mm2_per_year,
     estimate_growth_mm_sqrt_per_year,
-    guess_image_date,
+    guess_image_datetime,
     overlays_to_gif_bytes,
-    resize_to_reference,
+    resize_to_reference_with_scales,
 )
 
 
 def test_guess_image_date_from_filename():
     path = Path('/tmp/patient_20240315_faf.png')
-    assert guess_image_date(path) == date(2024, 3, 15)
+    assert guess_image_datetime(path).date() == date(2024, 3, 15)
 
 
 def test_estimate_progression_rate_positive():
@@ -52,8 +52,10 @@ def test_overlays_to_gif_bytes():
 def test_resize_to_reference():
     a = np.zeros((50, 60), dtype=np.uint8)
     b = np.zeros((80, 90), dtype=np.uint8)
-    out = resize_to_reference([a, b])
+    out, scales = resize_to_reference_with_scales([a, b])
     assert out[1].shape == a.shape
+    assert scales[0] == (1.0, 1.0)
+    assert scales[1] == (60 / 90, 50 / 80)
 
 
 def test_build_series_from_saved():
