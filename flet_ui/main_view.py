@@ -3191,12 +3191,23 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     def _run_registration_on_series(
         *,
         landing_filename: str | None = None,
+        launch_guard_gen: int | None = None,
     ) -> None:
-        """選択済み時系列に位置合わせを適用し、確認モードへ入る（非同期）。"""
+        """選択済み時系列に位置合わせを適用し、確認モードへ入る（非同期）。
+
+        launch_guard_gen: ④ からの直行パス（案1）で引き継いだ series 起動
+        ガード。登録完了（またはエラー）時にこの関数側で解除する。
+        """
+        def _finish_launch_guard() -> None:
+            if launch_guard_gen is not None:
+                _end_series_launch_guard(launch_guard_gen)
+
         if registration_guard["running"]:
+            _finish_launch_guard()
             return
         selected = _selected_count()
         if selected < 2:
+            _finish_launch_guard()
             _set_status(f"位置合わせには対象2枚以上が必要です (現在 選択 {selected} 枚)")
             page.update()
             return
@@ -3281,7 +3292,10 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                         " — 各時点で OK / やり直しを選択してください"
                     ))
                     _enter_registration_review()
+                _update_batch_ui(refresh_dropdown=False)
+                _refresh_file_dropdown_labels()
             finally:
+                _finish_launch_guard()
                 _set_registration_busy(False)
                 page.update()
 
@@ -3315,7 +3329,12 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         auto: bool = False,
         landing_filename: str | None = None,
     ) -> None:
-        """確定済み結果から時系列を構築。既定は位置合わせなしでグラフ表示（非同期）。"""
+        """確定済み結果から時系列を構築（非同期）。
+
+        位置合わせトグル OFF: register=False で構築しグラフ表示。
+        トグル ON: 中間ビルドを作らず直接 register=True で1回だけ構築し、
+        確認モード（または行列再利用時は結果表示）へ進む。
+        """
         if registration_guard["running"] or series_guard["launching"]:
             return
         selected = _selected_count()
@@ -3338,6 +3357,16 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         series_methods = state.series_methods
 
         async def _series_task() -> None:
+            if state.series_registration_enabled:
+                # 位置合わせ ON: register=False の中間ビルド（すぐ捨てられる）
+                # を作らず、直接 register=True で1回だけ構築する。
+                # 起動ガードは登録タスク側で解除する。
+                state.disc_diameter_um = float(disc_field.value or 1800)
+                _run_registration_on_series(
+                    landing_filename=prefer,
+                    launch_guard_gen=dd_gen,
+                )
+                return
             try:
                 results = await asyncio.to_thread(
                     build_series_from_saved,
