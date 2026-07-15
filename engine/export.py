@@ -63,8 +63,17 @@ def gawain_figure_png_from_context(ctx: dict) -> bytes | None:
     return png_bytes
 
 
-def build_batch_csv_bytes(results: list[dict]) -> bytes:
-    """時系列結果を CSV バイト列にする。"""
+def build_batch_csv_bytes(
+    results: list[dict],
+    roi_qc: list[dict] | None = None,
+) -> bytes:
+    """時系列結果を CSV バイト列にする。
+
+    roi_qc: マスクQC補正のログ（apply_roi_correction_to_series の
+    ``qc_log``）。指定時は本表の下に「ROI QC correction log」セクション
+    （SOP 11章相当: raw/補正後面積・前時点Dice・異常判定・補正手法）を
+    追記する。
+    """
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow([
@@ -82,6 +91,32 @@ def build_batch_csv_bytes(results: list[dict]) -> bytes:
             s.get("dist_um"),
             s.get("lesion_count"),
         ])
+
+    if roi_qc:
+        writer.writerow([])
+        writer.writerow(["ROI QC correction log"])
+        writer.writerow([
+            "index", "date", "filename",
+            "raw_area_px", "corrected_area_px",
+            "dice_with_prev_raw", "dice_with_prev_corrected",
+            "refine_method", "area_anomaly", "shape_anomaly",
+            "needs_review", "reason",
+        ])
+        for rec in roi_qc:
+            writer.writerow([
+                rec.get("index"),
+                rec.get("date"),
+                rec.get("filename"),
+                rec.get("raw_area"),
+                rec.get("corrected_area"),
+                rec.get("dice_with_prev_raw"),
+                rec.get("dice_with_prev_corrected"),
+                rec.get("refine_method") or "",
+                rec.get("area_anomaly"),
+                rec.get("shape_anomaly"),
+                rec.get("needs_review"),
+                rec.get("reason"),
+            ])
     return buf.getvalue().encode("utf-8-sig")
 
 
@@ -111,8 +146,13 @@ def generate_pdf_report_bytes(
     foveal_correction_applied: bool | None = None,
     foveal_correction_skipped: bool | None = None,
     foveal_correction_strength: float | None = None,
+    roi_qc_note: str | None = None,
 ) -> bytes:
-    """1時点の解析結果 PDF（計測表 + オーバーレイ + 任意 GAWAIN 図）をバイト列で返す。"""
+    """1時点の解析結果 PDF（計測表 + オーバーレイ + 任意 GAWAIN 図）をバイト列で返す。
+
+    roi_qc_note: マスクQC補正の1行サマリ（適用時のみ）。Summary metrics の
+    直下に "Mask QC: ..." として印字される。
+    """
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
@@ -136,6 +176,10 @@ def generate_pdf_report_bytes(
         ("Lesion count", s.get("lesion_count")),
     ]:
         pdf.cell(0, 6, _pdf_safe(f"{label}: {_dash(val)}"), new_x="LMARGIN", new_y="NEXT")
+    if roi_qc_note:
+        pdf.set_font("Helvetica", "I", 9)
+        pdf.cell(0, 6, _pdf_safe(f"Mask QC: {roi_qc_note}"), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", size=10)
 
     lesions = s.get("lesions") or []
     if lesions:
@@ -194,42 +238,6 @@ def generate_pdf_report_bytes(
             gaw_tmp.unlink(missing_ok=True)
 
     return bytes(pdf.output())
-
-
-def generate_pdf_report(
-    *,
-    filename: str,
-    date: str,
-    stats: dict,
-    overlay_rgb: np.ndarray,
-    output_path: Path,
-    gawain_figure_png: bytes | None = None,
-    scale_um_px: float | None = None,
-    calibration_source: str | None = None,
-    field_width_mm: float | None = None,
-    fovea_xy: tuple[float, float] | None = None,
-    foveal_correction_applied: bool | None = None,
-    foveal_correction_skipped: bool | None = None,
-    foveal_correction_strength: float | None = None,
-) -> Path:
-    """1時点の解析結果 PDF を保存。"""
-    pdf_bytes = generate_pdf_report_bytes(
-        filename=filename,
-        date=date,
-        stats=stats,
-        overlay_rgb=overlay_rgb,
-        gawain_figure_png=gawain_figure_png,
-        scale_um_px=scale_um_px,
-        calibration_source=calibration_source,
-        field_width_mm=field_width_mm,
-        fovea_xy=fovea_xy,
-        foveal_correction_applied=foveal_correction_applied,
-        foveal_correction_skipped=foveal_correction_skipped,
-        foveal_correction_strength=foveal_correction_strength,
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(pdf_bytes)
-    return output_path
 
 
 def suggested_csv_filename() -> str:

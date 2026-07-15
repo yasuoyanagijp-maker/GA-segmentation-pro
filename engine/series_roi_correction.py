@@ -41,6 +41,7 @@ def apply_roi_correction_to_series(
       "results": updated series rows (mask / stats / roi_* fields),
       "qc_records": list[FrameQCRecord],
       "needs_review_indices": list[int],
+      "qc_log": SOP 11章相当のQCログ（CSV/表示向け plain dict のリスト）,
     }
     """
     if not results:
@@ -85,10 +86,18 @@ def apply_roi_correction_to_series(
             needs_review_indices.append(i)
         updated.append(new_row)
 
+    qc_log = []
+    for i, rec in enumerate(out["qc_records"]):
+        entry = dict(rec.__dict__)
+        entry["filename"] = results[i].get("filename")
+        entry["refine_method"] = out["refine_methods"][i]
+        qc_log.append(entry)
+
     return {
         "results": updated,
         "qc_records": out["qc_records"],
         "needs_review_indices": needs_review_indices,
         "qc_dataframe": out["qc_dataframe"],
         "refine_methods": out["refine_methods"],
+        "qc_log": qc_log,
     }

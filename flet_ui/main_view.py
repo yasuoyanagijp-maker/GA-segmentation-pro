@@ -634,6 +634,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.series_review_idx = 0
         state.series_registered = False
         state.series_roi_applied = False
+        state.series_roi_qc = None
         state.view_mode = "work"
         view_mode.value = "work"
         view_mode.visible = False
@@ -1478,9 +1479,28 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             return
         out = _ensure_output_dir()
         path = out / suggested_csv_filename()
-        path.write_bytes(build_batch_csv_bytes(state.series_results))
+        path.write_bytes(build_batch_csv_bytes(
+            state.series_results,
+            roi_qc=state.series_roi_qc,
+        ))
         status.value = f"CSV 保存: {path}"
         page.update()
+
+    def _roi_qc_note_for_row(row: dict) -> str | None:
+        """PDF 用のマスクQC補正1行サマリ（未適用時は None）。"""
+        if "roi_raw_area" not in row:
+            return None
+        method = row.get("roi_refine_method")
+        if method:
+            note = (
+                f"corrected ({method}): {row['roi_raw_area']}"
+                f" -> {row['roi_corrected_area']} px"
+            )
+        else:
+            note = "no anomaly (mask unchanged)"
+        if row.get("roi_needs_review"):
+            note += f"; needs review: {row.get('roi_reason') or ''}"
+        return note
 
     def _resolve_pdf_export_context() -> dict | None:
         """PDF 出力用の filename / stats / overlay / GAWAIN 生成コンテキスト。"""
@@ -1489,6 +1509,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             overlay = state.series_overlays[state.series_time_idx]
             snap = state.per_file_results.get(row["filename"], row)
             return {
+                "roi_qc_note": _roi_qc_note_for_row(row),
                 "filename": row["filename"],
                 "date": row["date"],
                 "stats": row["stats"],
@@ -1573,6 +1594,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                     foveal_correction_applied=ctx.get("foveal_correction_applied"),
                     foveal_correction_skipped=ctx.get("foveal_correction_skipped"),
                     foveal_correction_strength=ctx.get("foveal_correction_strength"),
+                    roi_qc_note=ctx.get("roi_qc_note"),
                 )
                 out = _ensure_output_dir()
                 path = out / suggested_pdf_filename(ctx["filename"])
@@ -3258,6 +3280,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 state.series_overlays = overlays
                 state.series_gif = None
                 state.series_roi_applied = True
+                state.series_roi_qc = out["qc_log"]
                 _recompute_series_estimates()
                 n_corr = sum(1 for m in out["refine_methods"] if m)
                 n_review = len(out["needs_review_indices"])
@@ -3298,6 +3321,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             ):
                 row.pop(key, None)
         state.series_roi_applied = False
+        state.series_roi_qc = None
         _rebuild_series_derived()
         _set_status("マスクQC補正を解除しました（補正前マスクに戻しました）")
         refresh_image()

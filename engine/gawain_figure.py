@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import io
-from pathlib import Path
 
 import cv2
 import matplotlib
@@ -12,7 +11,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.gridspec import GridSpec
-from skimage.measure import label, regionprops
 
 from engine.gawain import (
     MACULA_RADIUS_MM,
@@ -22,39 +20,6 @@ from engine.gawain import (
     macula_radius_px,
 )
 from engine.overlay import blend_mask_overlay
-
-
-def split_optos_dual_panel(img: np.ndarray, eye: str = "R") -> np.ndarray:
-    """Optos 左右2眼並列画像から片眼パネルを切り出す。
-
-    eye: 'R' = 左半分, 'L' = 右半分（画像上の配置）
-    """
-    h, w = img.shape[:2]
-    if w < h * 1.35:
-        return img
-    mid = w // 2
-    if eye.upper() == "L":
-        return img[:, mid:].copy()
-    return img[:, :mid].copy()
-
-
-def crop_display_margins(img: np.ndarray, margin_frac: float = 0.07) -> np.ndarray:
-    """上下左右の UI テキスト余白を除去。"""
-    h, w = img.shape[:2]
-    dy = int(h * margin_frac)
-    dx = int(w * margin_frac)
-    return img[dy : h - dy, dx : w - dx].copy()
-
-
-def estimate_fovea_from_mask(mask: np.ndarray) -> tuple[float, float] | None:
-    """最大 GA 連結成分の重心を中心窩近似とする。"""
-    labeled = label(mask > 0)
-    props = regionprops(labeled)
-    if not props:
-        return None
-    main = max(props, key=lambda r: r.area)
-    cy, cx = main.centroid
-    return float(cx), float(cy)
 
 
 def draw_annuli_overlay(
@@ -172,24 +137,3 @@ def render_gawain_figure_bytes(
         "annuli": annuli,
     }
     return png_bytes, meta
-
-
-def render_gawain_figure(
-    img_gray: np.ndarray,
-    mask: np.ndarray,
-    fovea_xy: tuple[float, float],
-    scale_um_px: float,
-    output_path: Path | str,
-    *,
-    title: str = "",
-    dpi: int = 150,
-) -> dict:
-    """Figure 1 型（A–E）の GAWAIN 説明 PNG を出力する。"""
-    output_path = Path(output_path)
-    png_bytes, meta = render_gawain_figure_bytes(
-        img_gray, mask, fovea_xy, scale_um_px, title=title, dpi=dpi,
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(png_bytes)
-    meta["output_path"] = str(output_path)
-    return meta

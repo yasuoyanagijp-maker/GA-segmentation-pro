@@ -8,7 +8,7 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -62,11 +62,6 @@ def guess_image_datetime(path: Path) -> datetime:
                 continue
 
     return datetime.fromtimestamp(path.stat().st_mtime)
-
-
-def guess_image_date(path: Path) -> date:
-    """EXIF → ファイル名 → 更新日時の順で撮影日を推定する。"""
-    return guess_image_datetime(path).date()
 
 
 def datetime_to_iso(dt: datetime) -> str:
@@ -130,12 +125,6 @@ def refresh_series_dates_for_files(
         if f.name in filenames and f.name not in skip:
             refreshed[f.name] = datetime_to_iso(guess_image_datetime(f))
     return refreshed
-
-
-def resize_to_reference(images: list[np.ndarray]) -> list[np.ndarray]:
-    """先頭画像の解像度に合わせる。"""
-    resized, _ = resize_to_reference_with_scales(images)
-    return resized
 
 
 def resize_to_reference_with_scales(

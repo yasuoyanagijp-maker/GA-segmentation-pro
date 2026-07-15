@@ -87,3 +87,13 @@ def test_apply_roi_correction_to_series_shrink_and_flag():
             )
     # frame0 is largely oversized vs frame1 → should escalate past band
     assert out["refine_methods"][0] in ("chan_vese", "grabcut")
+    # CSV エクスポート用 QC ログ（SOP 11章相当 + filename/refine_method）
+    qc_log = out["qc_log"]
+    assert len(qc_log) == 3
+    assert qc_log[0]["filename"] == "f0.jpg"
+    assert qc_log[0]["refine_method"] == out["refine_methods"][0]
+    for key in (
+        "raw_area", "corrected_area", "dice_with_prev_raw",
+        "dice_with_prev_corrected", "needs_review", "reason",
+    ):
+        assert key in qc_log[0]

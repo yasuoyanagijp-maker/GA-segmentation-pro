@@ -122,6 +122,17 @@
    - **表示**: 結果パネルに「マスクQC補正済み: 日付(手法)」と
      「⚠ QC要確認 日付: 理由」を表示。ステータスバーに補正/要確認の
      時点数を通知。
+   - **エクスポート**: QCログ（SOP 11章相当: raw/補正後面積・前時点
+     Dice・異常判定・補正手法）を CSV の「ROI QC correction log」
+     セクションとして出力。PDF には現在時点の "Mask QC: ..." 1行
+     サマリを印字。
+   - **整理**: アプリ未参照の旧ヘルパー（`guess_image_date` /
+     `resize_to_reference` / `generate_pdf_report` /
+     `render_gawain_figure` ほか gawain_figure 系3関数）は
+     `archive/deprecated_engine_helpers.py` へ移動（`archive/README.md`
+     参照）。`ga_roi_correction` のスタンドアロン部分
+     （`registration.py`・`correct_ga_series`）は研究用として維持し、
+     README に「アプリからは aligned_correct 経由」の注記を追加。
    - **速度**: 1024²×4時点で約4.4秒（ワーカースレッド実行のため UI は
      ブロックされない）。NL-means が支配的なのは変わらず、さらに詰める
      場合は縮小 denoise を検討。
