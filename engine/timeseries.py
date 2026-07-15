@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from pathlib import Path
 
@@ -380,15 +382,66 @@ def build_series_from_saved(
     if ref_scale is None:
         raise ValueError("基準画像に scale_um_px がありません")
 
-    results: list[dict] = []
-    for i, (snap, f) in enumerate(zip(snapshots, ordered)):
-        fname = f.name
-        date_str = series_dates.get(fname) or snap.get("date", "")
+    # 各時点の固定点を先に解決（並列登録と組み立ての両方で使う）
+    row_lms: list[tuple[dict, dict]] = []
+    for i, snap in enumerate(snapshots):
         lm_raw = landmarks_from_snapshot(snap)
         sx, sy = img_scales[i]
         lm = scale_landmarks(
             lm_raw["fovea_xy"], lm_raw["disc_pts"], lm_raw["disc_xy"], sx, sy,
         )
+        row_lms.append((lm_raw, lm))
+
+    # 位置合わせが必要な時点は互いに独立（全て基準時点へ整列する）なので
+    # 並列に計算する。結果は直列実行と同一（時点間に依存なし・決定的）。
+    reg_methods: dict[int, str] = {}
+    for i, f in enumerate(ordered):
+        fname = f.name
+        if i == 0 or not register or fname in prior_matrices:
+            continue
+        lm = row_lms[i][1]
+        reg_methods[i] = methods.get(fname) or default_method_for(
+            lm["fovea_xy"], lm["disc_xy"], ref_fovea, ref_disc,
+        )
+
+    def _register_one(i: int) -> tuple[int, dict]:
+        fname = ordered[i].name
+        method = reg_methods[i]
+        lm = row_lms[i][1]
+        t0 = time.perf_counter()
+        reg = register_moving_to_reference(
+            images[i], masks[i], ref_img,
+            method=method,
+            moving_fovea=lm["fovea_xy"],
+            ref_fovea=ref_fovea,
+            moving_disc=lm["disc_xy"],
+            ref_disc=ref_disc,
+            anchor_fovea=True,
+        )
+        _perf_log.info(
+            "timepoint %d/%d %s (method=%s): %.1f s",
+            i + 1, len(ordered), fname, method,
+            time.perf_counter() - t0,
+        )
+        return i, reg
+
+    reg_out: dict[int, dict] = {}
+    if reg_methods:
+        # メモリ（1時点あたり前処理キャッシュ数十MB）を抑えるため上限4並列
+        max_workers = min(len(reg_methods), 4, os.cpu_count() or 1)
+        if max_workers <= 1:
+            for i in sorted(reg_methods):
+                reg_out[i] = _register_one(i)[1]
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                for i, reg in ex.map(_register_one, sorted(reg_methods)):
+                    reg_out[i] = reg
+
+    results: list[dict] = []
+    for i, (snap, f) in enumerate(zip(snapshots, ordered)):
+        fname = f.name
+        date_str = series_dates.get(fname) or snap.get("date", "")
+        lm_raw, lm = row_lms[i]
         moving_fovea = lm["fovea_xy"]
         moving_disc = lm["disc_xy"]
         source_fovea = lm_raw["fovea_xy"]
@@ -411,24 +464,8 @@ def build_series_from_saved(
             disc_xy = warp_point(moving_disc, matrix) or ref_disc
             disc_pts = lm["disc_pts"]
         else:
-            method = methods.get(fname) or default_method_for(
-                moving_fovea, moving_disc, ref_fovea, ref_disc,
-            )
-            t0 = time.perf_counter()
-            reg = register_moving_to_reference(
-                images[i], masks[i], ref_img,
-                method=method,
-                moving_fovea=moving_fovea,
-                ref_fovea=ref_fovea,
-                moving_disc=moving_disc,
-                ref_disc=ref_disc,
-                anchor_fovea=True,
-            )
-            _perf_log.info(
-                "timepoint %d/%d %s (method=%s): %.1f s",
-                i + 1, len(ordered), fname, method,
-                time.perf_counter() - t0,
-            )
+            method = reg_methods[i]
+            reg = reg_out[i]
             img = reg["image"]
             mask = reg["mask"]
             fovea = reg["fovea_xy"] or ref_fovea

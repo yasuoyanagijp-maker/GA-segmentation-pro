@@ -765,24 +765,61 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             scale_um_px=scale,
         )
 
-    def _rebuild_series_derived() -> None:
-        """state.series_results から overlay / GIF / 進行速度を再構築する。"""
+    def _recompute_series_estimates() -> None:
+        """進行速度3種（線形回帰）を state.series_results から再計算する。"""
         results = state.series_results or []
-        overlays = [_row_overlay(row) for row in results]
-        state.series_overlays = overlays
-        state.series_gif = overlays_to_gif_bytes(overlays) if overlays else None
         state.estimated_prog = estimate_progression_rate_um_per_year(results)
         state.estimated_growth_mm2_per_year = estimate_growth_mm2_per_year(results)
         state.estimated_growth_mm_sqrt_per_year = estimate_growth_mm_sqrt_per_year(results)
         prog_field.value = str(int(state.estimated_prog)) if state.estimated_prog else ""
 
+    def _rebuild_series_derived(
+        *,
+        overlays: list[np.ndarray] | None = None,
+    ) -> None:
+        """state.series_results から overlay / 進行速度を再構築する。
+
+        overlays を渡すと再生成しない（ワーカースレッドで事前計算した結果を
+        受け取る用）。GIF はここでは作らず、GIF ビュー表示時に遅延生成する。
+        """
+        results = state.series_results or []
+        if overlays is None:
+            overlays = [_row_overlay(row) for row in results]
+        state.series_overlays = overlays
+        state.series_gif = None  # 次回 GIF ビュー表示時に再生成
+        _recompute_series_estimates()
+
+    def _series_gif_bytes() -> bytes | None:
+        """GIF ビュー用アニメGIF（表示幅で遅延生成し、キャッシュする）。
+
+        原寸ではなく表示幅（DISPLAY_WIDTH）で生成する: エンコードが
+        約9倍速く、UI へ送るペイロードも約1/7 になる。原寸が必要な
+        PDF 出力は overlay（原寸）を使うため影響しない。
+        """
+        if state.series_gif is not None:
+            return state.series_gif
+        overlays = state.series_overlays
+        if not overlays:
+            return None
+        frames = [
+            cv2.resize(
+                o,
+                (DISPLAY_WIDTH, max(1, int(o.shape[0] * DISPLAY_WIDTH / o.shape[1]))),
+                interpolation=cv2.INTER_AREA,
+            )
+            for o in overlays
+        ]
+        state.series_gif = overlays_to_gif_bytes(frames)
+        return state.series_gif
+
     def _apply_series_results(
         results: list[dict],
         *,
         landing_filename: str | None = None,
+        overlays: list[np.ndarray] | None = None,
     ) -> None:
         state.series_results = results
-        _rebuild_series_derived()
+        _rebuild_series_derived(overlays=overlays)
         series_date_dd.visible = True
         series_date_dd.options = [
             ft.dropdown.Option(
@@ -1575,12 +1612,14 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             if rgb is not None:
                 _push_image_rgb(rgb, do_update=do_update)
             return
-        if state.view_mode == "gif" and state.series_gif:
-            gif_img.src_base64 = base64.b64encode(state.series_gif).decode("ascii")
-            img_ctrl.visible = False
-            gif_img.visible = True
-            graph_area.visible = False
-            return
+        if state.view_mode == "gif" and state.series_results:
+            gif = _series_gif_bytes()
+            if gif:
+                gif_img.src_base64 = base64.b64encode(gif).decode("ascii")
+                img_ctrl.visible = False
+                gif_img.visible = True
+                graph_area.visible = False
+                return
         if state.view_mode == "graph" and state.series_results:
             img_ctrl.visible = False
             gif_img.visible = False
@@ -3083,7 +3122,16 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             else:
                 results[idx] = updated
                 state.series_methods[updated["filename"]] = method
-                _rebuild_series_derived()
+                # 変わったのは 1 時点だけなので、その行の overlay だけ差し替える
+                if (
+                    state.series_overlays is not None
+                    and idx < len(state.series_overlays)
+                ):
+                    state.series_overlays[idx] = _row_overlay(updated)
+                    state.series_gif = None
+                    _recompute_series_estimates()
+                else:
+                    _rebuild_series_derived()
                 _refresh_review_panel()
                 refresh_image()
                 refresh_results()
@@ -3192,7 +3240,13 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             except Exception as exc:
                 _set_status(f"位置合わせエラー: {exc}")
             else:
-                _apply_series_results(results, landing_filename=prefer)
+                # overlay 生成（数百ms〜）はイベントループを塞がないよう別スレッドで
+                overlays = await asyncio.to_thread(
+                    lambda: [_row_overlay(row) for row in results],
+                )
+                _apply_series_results(
+                    results, landing_filename=prefer, overlays=overlays,
+                )
                 if prior_matrices and cache_confirmed:
                     # 再解析後の再利用: 確認フローを飛ばして結果表示へ
                     state.series_review_active = False
@@ -3305,7 +3359,13 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 page.update()
                 return
             state.disc_diameter_um = float(disc_field.value or 1800)
-            _apply_series_results(results, landing_filename=prefer)
+            # overlay 生成（数百ms〜）はイベントループを塞がないよう別スレッドで
+            overlays = await asyncio.to_thread(
+                lambda: [_row_overlay(row) for row in results],
+            )
+            _apply_series_results(
+                results, landing_filename=prefer, overlays=overlays,
+            )
             _show_series_results_view(n=len(results), selected=selected)
             _update_batch_ui(refresh_dropdown=False)
             _refresh_file_dropdown_labels()
