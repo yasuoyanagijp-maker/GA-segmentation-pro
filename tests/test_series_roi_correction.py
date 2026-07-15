@@ -17,7 +17,12 @@ if str(_PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(_PKG_ROOT))
 
 from ga_roi_correction.aligned_correct import choose_refine_method  # noqa: E402
-from ga_roi_correction.qc import AnomalyThresholds  # noqa: E402
+from ga_roi_correction.qc import AnomalyThresholds, dice  # noqa: E402
+from ga_roi_correction.refine import (  # noqa: E402
+    interpolate_prior_mask,
+    position_guided_monotonic_refine,
+    trusted_prior_mask,
+)
 
 
 def _circle(size: int, center: tuple[int, int], radius: int) -> np.ndarray:
@@ -87,3 +92,89 @@ def test_apply_roi_correction_to_series_shrink_and_flag():
             )
     # frame0 is largely oversized vs frame1 → should escalate past band
     assert out["refine_methods"][0] in ("chan_vese", "grabcut")
+
+
+def test_interpolate_prior_mask_midpoint():
+    size = 120
+    prev = _circle(size, (60, 60), 20) > 0
+    nxt = _circle(size, (60, 60), 30) > 0
+    prior = interpolate_prior_mask(prev, nxt, t=0.5) > 0
+    # midpoint of two concentric circles ≈ circle with the mean radius
+    expected = _circle(size, (60, 60), 25) > 0
+    assert dice(prior, expected) > 0.95
+    # one-sided fallback returns the available neighbor
+    assert np.array_equal(interpolate_prior_mask(prev, None) > 0, prev)
+    assert np.array_equal(interpolate_prior_mask(None, nxt) > 0, nxt)
+    assert interpolate_prior_mask(None, None) is None
+
+
+def test_trusted_prior_mask_rejects_disagreeing_neighbors():
+    size = 160
+    prev = _circle(size, (40, 40), 20) > 0
+    far_next = _circle(size, (120, 120), 20) > 0
+    assert trusted_prior_mask(prev, far_next) is None
+    close_next = _circle(size, (42, 42), 24) > 0
+    assert trusted_prior_mask(prev, close_next) is not None
+
+
+def test_position_guided_monotonic_refine_recovers_shifted_roi():
+    size = 200
+    center = (100, 100)
+    radii = (28, 32, 36)
+    image = np.full((size, size), 160, dtype=np.uint8)
+    true_mask = _circle(size, center, radii[1]) > 0
+    image[true_mask] = 50
+
+    prev_mask = _circle(size, center, radii[0]) > 0
+    next_mask = _circle(size, center, radii[2]) > 0
+    shifted = _circle(size, (160, 100), radii[1]) > 0  # same area, wrong place
+
+    assert dice(shifted, true_mask) < 0.2
+    refined = position_guided_monotonic_refine(
+        image, shifted, prev_mask=prev_mask, next_mask=next_mask,
+    ) > 0
+    assert dice(refined, true_mask) > 0.9
+    # monotonicity: prev ⊆ result ⊆ dilate(next, margin)
+    assert not (prev_mask & ~refined).any()
+    from skimage.morphology import dilation, disk
+    upper = dilation(next_mask, disk(3))
+    assert not (refined & ~upper).any()
+
+
+def test_apply_roi_correction_flags_position_anomaly():
+    size = 200
+    center = (100, 100)
+    images = [np.full((size, size), 160, dtype=np.uint8) for _ in range(3)]
+    radii = [24, 28, 32]
+    for i, img in enumerate(images):
+        img[_circle(size, center, radii[i]) > 0] = 50
+    masks = [
+        _circle(size, center, radii[0]),
+        _circle(size, (160, 100), radii[1]),  # area normal but mislocated
+        _circle(size, center, radii[2]),
+    ]
+    results = [
+        {
+            "image": images[i],
+            "mask": masks[i],
+            "date": f"2026-0{i + 1}-01",
+            "filename": f"f{i}.jpg",
+            "scale_um_px": 10.0,
+            "fovea_xy": (100.0, 100.0),
+            "stats": {"area_mm2": 1.0, "dist_um": 100.0},
+            "reg_method": "reference" if i == 0 else "affine",
+        }
+        for i in range(3)
+    ]
+    out = apply_roi_correction_to_series(results)
+    rec = out["qc_records"][1]
+    assert rec.position_anomaly
+    assert "position_anomaly" in rec.reason
+    assert not rec.area_anomaly  # area QC alone cannot catch this case
+    assert out["refine_methods"][1] == "position_guided_monotonic"
+    corrected1 = out["results"][1]["mask"] > 0
+    true1 = _circle(size, center, radii[1]) > 0
+    assert dice(corrected1, true1) > 0.9
+    # neighbors stay untouched
+    assert np.array_equal(out["results"][0]["mask"] > 0, masks[0] > 0)
+    assert np.array_equal(out["results"][2]["mask"] > 0, masks[2] > 0)

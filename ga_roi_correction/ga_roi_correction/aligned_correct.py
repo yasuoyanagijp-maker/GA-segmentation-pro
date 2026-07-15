@@ -27,6 +27,11 @@ class AlignedCorrectConfig:
     reconstruction_margin_px: int = 6
     clahe_clip_limit: float = 2.5
     denoise_h: float = 6.0
+    # Detect grossly mislocated ROIs (area may look normal) before the
+    # area-based checks, and fix them with neighbor-guided refine +
+    # monotonicity constraint (prev ⊆ result ⊆ dilate(next, margin)).
+    enable_position_guided_refine: bool = True
+    position_next_margin_px: int = 3
 
 
 def _area_severity_tier(
@@ -138,8 +143,30 @@ def correct_aligned_series(
     corrected: list[np.ndarray] = [None] * n  # type: ignore
     corrected[0] = aligned_masks[0]
     refine_methods: list[Optional[str]] = [None] * n
+    dice_neighbor_prior: list[Optional[float]] = [None] * n
 
     for i in range(n):
+        prev_m = corrected[i - 1] if i > 0 else None
+        next_m = aligned_masks[i + 1] if i < n - 1 else None
+
+        # Position check runs before the area checks: a frame whose area is
+        # in range can still be grossly shifted, which area QC cannot see.
+        # Edge frames are skipped: with a single neighbor we cannot tell
+        # which of the two frames is mislocated, and a shifted neighbor
+        # would drag a correct edge frame to the wrong place.
+        if cfg.enable_position_guided_refine and prev_m is not None and next_m is not None:
+            prior = rf.trusted_prior_mask(prev_m, next_m, t=0.5)
+            if prior is not None:
+                dice_neighbor_prior[i] = qc.dice(aligned_masks[i], prior)
+            if qc.detect_position_anomaly(dice_neighbor_prior[i], pcfg.thresholds):
+                refine_methods[i] = "position_guided_monotonic"
+                corrected[i] = rf.position_guided_monotonic_refine(
+                    analysis[i], aligned_masks[i],
+                    prev_mask=prev_m, next_mask=next_m,
+                    next_margin_px=cfg.position_next_margin_px,
+                )
+                continue
+
         prev_a = qc.mask_area(corrected[i - 1]) if i > 0 else None
         next_a = raw_areas[i + 1] if i < n - 1 else None
         is_anom = qc.detect_area_anomaly(prev_a, raw_areas[i], next_a, pcfg.thresholds)
@@ -183,6 +210,7 @@ def correct_aligned_series(
     records = qc.build_qc_records(
         dates, raw_areas, corrected_areas, dice_prev_raw, dice_prev_corr,
         modes, ccs, pcfg.thresholds,
+        dice_neighbor_prior=dice_neighbor_prior,
     )
     return {
         "corrected_masks": corrected,
