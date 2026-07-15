@@ -17,6 +17,11 @@ from .aligned_correct import (
     AlignedCorrectConfig,
     choose_refine_method,
 )
+from .refine import (
+    interpolate_prior_mask,
+    position_guided_monotonic_refine,
+    trusted_prior_mask,
+)
 
 __all__ = [
     "correct_ga_series",
@@ -24,5 +29,8 @@ __all__ = [
     "correct_aligned_series",
     "AlignedCorrectConfig",
     "choose_refine_method",
+    "interpolate_prior_mask",
+    "position_guided_monotonic_refine",
+    "trusted_prior_mask",
 ]
 __version__ = "0.1.0"

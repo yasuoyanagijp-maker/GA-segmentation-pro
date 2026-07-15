@@ -33,6 +33,9 @@ class AnomalyThresholds:
     last_ratio: float = 1.5       # 最終フレームが直前よりこの倍率以上大きければ異常候補
     min_dice_with_prev: float = 0.5   # 登録後Diceがこれ未満なら形状不整合フラグ
     min_registration_cc: float = 0.5  # 登録信頼度がこれ未満ならレビュー対象
+    # 前後フレーム補間prior(shape-based interpolation)とのDiceがこれ未満なら
+    # 「面積は正常でも位置が大きくずれている」候補(position_anomaly)
+    min_dice_with_neighbor_prior: float = 0.3
 
 
 @dataclass
@@ -50,6 +53,10 @@ class FrameQCRecord:
     registration_low_confidence: bool
     needs_review: bool
     reason: str
+    # 前後フレーム補間prior(位置の事前分布)との整合性。面積が正常でも
+    # 位置が大きくずれているフレームを検出するための指標。
+    dice_with_neighbor_prior: Optional[float] = None
+    position_anomaly: bool = False
 
 
 def detect_area_anomaly(prev_area: Optional[int], curr_area: int, next_area: Optional[int],
@@ -66,8 +73,18 @@ def detect_area_anomaly(prev_area: Optional[int], curr_area: int, next_area: Opt
     return False
 
 
+def detect_position_anomaly(dice_with_neighbor_prior: Optional[float],
+                             th: AnomalyThresholds) -> bool:
+    """面積は正常範囲でも、前後フレーム補間priorとの重なりが低すぎる
+    (=場所がずれている)フレームを検出する。"""
+    if dice_with_neighbor_prior is None:
+        return False
+    return dice_with_neighbor_prior < th.min_dice_with_neighbor_prior
+
+
 def build_qc_records(dates, raw_areas, corrected_areas, dice_prev_raw, dice_prev_corr,
-                      reg_modes, reg_ccs, th: AnomalyThresholds) -> list[FrameQCRecord]:
+                      reg_modes, reg_ccs, th: AnomalyThresholds,
+                      dice_neighbor_prior=None) -> list[FrameQCRecord]:
     n = len(raw_areas)
     records = []
     for i in range(n):
@@ -83,7 +100,12 @@ def build_qc_records(dates, raw_areas, corrected_areas, dice_prev_raw, dice_prev
         if reg_ccs[i] is not None and reg_ccs[i] < th.min_registration_cc:
             reg_low_conf = True
 
+        d_prior = dice_neighbor_prior[i] if dice_neighbor_prior is not None else None
+        pos_anom = detect_position_anomaly(d_prior, th)
+
         reasons = []
+        if pos_anom:
+            reasons.append("position_anomaly")
         if area_anom:
             reasons.append("area_anomaly")
         if shape_anom:
@@ -105,6 +127,8 @@ def build_qc_records(dates, raw_areas, corrected_areas, dice_prev_raw, dice_prev
             registration_low_confidence=reg_low_conf,
             needs_review=bool(reasons),
             reason=";".join(reasons) if reasons else "ok",
+            dice_with_neighbor_prior=d_prior,
+            position_anomaly=pos_anom,
         ))
     return records
 

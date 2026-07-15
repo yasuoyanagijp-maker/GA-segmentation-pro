@@ -7,7 +7,11 @@ SOP 5〜11章を統合する全体オーケストレーション。
   1. 各フレームを前処理 (preprocessing)
   2. 基準フレーム(既定: 先頭)へ全フレームを画像登録 (registration)
      -> 以降はすべて「基準フレーム座標系(aligned space)」で処理する
-  3. SOPの初回/中間/最終ロジックで面積異常を検出 (qc.detect_area_anomaly)
+  3. 面積異常より先に「位置ずれ」を検出 (qc.detect_position_anomaly):
+     前後フレームROIのshape-based interpolationで作ったpriorとのDiceが
+     低いフレームは、面積が正常でも位置がずれているとみなし、
+     position_guided_monotonic_refine(前後フレーム誘導+単調性制約)で補正
+  3'. SOPの初回/中間/最終ロジックで面積異常を検出 (qc.detect_area_anomaly)
   4. 異常フレームのみ補正:
        - 縮小異常(中間) -> geodesic_prior_reconstruction で前フレームの
          形状を尊重しつつ回復
@@ -43,6 +47,9 @@ class PipelineConfig:
     clahe_clip_limit: float = 2.5
     denoise_h: float = 6.0
     save_overlays: bool = True
+    # 位置ずれフレームの検出+前後フレーム誘導補正(面積チェックより先に実施)
+    enable_position_guided_refine: bool = True
+    position_next_margin_px: int = 3          # 単調性上限(next側)の許容マージン
 
 
 def _cap_to_neighbor(curr_mask: np.ndarray, neighbor_mask: np.ndarray, margin_px: int) -> np.ndarray:
@@ -116,8 +123,29 @@ def correct_ga_series(images: list[np.ndarray], masks: list[np.ndarray],
     # 3-4. 異常検出 + 補正(時系列順に前から処理し、直前の"補正後"マスクを参照)
     corrected: list[np.ndarray] = [None] * n  # type: ignore
     corrected[0] = aligned_masks[0]
+    dice_neighbor_prior: list[Optional[float]] = [None] * n
 
     for i in range(n):
+        prev_m = corrected[i - 1] if i > 0 else None
+        next_m = aligned_masks[i + 1] if i < n - 1 else None
+
+        # 位置ずれチェック(面積チェックより先): 面積が正常でも
+        # 前後フレーム補間priorとの重なりが低ければ場所がずれている。
+        # 片側しか隣が無い端フレームでは「どちらがずれているか」を
+        # 判定できない(ずれた隣に引きずられて正常フレームを壊す)ため、
+        # 両隣が存在し互いに整合するフレームのみを対象とする。
+        if config.enable_position_guided_refine and prev_m is not None and next_m is not None:
+            prior = rf.trusted_prior_mask(prev_m, next_m, t=0.5)
+            if prior is not None:
+                dice_neighbor_prior[i] = qc.dice(aligned_masks[i], prior)
+            if qc.detect_position_anomaly(dice_neighbor_prior[i], config.thresholds):
+                corrected[i] = rf.position_guided_monotonic_refine(
+                    aligned_analysis[i], aligned_masks[i],
+                    prev_mask=prev_m, next_mask=next_m,
+                    next_margin_px=config.position_next_margin_px,
+                )
+                continue
+
         prev_a = qc.mask_area(corrected[i - 1]) if i > 0 else None
         next_a = raw_areas[i + 1] if i < n - 1 else None
         is_anom = qc.detect_area_anomaly(prev_a, raw_areas[i], next_a, config.thresholds)
@@ -150,7 +178,8 @@ def correct_ga_series(images: list[np.ndarray], masks: list[np.ndarray],
     reg_ccs = [r.cc for r in reg_results]
 
     records = qc.build_qc_records(dates, raw_areas, corrected_areas, dice_prev_raw, dice_prev_corr,
-                                   reg_modes, reg_ccs, config.thresholds)
+                                   reg_modes, reg_ccs, config.thresholds,
+                                   dice_neighbor_prior=dice_neighbor_prior)
 
     # 5. 元座標系へ逆変換(可視化・保存用)
     corrected_original: list[np.ndarray] = []
