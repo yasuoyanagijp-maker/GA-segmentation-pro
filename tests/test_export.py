@@ -10,7 +10,9 @@ from engine.export import (
 def test_build_batch_csv_bytes():
     results = [
         {
+            "case_id": "patient1",
             "date": "2024-01-01",
+            "exam_datetime": "2024-01-01T10:00:00",
             "filename": "a.jpg",
             "stats": {
                 "area_mm2": 1.2,
@@ -23,6 +25,10 @@ def test_build_batch_csv_bytes():
     ]
     data = build_batch_csv_bytes(results)
     text = data.decode("utf-8-sig")
+    assert "case_id" in text
+    assert "exam_datetime" in text
+    assert "patient1" in text
+    assert "2024-01-01T10:00:00" in text
     assert "area_mm2" in text
     assert "a.jpg" in text
     assert "1.2" in text

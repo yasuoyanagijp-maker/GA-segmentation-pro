@@ -72,7 +72,10 @@ def series_inputs():
 def test_parallel_registration_matches_direct_calls(series_inputs):
     """並列ビルドの各行列が、同じ入力での直接呼び出しと一致する。"""
     per_file, files, dates = series_inputs
-    results = build_series_from_saved(per_file, files, dates, register=True)
+    # 行列比較のため再segはOFF（マスクは warp 結果と一致させる）
+    results = build_series_from_saved(
+        per_file, files, dates, register=True, resegment_after_reg=False,
+    )
     assert len(results) == 3
     assert results[0]["is_reference"]
     ref_img = results[0]["image"]
@@ -90,13 +93,18 @@ def test_parallel_registration_matches_direct_calls(series_inputs):
         )
         assert np.allclose(row["reg_matrix"], direct["matrix"], atol=1e-4)
         assert np.array_equal(row["mask"], direct["mask"])
+        assert row["mask_source"] == "warp"
 
 
 def test_parallel_registration_is_deterministic(series_inputs):
     """同じ入力で2回ビルドしても行列・stats が一致する（並列順序に非依存）。"""
     per_file, files, dates = series_inputs
-    a = build_series_from_saved(per_file, files, dates, register=True)
-    b = build_series_from_saved(per_file, files, dates, register=True)
+    a = build_series_from_saved(
+        per_file, files, dates, register=True, resegment_after_reg=False,
+    )
+    b = build_series_from_saved(
+        per_file, files, dates, register=True, resegment_after_reg=False,
+    )
     for ra, rb in zip(a, b):
         assert np.allclose(ra["reg_matrix"], rb["reg_matrix"], atol=1e-4)
         assert ra["stats"]["area_mm2"] == rb["stats"]["area_mm2"]

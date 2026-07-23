@@ -40,12 +40,18 @@ def _foveal_correction_label(
 
 
 def _calibration_label(source: str | None, field_width_mm: float | None) -> str:
-    if source == "disc":
-        return "optic disc line"
+    from engine.calibration import calibration_source_label
+
     if source == "width":
         fw = _dash(field_width_mm)
         return f"field width ({fw} mm)"
-    return "-"
+    if not source:
+        return "-"
+    # disc / disc_1800um / dfd_4.76mm 等
+    label = calibration_source_label(source)
+    if label == "-":
+        return "-"
+    return label
 
 
 def gawain_figure_png_from_context(ctx: dict) -> bytes | None:
@@ -77,19 +83,26 @@ def build_batch_csv_bytes(
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow([
-        "date", "filename", "area_mm2", "area_mm_sqrt",
+        "case_id", "date", "exam_datetime", "filename",
+        "area_mm2", "area_mm_sqrt",
         "gawain", "dist_um", "lesion_count",
+        "calibration_source", "mask_source",
     ])
     for row in results:
-        s = row["stats"]
+        s = row.get("stats") or {}
+        exam_dt = row.get("exam_datetime") or row.get("date") or ""
         writer.writerow([
-            row["date"],
-            row["filename"],
+            row.get("case_id") or "",
+            row.get("date") or "",
+            exam_dt,
+            row.get("filename") or "",
             s.get("area_mm2"),
             s.get("area_mm_sqrt"),
             s.get("gawain"),
             s.get("dist_um"),
             s.get("lesion_count"),
+            row.get("calibration_source") or "",
+            row.get("mask_source") or "",
         ])
 
     if roi_qc:
@@ -147,6 +160,8 @@ def generate_pdf_report_bytes(
     foveal_correction_skipped: bool | None = None,
     foveal_correction_strength: float | None = None,
     roi_qc_note: str | None = None,
+    case_id: str | None = None,
+    exam_datetime: str | None = None,
 ) -> bytes:
     """1時点の解析結果 PDF（計測表 + オーバーレイ + 任意 GAWAIN 図）をバイト列で返す。
 
@@ -160,8 +175,14 @@ def generate_pdf_report_bytes(
     pdf.set_font("Helvetica", "B", 14)
     pdf.cell(0, 10, "GA Segmentation Pro - Analysis Report", new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", size=11)
+    if case_id:
+        pdf.cell(0, 7, f"Case: {_pdf_safe(case_id)}", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 7, f"File: {_pdf_safe(filename)}", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 7, f"Date: {_pdf_safe(date)}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(
+        0, 7,
+        f"Exam datetime: {_pdf_safe(exam_datetime or date)}",
+        new_x="LMARGIN", new_y="NEXT",
+    )
     pdf.ln(3)
 
     s = stats
