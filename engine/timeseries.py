@@ -349,6 +349,14 @@ def landmarks_from_snapshot(snap: dict) -> dict:
     return {"fovea_xy": fovea, "disc_pts": disc_pts, "disc_xy": disc_xy}
 
 
+def landmarks_ready_for_registration(snap: dict | None) -> bool:
+    """Registration 前ゲート: 各画像で乳頭（disc）と中心窩がユーザー確認済みか。"""
+    if not snap:
+        return False
+    lm = landmarks_from_snapshot(snap)
+    return lm.get("fovea_xy") is not None and lm.get("disc_xy") is not None
+
+
 def _maybe_resegment_aligned(
     img: np.ndarray,
     warped_mask: np.ndarray,

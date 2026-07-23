@@ -7,6 +7,7 @@ from engine.cases import (
     create_case,
     discover_cases,
     move_file_to_case,
+    move_files_to_case,
     ordered_case_ids,
 )
 
@@ -49,3 +50,23 @@ def test_create_and_move_case(tmp_path: Path):
     assert UNCLASSIFIED_CASE_ID not in cases or path not in cases.get(
         UNCLASSIFIED_CASE_ID, [],
     )
+
+
+def test_move_files_to_case_bulk(tmp_path: Path):
+    (tmp_path / "a.png").write_bytes(b"x")
+    (tmp_path / "b.png").write_bytes(b"x")
+    (tmp_path / "c.png").write_bytes(b"x")
+    cases = discover_cases(tmp_path)
+    cases, cid = create_case(cases, "caseB")
+    paths = list(cases[UNCLASSIFIED_CASE_ID])
+    assert len(paths) == 3
+    cases = move_files_to_case(
+        cases, paths[:2], UNCLASSIFIED_CASE_ID, cid,
+    )
+    assert {p.name for p in cases[cid]} == {"a.png", "b.png"}
+    assert [p.name for p in cases[UNCLASSIFIED_CASE_ID]] == ["c.png"]
+    cases = move_files_to_case(
+        cases, cases[UNCLASSIFIED_CASE_ID], UNCLASSIFIED_CASE_ID, cid,
+    )
+    assert len(cases[cid]) == 3
+    assert cases.get(UNCLASSIFIED_CASE_ID) == []

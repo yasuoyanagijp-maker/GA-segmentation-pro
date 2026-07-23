@@ -22,6 +22,8 @@ class GAAppState:
     case_id: str = UNCLASSIFIED_CASE_ID
     # case_id → その症例の確定スナップショット（切替時に stash/restore）
     case_results: dict[str, dict[str, dict]] = field(default_factory=dict)
+    # 症例へ一括移動する画像（filename → checked）
+    case_move_selected: dict[str, bool] = field(default_factory=dict)
 
     # False=独立解析（既定・registration なし） / True=時系列（症例内のみ）
     series_mode: bool = False
@@ -126,6 +128,7 @@ class GAAppState:
             self.estimated_growth_mm_sqrt_per_year = None
             self.per_file_results = {}
             self.series_selected = {}
+            self.case_move_selected = {}
             self.series_methods = {}
             self.series_dates_manual = {}
             self.series_date_source = {}

@@ -62,17 +62,34 @@ def move_file_to_case(
     to_case: str,
 ) -> dict[str, list[Path]]:
     """画像を症例間で移動した新しい cases dict を返す（パス自体は変えない）。"""
-    if from_case == to_case:
+    return move_files_to_case(cases, [path], from_case, to_case)
+
+
+def move_files_to_case(
+    cases: dict[str, list[Path]],
+    paths: list[Path],
+    from_case: str,
+    to_case: str,
+) -> dict[str, list[Path]]:
+    """複数画像を症例間で一括移動した新しい cases dict を返す（パス自体は変えない）。"""
+    if from_case == to_case or not paths:
         return cases
+    path_set = {Path(p) for p in paths}
     out: dict[str, list[Path]] = {
         cid: list(files) for cid, files in cases.items()
     }
     src = out.get(from_case) or []
-    out[from_case] = [p for p in src if p != path]
+    moved = [p for p in src if p in path_set]
+    if not moved:
+        return cases
+    out[from_case] = [p for p in src if p not in path_set]
     dest = list(out.get(to_case) or [])
-    if path not in dest:
-        dest.append(path)
-        dest.sort(key=lambda p: p.name.lower())
+    known = set(dest)
+    for p in moved:
+        if p not in known:
+            dest.append(p)
+            known.add(p)
+    dest.sort(key=lambda p: p.name.lower())
     out[to_case] = dest
     # 空になった症例は残す（ユーザーが再投入できるよう）。未分類以外の空は削除可。
     if from_case != UNCLASSIFIED_CASE_ID and not out[from_case]:

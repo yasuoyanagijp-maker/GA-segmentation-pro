@@ -20,7 +20,7 @@ from engine.cases import (
     UNCLASSIFIED_CASE_ID,
     create_case,
     discover_cases,
-    move_file_to_case,
+    move_files_to_case,
     ordered_case_ids,
 )
 from engine.io_utils import SUPPORTED_SUFFIXES, load_gray
@@ -65,6 +65,7 @@ from engine.timeseries import (
     series_metric_regressions,
     sync_date_to_snapshots,
     landmarks_from_snapshot,
+    landmarks_ready_for_registration,
     overlays_to_gif_bytes,
     reregister_timepoint,
 )
@@ -82,7 +83,7 @@ from flet_ui.theme import (
 )
 
 DISPLAY_WIDTH = 520
-APP_VERSION = "2026-07-23-case-series-v1"  # 画面右下に表示（コード反映確認用）
+APP_VERSION = "datetime-landmark-gate-2026-07-24"  # 画面右下に表示（コード反映確認用）
 # 未読込時のプレースホルダ（Flet Image は src か src_base64 が必須）
 EMPTY_PX = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
 
@@ -409,7 +410,28 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     )
     create_case_btn = btn_sidebar("症例を作成", on_click=lambda _: None, expand=True)
     move_case_dd = ft.Dropdown(
-        label="画像を症例へ移動", options=[], width=320, text_size=12,
+        label="移動先の症例", options=[], width=320, text_size=12,
+    )
+    case_move_list_col = ft.Column(spacing=2, scroll=ft.ScrollMode.AUTO, height=140)
+    case_select_all_btn = btn_outlined("すべて選択", on_click=lambda _: None)
+    case_deselect_all_btn = btn_outlined("選択解除", on_click=lambda _: None)
+    move_selected_btn = btn_sidebar(
+        "選択画像を症例へ移動", on_click=lambda _: None, expand=True,
+    )
+    case_move_section = ft.Column(
+        [
+            ft.Text(
+                "症例へ振り分け（複数選択可）",
+                size=12,
+                weight=ft.FontWeight.W_600,
+                color=T.PRIMARY,
+            ),
+            ft.Row([case_select_all_btn, case_deselect_all_btn], spacing=6),
+            case_move_list_col,
+            move_case_dd,
+            move_selected_btn,
+        ],
+        spacing=6,
     )
     prep_confirm_btn = btn_toolbar(
         "時系列準備として確定", on_click=lambda _: None,
@@ -419,9 +441,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         [
             ft.Text("時系列（検査日時）", size=12, weight=ft.FontWeight.W_600, color=T.PRIMARY),
             ft.Text(
-                "☑ = 時系列対象（準備確定または解析済み）。"
-                " 日時は EXIF → ファイル名。取れない場合は入力必須"
-                "（全画像の日時が揃うまで Registration 無効）。",
+                "手順: ①各画像の日時を入力し「確定」→ ②各画像で乳頭＋中心窩を確認し"
+                "「時系列準備として確定」→ ③ Registration。"
+                " 日時は EXIF/ファイル名。未取得は手動必須。",
                 size=10,
                 color=T.TEXT_MUTED,
             ),
@@ -431,6 +453,10 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         visible=False,
     )
     date_picker_target: dict[str, str | None] = {"fname": None}
+    # ignore=True while setting DatePicker.value programmatically (avoids apply loop)
+    date_picker_guard = {"ignore": False}
+    # skip=True while rebuilding dates Column (Checkbox on_change must not re-enter)
+    dates_ui_guard = {"skip": False, "gen": 0}
     date_picker = ft.DatePicker(
         first_date=datetime(1990, 1, 1),
         last_date=datetime(2035, 12, 31),
@@ -490,7 +516,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     # Blocks load_image while series is being built (covers page.update races
     # before series_results is assigned).
     series_guard = {"launching": False, "gen": 0, "roi_running": False}
-    registration_guard = {"running": False}
+    # gen: invalidate late call_soon_threadsafe progress callbacks after busy clears
+    registration_guard = {"running": False, "gen": 0}
     _registration_controls: dict = {"redo_btn": None}
     seg_correction_stats: dict | None = None
     # 遅延生成されるコントロール（registration 確認パネル等）への参照置き場。
@@ -710,6 +737,13 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         series_date_dd.visible = False
         prog_field.value = ""
         reg_apply_btn.visible = False
+        # Case-move / series exit: drop progress chrome; invalidate late ticks.
+        # In-flight registration finally still owns registration_guard["running"].
+        registration_guard["gen"] += 1
+        reg_progress_bar.visible = False
+        reg_progress_label.visible = False
+        reg_progress_bar.value = 0
+        reg_progress_label.value = ""
         if "reg_review_panel" in _ui:
             _ui["reg_review_panel"].visible = False
         if "roi_review_panel" in _ui:
@@ -727,6 +761,48 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 return False
         return True
 
+    def _selected_landmarks_ready() -> bool:
+        """選択対象の全画像で乳頭＋中心窩が準備確定済みか。"""
+        for fname in _selected_confirmed():
+            if not landmarks_ready_for_registration(state.per_file_results.get(fname)):
+                return False
+        return True
+
+    def _datetime_next_step_message(just_fname: str | None = None) -> str:
+        """日時入力直後の案内（次に何を押すか）。"""
+        n = len(state.files)
+        dates_pending = 0
+        lm_pending = 0
+        for f in state.files:
+            fname = f.name
+            src = state.series_date_source.get(fname)
+            if state.series_dates_manual.get(fname):
+                src = "manual"
+            if not state.series_dates.get(fname) or not is_datetime_source_confirmed(src):
+                dates_pending += 1
+            snap = state.per_file_results.get(fname)
+            if not landmarks_ready_for_registration(snap):
+                lm_pending += 1
+        prefix = f"{just_fname} の日時を確定。 " if just_fname else "日時を確定。 "
+        if dates_pending > 0:
+            return _safe_text(
+                f"{prefix}残り {dates_pending}/{n} 枚の日時を入力し「確定」"
+                " → 続けて各画像で乳頭＋中心窩を確認"
+            )
+        if lm_pending > 0:
+            return _safe_text(
+                f"{prefix}次: 各画像で①乳頭→②中心窩→「時系列準備として確定」"
+                f"（未準備 {lm_pending}/{n} 枚）"
+            )
+        if _selected_count() >= 2:
+            return _safe_text(
+                f"{prefix}全画像の日時・乳頭・中心窩が揃いました — "
+                "④ Registration を押してください"
+            )
+        return _safe_text(
+            f"{prefix}対象を2枚以上選択し、④ Registration へ"
+        )
+
     def _update_registration_controls() -> None:
         """時系列モード・Registration・QC トグルの表示を同期。"""
         series_mode_sw.value = state.series_mode
@@ -736,10 +812,12 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         reseg_after_reg_sw.value = state.series_resegment_enabled
         roi_correction_sw.value = state.series_roi_enabled
         dates_ok = _selected_dates_ready()
+        landmarks_ok = _selected_landmarks_ready()
         ready = (
             state.series_mode
             and _selected_count() >= 2
             and dates_ok
+            and landmarks_ok
             and not state.series_registered
             and not state.series_review_active
             and not state.series_roi_review_active
@@ -750,6 +828,10 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         if state.series_mode and _selected_count() >= 2 and not dates_ok:
             reg_apply_btn.tooltip = (
                 "全対象画像の検査日時を確定してください（EXIF/ファイル名/手動）"
+            )
+        elif state.series_mode and _selected_count() >= 2 and not landmarks_ok:
+            reg_apply_btn.tooltip = (
+                "全対象画像で乳頭（disc）と中心窩を確認し「時系列準備として確定」してください"
             )
         else:
             reg_apply_btn.tooltip = (
@@ -813,6 +895,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             and state.files
             and state.scale_um_px is not None
             and state.fovea_xy is not None
+            and state.disc_pts
+            and len(state.disc_pts) == 2
             and state.mode is None
         )
 
@@ -831,6 +915,10 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
 
     def _bind_select_toggle(fname: str):
         def _handler(e: ft.ControlEvent) -> None:
+            # Rebuilding the dates Column remounts Checkboxes; ignore those events
+            # or _update_batch_ui → refresh_series_dates_ui loops (UI 暴走).
+            if dates_ui_guard["skip"]:
+                return
             state.series_selected[fname] = bool(e.control.value)
             if state.series_results is not None or state.series_review_active:
                 _clear_series_display()
@@ -838,7 +926,17 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                     "対象画像を変更しました — ④ 時系列を再実行してください"
                 )
             _clear_reg_cache()
-            _update_batch_ui(refresh_dropdown=False)
+            # Update labels/buttons only — do NOT rebuild dates Column here.
+            series_ready = state.series_mode and _selected_count() >= 2
+            series_btn.visible = series_ready
+            series_launch_row.visible = state.series_mode and _batch_saved_count() >= 1
+            if series_ready:
+                label = _safe_text(
+                    f"Registration (選択 {_selected_count()}/{_batch_saved_count()})"
+                )
+                series_launch_btn.text = label
+                series_btn.text = label
+            _update_registration_controls()
             page.update()
         return _handler
 
@@ -1031,6 +1129,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         _invalidate_series_after_date_edit()
         refresh_series_dates_ui()
         _update_registration_controls()
+        # Explicit next-step guidance (日時入力だけでは Registration に進まない)
+        if not state.series_results:
+            _set_status(_datetime_next_step_message(just_fname=fname))
 
     def _ensure_selected_series_dates(selected_fnames: set[str]) -> None:
         """Registration 前: 自動推定は手動未設定のみ。全対象は series_dates を同期。"""
@@ -1073,19 +1174,39 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         _apply_series_datetime(fname, dt, manual=True)
 
     def _on_date_picker_change(e: ft.ControlEvent) -> None:
-        fname = date_picker_target["fname"]
-        val = e.control.value
-        if fname and val is not None:
-            picked = val.date() if isinstance(val, datetime) else val
-            _apply_series_date(fname, picked)
-        date_picker_target["fname"] = None
-        page.update()
+        if date_picker_guard["ignore"]:
+            return
+        try:
+            fname = date_picker_target["fname"]
+            val = e.control.value
+            if fname and val is not None:
+                picked = val.date() if isinstance(val, datetime) else val
+                _apply_series_date(fname, picked)
+        except Exception as exc:
+            _log.exception("date picker apply failed")
+            _set_status(f"日時設定エラー: {exc}")
+        finally:
+            date_picker_target["fname"] = None
+            try:
+                page.close(date_picker)
+            except Exception:
+                pass
+            page.update()
 
     def _open_date_picker(fname: str) -> None:
         date_picker_target["fname"] = fname
         iso = state.series_dates.get(fname)
-        if iso:
-            date_picker.value = datetime.fromisoformat(iso).date()
+        date_picker_guard["ignore"] = True
+        try:
+            if iso:
+                try:
+                    date_picker.value = datetime.fromisoformat(iso).date()
+                except ValueError:
+                    date_picker.value = None
+            else:
+                date_picker.value = None
+        finally:
+            date_picker_guard["ignore"] = False
         page.open(date_picker)
 
     def _bind_date_field_submit(fname: str):
@@ -1101,16 +1222,36 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             page.update()
         return _handler
 
+    def _bind_date_field_confirm(fname: str, field: ft.TextField):
+        """Enter 以外でも明示「確定」できるボタン用。"""
+        def _handler(_e: ft.ControlEvent) -> None:
+            raw = (field.value or "").strip()
+            try:
+                _apply_series_datetime_from_text(fname, raw)
+                field.error_text = None
+            except ValueError:
+                field.error_text = "YYYY-MM-DD または YYYY-MM-DD HH:MM"
+            page.update()
+        return _handler
+
     def _bind_date_picker_open(fname: str):
         def _handler(_e: ft.ControlEvent) -> None:
             _open_date_picker(fname)
         return _handler
 
     def refresh_series_dates_ui() -> None:
+        dates_ui_guard["gen"] += 1
+        gen = dates_ui_guard["gen"]
+        dates_ui_guard["skip"] = True
         series_dates_col.controls.clear()
         show = state.series_mode and len(state.files) >= 2
         series_dates_section.visible = show
         if not show:
+            async def _release_hidden() -> None:
+                await asyncio.sleep(0)
+                if dates_ui_guard["gen"] == gen:
+                    dates_ui_guard["skip"] = False
+            page.run_task(_release_hidden)
             return
         init_series_dates(state.files)
         for f in state.files:
@@ -1121,6 +1262,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 src = "manual"
             date_ok = is_datetime_source_confirmed(src)
             done = fname in state.per_file_results
+            lm_ready = landmarks_ready_for_registration(
+                state.per_file_results.get(fname) if done else None
+            )
             prep = bool(
                 done and (state.per_file_results[fname].get("prep_only")
                           or state.per_file_results[fname].get("mask") is None)
@@ -1134,6 +1278,10 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                     if lm.get("disc_xy"):
                         dx, dy = lm["disc_xy"]
                         lm_note += f" · 乳頭 ({dx:.0f},{dy:.0f})"
+                if not lm_ready:
+                    lm_note = (lm_note + " — " if lm_note else "") + "乳頭+中心窩の確認が必要"
+            elif date_ok:
+                lm_note = "次: ①乳頭 → ②中心窩 → 準備確定"
             src_label = {
                 "exif": "EXIF",
                 "filename": "ファイル名",
@@ -1141,6 +1289,16 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 "mtime": "要確認(mtime)",
                 "missing": "未入力",
             }.get(src, src or "未入力")
+            date_field = ft.TextField(
+                value=iso,
+                width=150,
+                text_size=12,
+                hint_text="YYYY-MM-DD HH:MM",
+                error_text=(
+                    None if date_ok else "日時を入力し「確定」"
+                ),
+                on_submit=_bind_date_field_submit(fname),
+            )
             series_dates_col.controls.append(
                 ft.Container(
                     content=ft.Column(
@@ -1149,24 +1307,24 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                                 [
                                     ft.Checkbox(
                                         value=_is_selected(fname),
-                                        disabled=not done,
+                                        disabled=not lm_ready,
                                         tooltip=(
                                             "時系列解析の対象に含める"
-                                            if done
-                                            else "先にランドマーク準備確定または③解析で確定"
+                                            if lm_ready
+                                            else "先に乳頭＋中心窩を確認し準備確定"
                                         ),
                                         on_change=_bind_select_toggle(fname),
                                         scale=0.85,
                                     ),
                                     ft.Icon(
-                                        ft.Icons.CHECK_CIRCLE if done else ft.Icons.RADIO_BUTTON_UNCHECKED,
+                                        ft.Icons.CHECK_CIRCLE if lm_ready else ft.Icons.RADIO_BUTTON_UNCHECKED,
                                         size=16,
-                                        color=T.ACCENT_GREEN if done else T.TEXT_MUTED,
+                                        color=T.ACCENT_GREEN if lm_ready else T.TEXT_MUTED,
                                     ),
                                     ft.Text(
                                         fname,
                                         size=10,
-                                        color=T.ACCENT_GREEN if done else T.TEXT_MUTED,
+                                        color=T.ACCENT_GREEN if lm_ready else T.TEXT_MUTED,
                                         max_lines=2,
                                         overflow=ft.TextOverflow.ELLIPSIS,
                                         expand=True,
@@ -1192,15 +1350,12 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                             ) if lm_note else ft.Container(height=0),
                             ft.Row(
                                 [
-                                    ft.TextField(
-                                        value=iso,
-                                        width=168,
-                                        text_size=12,
-                                        hint_text="YYYY-MM-DD HH:MM（必須）",
-                                        error_text=(
-                                            None if date_ok else "日時を確定してください"
-                                        ),
-                                        on_submit=_bind_date_field_submit(fname),
+                                    date_field,
+                                    ft.TextButton(
+                                        "確定",
+                                        tooltip="日時を確定（次のステップへ）",
+                                        on_click=_bind_date_field_confirm(fname, date_field),
+                                        style=ft.ButtonStyle(padding=4),
                                     ),
                                     ft.IconButton(
                                         icon=ft.Icons.CALENDAR_MONTH,
@@ -1219,6 +1374,15 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                     padding=ft.padding.only(bottom=4),
                 )
             )
+
+        async def _release_dates_guard() -> None:
+            # Hold through deferred Flet web on_change after page.update.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0.35)
+            if dates_ui_guard["gen"] == gen:
+                dates_ui_guard["skip"] = False
+
+        page.run_task(_release_dates_guard)
 
     date_picker.on_change = _on_date_picker_change
 
@@ -1699,6 +1863,12 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             _set_status("先に乳頭/スケールと中心窩を完了してください")
             page.update()
             return
+        if not state.disc_pts or len(state.disc_pts) != 2:
+            _set_status(
+                "Registration には各画像の乳頭確認が必要です — 「① 乳頭」で端点を指定"
+            )
+            page.update()
+            return
         if state.img_gray is None:
             _set_status("画像を読み込んでください")
             page.update()
@@ -1709,7 +1879,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             src = "manual"
         if not is_datetime_source_confirmed(src):
             _set_status(
-                "検査日時が未確定です — サイドバーで日時を入力/確定してから準備確定"
+                "検査日時が未確定です — サイドバーで日時を入力し「確定」してから準備確定"
             )
             page.update()
             return
@@ -1717,10 +1887,23 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.series_selected.setdefault(fname, True)
         saved = _batch_saved_count()
         selected = _selected_count()
+        n = len(state.files)
+        lm_left = sum(
+            1 for f in state.files
+            if not landmarks_ready_for_registration(state.per_file_results.get(f.name))
+        )
+        if lm_left > 0:
+            next_msg = f" — 「次へ ▶」で未準備 {lm_left}/{n} 枚の乳頭＋中心窩を確認"
+        elif not _selected_dates_ready():
+            next_msg = " — 残り画像の日時を確定してから Registration"
+        elif selected >= 2:
+            next_msg = " — ④ Registration を押してください"
+        else:
+            next_msg = " — 対象を2枚以上選択してください"
         _set_status(
             _safe_text(
-                f"準備確定 {saved}/{len(state.files)} · 対象 {selected} 枚"
-                " — 全対象の日時確定後に Registration"
+                f"準備確定 {saved}/{n} · 対象 {selected} 枚（乳頭＋中心窩確認済）"
+                f"{next_msg}"
             )
         )
         _update_batch_ui()
@@ -1926,7 +2109,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             except Exception as exc:
                 _log.exception("PDF export failed")
                 status.value = f"PDF エラー: {exc}"
-            page.update()
+            finally:
+                page.update()
 
         page.run_task(_export_pdf_task)
 
@@ -2464,6 +2648,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.cases = cases
         state.case_results = {}
         state.per_file_results = {}
+        state.case_move_selected = {}
         ids = ordered_case_ids(cases)
         if not ids:
             state.case_id = UNCLASSIFIED_CASE_ID
@@ -2486,11 +2671,56 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         case_dd.value = state.case_id if state.case_id in ids else (
             ids[0] if ids else None
         )
+        # 移動先は現在症例以外（同症例への移動は無意味）
+        dest_ids = [cid for cid in ids if cid != state.case_id]
         move_case_dd.options = [
-            ft.dropdown.Option(key=cid, text=_safe_text(cid)) for cid in ids
+            ft.dropdown.Option(key=cid, text=_safe_text(cid)) for cid in dest_ids
         ]
-        if state.case_id in ids:
-            move_case_dd.value = state.case_id
+        if move_case_dd.value not in dest_ids:
+            move_case_dd.value = dest_ids[0] if dest_ids else None
+        _refresh_case_move_list()
+
+    def _bind_case_move_toggle(fname: str):
+        def _handler(e: ft.ControlEvent) -> None:
+            state.case_move_selected[fname] = bool(e.control.value)
+            page.update()
+        return _handler
+
+    def _refresh_case_move_list() -> None:
+        """現在症例の画像チェックリストを再構築。"""
+        valid = {f.name for f in state.files}
+        state.case_move_selected = {
+            k: v for k, v in state.case_move_selected.items() if k in valid
+        }
+        case_move_list_col.controls.clear()
+        if not state.files:
+            case_move_list_col.controls.append(
+                ft.Text("（画像なし）", size=11, color=T.TEXT_MUTED),
+            )
+            return
+        for f in state.files:
+            fname = f.name
+            case_move_list_col.controls.append(
+                ft.Row(
+                    [
+                        ft.Checkbox(
+                            value=bool(state.case_move_selected.get(fname)),
+                            on_change=_bind_case_move_toggle(fname),
+                            scale=0.85,
+                        ),
+                        ft.Text(
+                            _safe_text(fname),
+                            size=11,
+                            color=T.TEXT,
+                            max_lines=1,
+                            overflow=ft.TextOverflow.ELLIPSIS,
+                            expand=True,
+                        ),
+                    ],
+                    spacing=4,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                )
+            )
 
     def _switch_case(new_case_id: str, *, load_first: bool = True) -> None:
         if not new_case_id or new_case_id == state.case_id:
@@ -2506,6 +2736,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.files = list(state.cases.get(new_case_id) or [])
         state.file_idx = 0
         state.series_selected = {}
+        state.case_move_selected = {}
         init_series_dates(state.files)
         if state.files and load_first:
             load_image_at(0, force=True)
@@ -2730,30 +2961,36 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         a_power = 0.5
         is_erase = state.mode == "seg_erase"
         base_gray = _overlay_base_gray()
-        while edit_state["pressing"]:
-            if base_gray is None or state.mask is None:
-                break
-            if is_erase:
-                preview, delta = erase_oversegmentation_from_mask(
-                    base_gray, state.mask, (ix, iy), a_power,
+        try:
+            while edit_state["pressing"]:
+                if base_gray is None or state.mask is None:
+                    break
+                if is_erase:
+                    preview, delta = erase_oversegmentation_from_mask(
+                        base_gray, state.mask, (ix, iy), a_power,
+                    )
+                    action = "削除"
+                else:
+                    preview, delta = expand_segmentation_from_mask(
+                        base_gray, state.mask, (ix, iy), a_power,
+                    )
+                    action = "追加"
+                edit_state["preview_mask"] = preview
+                if delta > 0:
+                    edit_state["changed"] = True
+                rgb = _build_rgb_frame(preview)
+                _push_image_rgb(rgb, do_update=True, jpeg_quality=72)
+                status.value = (
+                    f"{'Erase' if is_erase else 'Draw'}中… パワー {a_power:.1f}（{action} {delta}px）"
+                    if delta else f"{'Erase' if is_erase else 'Draw'}中… パワー {a_power:.1f}（拡大中）"
                 )
-                action = "削除"
-            else:
-                preview, delta = expand_segmentation_from_mask(
-                    base_gray, state.mask, (ix, iy), a_power,
-                )
-                action = "追加"
-            edit_state["preview_mask"] = preview
-            if delta > 0:
-                edit_state["changed"] = True
-            rgb = _build_rgb_frame(preview)
-            _push_image_rgb(rgb, do_update=True, jpeg_quality=72)
-            status.value = (
-                f"{'Erase' if is_erase else 'Draw'}中… パワー {a_power:.1f}（{action} {delta}px）"
-                if delta else f"{'Erase' if is_erase else 'Draw'}中… パワー {a_power:.1f}（拡大中）"
-            )
-            a_power = min(6.0, a_power + 0.2)
-            await asyncio.sleep(0.04)
+                a_power = min(6.0, a_power + 0.2)
+                await asyncio.sleep(0.04)
+        except Exception as exc:
+            _log.exception("continuous edit failed")
+            edit_state["pressing"] = False
+            _set_status(f"編集エラー: {exc}")
+            page.update()
 
     def _commit_edit_stroke() -> None:
         if edit_state["changed"] and edit_state["preview_mask"] is not None:
@@ -2877,7 +3114,31 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.foveal_correction_skipped = strength <= 0
         state.foveal_correction_strength = strength
         state.series_results = None
-        # OK → ③ 解析（セグメンテーション確認）へ自動進行
+        # 時系列モード: seg は Registration 後。ここでは準備確定を促す（自動 seg しない）。
+        if state.series_mode:
+            state.mode = None
+            fname = state.files[state.file_idx].name if state.files else ""
+            src = state.series_date_source.get(fname)
+            if state.series_dates_manual.get(fname):
+                src = "manual"
+            if not is_datetime_source_confirmed(src):
+                _set_status(
+                    "中心窩確認済み — サイドバーで日時を「確定」したあと"
+                    "「時系列準備として確定」を押してください"
+                )
+            else:
+                _set_status(
+                    "乳頭・中心窩を確認済み — 「時系列準備として確定」を押してください"
+                    "（seg は Registration 後）"
+                )
+            refresh_hint()
+            update_confirm_visibility()
+            refresh_image()
+            refresh_results()
+            _update_batch_ui()
+            page.update()
+            return
+        # 独立解析: OK → ③ 解析（セグメンテーション確認）へ自動進行
         _run_segmentation_review(status_prefix="解析")
         refresh_hint()
         update_confirm_visibility()
@@ -2892,6 +3153,18 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.foveal_correction_applied = False
         state.foveal_correction_skipped = True
         state.series_results = None
+        if state.series_mode:
+            state.mode = None
+            _set_status(
+                "中心窩確定（補正スキップ）— 「時系列準備として確定」を押してください"
+            )
+            refresh_hint()
+            update_confirm_visibility()
+            refresh_image()
+            refresh_results()
+            _update_batch_ui()
+            page.update()
+            return
         _run_segmentation_review()
         refresh_hint()
         update_confirm_visibility()
@@ -3609,18 +3882,31 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             _set_status("全時点の位置合わせを確認しました — 「確認完了」で結果表示へ")
         page.update()
 
-    def _set_registration_busy(busy: bool) -> None:
+    def _set_registration_busy(busy: bool) -> int:
+        """位置合わせ busy を設定。戻り値は進捗コールバック無効化用の世代。"""
+        registration_guard["gen"] += 1
         registration_guard["running"] = busy
+        gen = int(registration_guard["gen"])
         reg_apply_btn.disabled = busy
         redo = _registration_controls.get("redo_btn")
         if redo is not None:
             redo.disabled = busy
         if not busy:
+            # Hide progress UI; bump gen above already invalidated late threadsafe ticks
             reg_progress_bar.visible = False
             reg_progress_label.visible = False
+            reg_progress_bar.value = 0
+            reg_progress_label.value = ""
+        return gen
 
-    def _show_registration_progress(done: int, total: int, label: str) -> None:
+    def _show_registration_progress(
+        done: int, total: int, label: str, *, gen: int | None = None,
+    ) -> None:
         """位置合わせ進捗をステータス＋バーに反映（メインスレッド想定）。"""
+        if not registration_guard["running"]:
+            return
+        if gen is not None and gen != registration_guard["gen"]:
+            return
         total = max(int(total), 1)
         done = max(0, min(int(done), total))
         reg_progress_bar.value = done / total
@@ -3915,11 +4201,6 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             page.update()
             try:
                 out = await asyncio.to_thread(apply_roi_correction_to_series, results)
-            except Exception as exc:
-                _log.exception("ROI correction failed")
-                _set_status(f"ROI補正エラー: {exc}")
-                _finish_to_series_results_view()
-            else:
                 if state.series_results is not results:
                     # 適用中に時系列が破棄/再構築された — 結果は捨てる
                     return
@@ -3961,6 +4242,10 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                             f"時系列表示 ({len(out['results'])} 時点) "
                             "— マスクQC補正: 異常なし（マスク変更なし）"
                         ))
+            except Exception as exc:
+                _log.exception("ROI correction failed")
+                _set_status(f"ROI補正エラー: {exc}")
+                _finish_to_series_results_view()
             finally:
                 series_guard["roi_running"] = False
                 page.update()
@@ -3984,28 +4269,37 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             results = state.series_results or []
             if not results:
                 return
-            if state.series_resegment_enabled:
-                _set_status("整列空間でセグメンテーション中…")
-                page.update()
-                try:
-                    results = await asyncio.to_thread(
-                        segment_aligned_series, results, allow_warp_fallback=True,
-                    )
-                except Exception as exc:
-                    _set_status(f"整列後 seg エラー: {exc}")
+            try:
+                if state.series_resegment_enabled:
+                    _set_status("整列空間でセグメンテーション中…")
                     page.update()
-                    return
-                results = _tag_series_case_id(results)
-                overlays = await asyncio.to_thread(
-                    lambda: [_row_overlay(row) for row in results],
-                )
-                _apply_series_results(
-                    results, landing_filename=landing_filename, overlays=overlays,
-                )
-            else:
-                results = _tag_series_case_id(results)
-                state.series_results = results
-            _run_roi_correction_after_registration()
+                    try:
+                        results = await asyncio.to_thread(
+                            segment_aligned_series,
+                            results,
+                            allow_warp_fallback=True,
+                        )
+                    except Exception as exc:
+                        _set_status(f"整列後 seg エラー: {exc}")
+                        return
+                    results = _tag_series_case_id(results)
+                    overlays = await asyncio.to_thread(
+                        lambda: [_row_overlay(row) for row in results],
+                    )
+                    _apply_series_results(
+                        results,
+                        landing_filename=landing_filename,
+                        overlays=overlays,
+                    )
+                else:
+                    results = _tag_series_case_id(results)
+                    state.series_results = results
+                _run_roi_correction_after_registration()
+            except Exception as exc:
+                _log.exception("aligned pipeline failed")
+                _set_status(f"整列後処理エラー: {exc}")
+            finally:
+                page.update()
 
         page.run_task(_pipeline)
 
@@ -4073,7 +4367,17 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         if not _selected_dates_ready():
             _finish_launch_guard()
             _set_status(
-                "全対象画像の検査日時を確定してください（EXIF/ファイル名/手動）"
+                "全対象画像の検査日時を確定してください（入力後「確定」）"
+            )
+            refresh_series_dates_ui()
+            _update_registration_controls()
+            page.update()
+            return
+        if not _selected_landmarks_ready():
+            _finish_launch_guard()
+            _set_status(
+                "Registration 前に、対象の各画像で乳頭と中心窩を確認し"
+                "「時系列準備として確定」してください"
             )
             refresh_series_dates_ui()
             _update_registration_controls()
@@ -4095,7 +4399,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         )
 
         async def _registration_task() -> None:
-            _set_registration_busy(True)
+            busy_gen = _set_registration_busy(True)
             proceed_to_seg = False
             loop = asyncio.get_running_loop()
             if prior_matrices:
@@ -4110,7 +4414,15 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
 
             def _on_progress(done: int, total: int, label: str) -> None:
                 def _apply() -> None:
-                    _show_registration_progress(done, total, label)
+                    # Ignore ticks after finally cleared busy (classic stuck bar).
+                    if (
+                        not registration_guard["running"]
+                        or registration_guard["gen"] != busy_gen
+                    ):
+                        return
+                    _show_registration_progress(
+                        done, total, label, gen=busy_gen,
+                    )
                     page.update()
 
                 try:
@@ -4138,35 +4450,39 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             except Exception as exc:
                 _set_status(f"位置合わせエラー: {exc}")
             else:
-                overlays = await asyncio.to_thread(
-                    lambda: [_row_overlay(row) for row in results],
-                )
-                _apply_series_results(
-                    results, landing_filename=prefer, overlays=overlays,
-                )
-                if prior_matrices and cache_confirmed:
-                    state.series_review_active = False
-                    state.series_registered = True
-                    _stash_reg_cache_from_series()
-                    _refresh_review_panel()
-                    proceed_to_seg = True
-                else:
-                    state.series_review_active = True
-                    state.series_review_idx = 1 if len(results) > 1 else 0
-                    view_mode.visible = False
-                    series_date_dd.visible = False
-                    _update_registration_controls()
-                    reused_note = (
-                        "（行列再利用・要確認）" if prior_matrices else ""
+                try:
+                    overlays = await asyncio.to_thread(
+                        lambda: [_row_overlay(row) for row in results],
                     )
-                    _set_status(_safe_text(
-                        f"位置合わせ確認 ({len(results)} 時点 / 対象 {selected} 枚)"
-                        f"{reused_note}"
-                        " — 各時点で OK / やり直し → 確認完了後に seg"
-                    ))
-                    _enter_registration_review()
-                _update_batch_ui(refresh_dropdown=False)
-                _refresh_file_dropdown_labels()
+                    _apply_series_results(
+                        results, landing_filename=prefer, overlays=overlays,
+                    )
+                    if prior_matrices and cache_confirmed:
+                        state.series_review_active = False
+                        state.series_registered = True
+                        _stash_reg_cache_from_series()
+                        _refresh_review_panel()
+                        proceed_to_seg = True
+                    else:
+                        state.series_review_active = True
+                        state.series_review_idx = 1 if len(results) > 1 else 0
+                        view_mode.visible = False
+                        series_date_dd.visible = False
+                        _update_registration_controls()
+                        reused_note = (
+                            "（行列再利用・要確認）" if prior_matrices else ""
+                        )
+                        _set_status(_safe_text(
+                            f"位置合わせ確認 ({len(results)} 時点 / 対象 {selected} 枚)"
+                            f"{reused_note}"
+                            " — 各時点で OK / やり直し → 確認完了後に seg"
+                        ))
+                        _enter_registration_review()
+                    _update_batch_ui(refresh_dropdown=False)
+                    _refresh_file_dropdown_labels()
+                except Exception as exc:
+                    _log.exception("registration post-process failed")
+                    _set_status(f"位置合わせ後処理エラー: {exc}")
             finally:
                 _finish_launch_guard()
                 _set_registration_busy(False)
@@ -4182,10 +4498,21 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         if not state.series_mode:
             _clear_series_display()
             _clear_reg_cache()
+            # Hide progress UI immediately; invalidate late progress ticks.
+            # Do not clear running here — in-flight task finally owns that.
+            registration_guard["gen"] += 1
+            reg_progress_bar.visible = False
+            reg_progress_label.visible = False
+            reg_progress_bar.value = 0
+            reg_progress_label.value = ""
+            if not registration_guard["running"]:
+                series_guard["launching"] = False
+                series_guard["roi_running"] = False
             _set_status("独立解析モード — 各画像で landmark → scale → seg → 測定")
         else:
             _set_status(
-                "時系列モード — landmark → 日時確定 → Registration → 整列QC → seg"
+                "時系列モード — 日時「確定」→ 各画像で乳頭＋中心窩→準備確定"
+                " → Registration → 整列QC → seg"
             )
         _update_batch_ui()
         page.update()
@@ -4235,7 +4562,15 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         refresh_series_dates_ui()
         if not _selected_dates_ready():
             _set_status(
-                "全対象画像の検査日時を確定してください（EXIF/ファイル名/手動）"
+                "全対象画像の検査日時を確定してください（入力後「確定」）"
+            )
+            _update_registration_controls()
+            page.update()
+            return
+        if not _selected_landmarks_ready():
+            _set_status(
+                "Registration 前に、対象の各画像で乳頭（disc）と中心窩を確認し"
+                "「時系列準備として確定」してください"
             )
             _update_registration_controls()
             page.update()
@@ -4690,44 +5025,89 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.cases, cid = create_case(state.cases, name)
         new_case_field.value = ""
         _switch_case(cid)
-        _set_status(_safe_text(f"症例「{cid}」を作成 — 画像を移動して振り分けてください"))
+        _set_status(_safe_text(f"症例「{cid}」を作成 — 画像を選択して振り分けてください"))
         page.update()
 
-    def on_move_case(e: ft.ControlEvent) -> None:
-        to_case = e.control.value
-        if not to_case or not state.files:
+    def on_case_select_all(_=None) -> None:
+        for f in state.files:
+            state.case_move_selected[f.name] = True
+        _refresh_case_move_list()
+        page.update()
+
+    def on_case_deselect_all(_=None) -> None:
+        state.case_move_selected = {}
+        _refresh_case_move_list()
+        page.update()
+
+    def on_move_selected(_=None) -> None:
+        to_case = move_case_dd.value
+        if not to_case:
+            _set_status("移動先の症例を選んでください（先に症例を作成）")
+            page.update()
             return
-        path = state.files[state.file_idx]
         from_case = state.case_id
         if to_case == from_case:
+            _set_status("移動先は現在の症例と異なるものを選んでください")
+            page.update()
             return
-        # 移動前に現在症例の結果を退避し、ファイルのスナップも持ち越し
-        state.stash_current_case_results()
-        snap = state.per_file_results.pop(path.name, None)
-        state.cases = move_file_to_case(state.cases, path, from_case, to_case)
-        state.case_results[from_case] = dict(state.per_file_results)
-        dest = dict(state.case_results.get(to_case) or {})
-        if snap is not None:
-            snap["case_id"] = to_case
-            dest[path.name] = snap
-        state.case_results[to_case] = dest
-        # 移動先へ切替
-        state.case_id = to_case
-        state.restore_case_results(to_case)
-        state.files = list(state.cases.get(to_case) or [])
-        state.file_idx = next(
-            (i for i, f in enumerate(state.files) if f == path), 0,
-        )
-        init_series_dates(state.files)
-        if state.files:
-            load_image_at(state.file_idx, force=True)
-        _set_status(_safe_text(f"{path.name} を「{to_case}」へ移動"))
-        _update_batch_ui()
-        page.update()
+        selected_paths = [
+            f for f in state.files
+            if state.case_move_selected.get(f.name)
+        ]
+        if not selected_paths:
+            _set_status("移動する画像にチェックを入れてください")
+            page.update()
+            return
+        try:
+            # 移動前に現在症例の結果を退避し、各ファイルのスナップを持ち越し
+            state.stash_current_case_results()
+            snaps: dict[str, dict] = {}
+            for path in selected_paths:
+                snap = state.per_file_results.pop(path.name, None)
+                if snap is not None:
+                    snaps[path.name] = snap
+            state.cases = move_files_to_case(
+                state.cases, selected_paths, from_case, to_case,
+            )
+            state.case_results[from_case] = dict(state.per_file_results)
+            dest = dict(state.case_results.get(to_case) or {})
+            for fname, snap in snaps.items():
+                snap["case_id"] = to_case
+                dest[fname] = snap
+            state.case_results[to_case] = dest
+            state.case_move_selected = {}
+            _clear_series_display()
+            _clear_reg_cache()
+            # 移動先へ切替（症例 isolation を維持）
+            state.case_id = to_case
+            state.restore_case_results(to_case)
+            state.files = list(state.cases.get(to_case) or [])
+            focus = selected_paths[0]
+            state.file_idx = next(
+                (i for i, f in enumerate(state.files) if f == focus), 0,
+            )
+            state.series_selected = {}
+            init_series_dates(state.files)
+            if state.files:
+                load_image_at(state.file_idx, force=True)
+            n = len(selected_paths)
+            names = ", ".join(p.name for p in selected_paths[:3])
+            if n > 3:
+                names += f" 他{n - 3}枚"
+            _set_status(_safe_text(f"{n} 枚を「{to_case}」へ移動（{names}）"))
+            _update_batch_ui()
+        except Exception as exc:
+            _log.exception("case move failed")
+            _set_status(f"症例移動エラー: {exc}")
+        finally:
+            # Always refresh; _clear_series_display already hid progress chrome.
+            page.update()
 
     case_dd.on_change = on_case_change
     create_case_btn.on_click = on_create_case
-    move_case_dd.on_change = on_move_case
+    case_select_all_btn.on_click = on_case_select_all
+    case_deselect_all_btn.on_click = on_case_deselect_all
+    move_selected_btn.on_click = on_move_selected
 
     sidebar = ft.Column(
         [
@@ -4737,7 +5117,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             btn_sidebar("画像リストを読込", on_click=on_load_files, expand=True),
             case_dd,
             ft.Row([new_case_field, create_case_btn], spacing=6),
-            move_case_dd,
+            case_move_section,
             series_mode_sw,
             file_dd,
             series_dates_section,
@@ -4798,52 +5178,69 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
 
     async def _deferred_auto_load() -> None:
         import os
-        await asyncio.sleep(0.05)
-        auto_dir = os.environ.get("GA_INPUT_DIR", "").strip()
-        if not auto_dir:
-            return
-        input_field.value = auto_dir
-        folder = Path(auto_dir)
-        state.input_dir = auto_dir
-        state.output_dir = output_field.value.strip()
-        cases = await asyncio.to_thread(discover_cases, folder)
-        state.cases = cases
-        state.case_results = {}
-        ids = ordered_case_ids(cases)
-        if ids:
-            prefer = next((c for c in ids if c != UNCLASSIFIED_CASE_ID), ids[0])
-            state.case_id = prefer
-            state.files = list(cases.get(prefer) or [])
-        else:
-            state.case_id = UNCLASSIFIED_CASE_ID
-            state.files = []
-        init_series_dates(state.files)
-        refresh_series_dates_ui()
-        if state.files:
-            path = state.files[0]
-            gray = await asyncio.to_thread(load_gray, path)
-            state.reset_analysis(keep_series=True)
-            state.reset_per_image()
-            state.img_full = gray
-            state.img_gray = gray.copy()
-            state.crop_box = None
-            state.crop_pts = []
-            _refresh_image_width_label()
-            _refresh_scale_info()
-            _refresh_file_dropdown()
-            refresh_image()
-            n_cases = len(state.cases)
-            n_files = sum(len(v) for v in state.cases.values())
-            _set_status(
-                _safe_text(
-                    f"{n_cases} 症例 / {n_files} 枚（現在: {state.case_id}）"
+        try:
+            await asyncio.sleep(0.05)
+            auto_dir = os.environ.get("GA_INPUT_DIR", "").strip()
+            if not auto_dir:
+                return
+            input_field.value = auto_dir
+            folder = Path(auto_dir)
+            state.input_dir = auto_dir
+            state.output_dir = output_field.value.strip()
+            cases = await asyncio.to_thread(discover_cases, folder)
+            state.cases = cases
+            state.case_results = {}
+            ids = ordered_case_ids(cases)
+            if ids:
+                prefer = next(
+                    (c for c in ids if c != UNCLASSIFIED_CASE_ID), ids[0],
                 )
-            )
-        else:
-            _set_status(f"画像なし: {folder}")
-            state.img_gray = None
-            refresh_image()
-        _update_batch_ui()
-        page.update()
+                state.case_id = prefer
+                state.files = list(cases.get(prefer) or [])
+            else:
+                state.case_id = UNCLASSIFIED_CASE_ID
+                state.files = []
+            init_series_dates(state.files)
+            refresh_series_dates_ui()
+            if state.files:
+                path = state.files[0]
+                gray = await asyncio.to_thread(load_gray, path)
+                state.reset_analysis(keep_series=True)
+                state.reset_per_image()
+                state.img_full = gray
+                state.img_gray = gray.copy()
+                state.crop_box = None
+                state.crop_pts = []
+                _refresh_image_width_label()
+                _refresh_scale_info()
+                _refresh_file_dropdown()
+                refresh_image()
+                n_cases = len(state.cases)
+                n_files = sum(len(v) for v in state.cases.values())
+                _set_status(
+                    _safe_text(
+                        f"{n_cases} 症例 / {n_files} 枚（現在: {state.case_id}）"
+                    )
+                )
+            else:
+                _set_status(f"画像なし: {folder}")
+                state.img_gray = None
+                refresh_image()
+            _update_batch_ui()
+        except Exception as exc:
+            _log.exception("deferred auto-load failed")
+            _set_status(f"自動読込エラー: {exc}")
+        finally:
+            # Ensure progress chrome is not left visible after autoload.
+            if not registration_guard["running"]:
+                registration_guard["gen"] += 1
+                reg_progress_bar.visible = False
+                reg_progress_label.visible = False
+                reg_progress_bar.value = 0
+                reg_progress_label.value = ""
+            try:
+                page.update()
+            except Exception:
+                pass
 
     page.run_task(_deferred_auto_load)

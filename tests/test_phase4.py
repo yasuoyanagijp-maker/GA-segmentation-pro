@@ -31,6 +31,26 @@ def test_extract_image_datetime_filename_confirmed():
     assert is_datetime_source_confirmed("manual")
 
 
+def test_landmarks_ready_for_registration():
+    from engine.timeseries import landmarks_ready_for_registration
+
+    assert not landmarks_ready_for_registration(None)
+    assert not landmarks_ready_for_registration({})
+    assert not landmarks_ready_for_registration({"fovea_xy": (10.0, 20.0)})
+    assert not landmarks_ready_for_registration(
+        {"disc_pts": [(0.0, 0.0), (10.0, 0.0)]}
+    )
+    assert landmarks_ready_for_registration(
+        {
+            "fovea_xy": (50.0, 60.0),
+            "disc_pts": [(0.0, 0.0), (10.0, 0.0)],
+        }
+    )
+    assert landmarks_ready_for_registration(
+        {"fovea_xy": (1.0, 2.0), "disc_xy": (3.0, 4.0)}
+    )
+
+
 def test_estimate_progression_rate_positive():
     results = [
         {'date': '2020-01-01', 'stats': {'dist_um': 200.0}},
