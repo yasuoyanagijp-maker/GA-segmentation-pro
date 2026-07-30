@@ -19,8 +19,9 @@ server_healthy() {
     curl -sf --max-time 2 "http://127.0.0.1:${FLET_PORT}/" >/dev/null 2>&1 || return 1
     # HTTP 200 alone is not enough: zombie/stuck Flet can still serve static HTML
     # while the websocket never delivers the first frame (browser spinner forever).
+    # Count LISTEN only — plain lsof -ti also includes browser client sockets.
     local pids
-    pids=$(lsof -ti :"${FLET_PORT}" 2>/dev/null | sort -u)
+    pids=$(lsof -tiTCP:"${FLET_PORT}" -sTCP:LISTEN 2>/dev/null | sort -u)
     [ -n "$pids" ] || return 1
     local count
     count=$(echo "$pids" | wc -l | tr -d ' ')
@@ -35,16 +36,25 @@ open_browser() {
 cleanup_port() {
     local port=$1
     local pid
+    local i
     # 古い Flet プロセスが残るとブラウザがグルグルのままになる
     pkill -f "[f]let run.*${port}" 2>/dev/null || true
+    pkill -f "[f]let.*${port}" 2>/dev/null || true
     pkill -f "[G]A-segmentation-pro/main_app.py" 2>/dev/null || true
+    pkill -f "[m]ain_app.py" 2>/dev/null || true
     sleep 1
-    while read -r pid; do
-        [ -n "$pid" ] || continue
-        echo "Port $port in use (PID $pid) — cleaning up"
-        kill -9 "$pid" 2>/dev/null || true
-    done < <(lsof -ti :"$port" 2>/dev/null | sort -u)
-    sleep 1
+    for i in 1 2 3 4 5 6 8; do
+        local left
+        # LISTEN + any leftover holders on the port
+        left=$(lsof -tiTCP:"$port" 2>/dev/null | sort -u || true)
+        [ -z "$left" ] && break
+        while read -r pid; do
+            [ -n "$pid" ] || continue
+            echo "Port $port in use (PID $pid) — cleaning up"
+            kill -9 "$pid" 2>/dev/null || true
+        done <<< "$left"
+        sleep 1
+    done
 }
 
 # 既に正常起動中なら kill せずブラウザだけ開く（古いタブのグルグル化を防ぐ）

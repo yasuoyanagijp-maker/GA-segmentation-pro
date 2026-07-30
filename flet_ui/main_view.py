@@ -27,9 +27,13 @@ from engine.io_utils import SUPPORTED_SUFFIXES, load_gray
 from engine.life_table import LIFE_TABLE_SOURCE, format_life_expectancy, life_expectancy_years
 from engine.overlay import make_overlay
 from engine.region_growing import (
+    GROW_MODE_CV,
+    GROW_MODE_LSF,
+    GROW_MODE_STANDARD,
     clear_mask_in_freehand_region,
     erase_oversegmentation_from_mask,
     expand_segmentation_from_mask,
+    refine_mask_chan_vese_light,
 )
 from engine.export import (
     build_batch_csv_bytes,
@@ -83,7 +87,26 @@ from flet_ui.theme import (
 )
 
 DISPLAY_WIDTH = 520
-APP_VERSION = "datetime-landmark-gate-2026-07-24"  # 画面右下に表示（コード反映確認用）
+APP_VERSION = "auto-cv-refine-2026-07-30"  # 画面右下に表示（コード反映確認用）
+
+# Auto-seg パラメータ調整（seg_param）既定値・プレビュー debounce
+_SEG_PARAM_DEFAULTS = {
+    "clahe_clip": 2.0,
+    "macula_radius_mm": 6.0,
+    "seg_min_size": 500,
+}
+_SEG_PREVIEW_DEBOUNCE_S = 0.25
+
+# Phase A: continuous grow の a ランプ（Wang 風: 序盤やや速く → 後半締め）
+# a_start が小さすぎると境界クリックで μ±aσ がシードを外し無成長になる
+_GROW_A_MAX = 2.6
+_GROW_A_START = 0.9
+_GROW_DEBOUNCE_S = 0.08
+_GROW_MODE_LABELS = {
+    GROW_MODE_STANDARD: "標準（安全成長）",
+    GROW_MODE_LSF: "局所類似 (LSF)",
+    GROW_MODE_CV: "確定後CV精緻化",
+}
 # 未読込時のプレースホルダ（Flet Image は src か src_base64 が必須）
 EMPTY_PX = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
 
@@ -102,6 +125,41 @@ def _b64_jpeg(rgb: np.ndarray, quality: int = 85) -> str:
     if not ok:
         raise RuntimeError("画像エンコードに失敗しました")
     return base64.b64encode(buf).decode("ascii")
+
+
+def compute_display_box(img_w: int, img_h: int, box_w: int = DISPLAY_WIDTH) -> tuple[int, int]:
+    """Image pixel size → widget box size (width-fixed, height from aspect)."""
+    if img_w <= 0 or img_h <= 0 or box_w <= 0:
+        return max(1, box_w), 1
+    disp_h = max(1, int(round(img_h * box_w / img_w)))
+    return box_w, disp_h
+
+
+def local_to_image_xy(
+    local_x: float,
+    local_y: float,
+    *,
+    img_w: int,
+    img_h: int,
+    box_w: float,
+    box_h: float,
+    off_x: float = 0.0,
+    off_y: float = 0.0,
+) -> tuple[float, float]:
+    """Widget/tap coords → image pixel coords (shared by disc drag + fovea tap).
+
+    Display buffer is painted into ``box_w x box_h`` (letterbox offsets optional).
+    Mapping must match how overlays are resized into that same box.
+    """
+    if img_w <= 0 or img_h <= 0 or box_w <= 0 or box_h <= 0:
+        return 0.0, 0.0
+    scale_x = float(box_w) / float(img_w)
+    scale_y = float(box_h) / float(img_h)
+    ox = (float(local_x) - float(off_x)) / scale_x
+    oy = (float(local_y) - float(off_y)) / scale_y
+    ox = max(0.0, min(float(img_w - 1), ox))
+    oy = max(0.0, min(float(img_h - 1), oy))
+    return ox, oy
 
 
 def _safe_text(text: str) -> str:
@@ -289,10 +347,12 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     await asyncio.sleep(0)
     status = ft.Text("", color=T.ACCENT_AMBER, size=13)
     hint = ft.Text("", color=T.TEXT_MUTED, size=13)
+    # FILL: display buffer is pre-resized to the widget box — no CONTAIN letterboxing.
     img_ctrl = ft.Image(
-        src_base64=EMPTY_PX, fit=ft.ImageFit.CONTAIN, width=DISPLAY_WIDTH, height=200,
+        src_base64=EMPTY_PX, fit=ft.ImageFit.FILL, width=DISPLAY_WIDTH, height=200,
     )
-    results_col = ft.Column(spacing=8, expand=True, scroll=ft.ScrollMode.AUTO)
+    # No expand here: nested expand+scroll Columns hung Flet web (endless spinner).
+    results_col = ft.Column(spacing=8, scroll=ft.ScrollMode.AUTO)
     file_dd = ft.Dropdown(label="画像選択", options=[], width=320, text_size=13)
     input_field = ft.TextField(
         label="入力フォルダ", expand=True, value=state.input_dir or str(Path.home() / "Downloads"),
@@ -396,6 +456,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     )
     reg_apply_btn = btn_toolbar("Registration", on_click=lambda _: None)
     reg_apply_btn.visible = False
+    # value must stay numeric: None ⇒ indeterminate (endless spinner on web).
+    # Keep outside series_launch_row: toggling that parent remounted a stale bar
+    # after ③解析/OK and looked like a runaway spinner.
     reg_progress_bar = ft.ProgressBar(
         value=0,
         bar_height=8,
@@ -404,6 +467,11 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         visible=False,
     )
     reg_progress_label = ft.Text("", size=11, color=T.TEXT_MUTED, visible=False)
+    progress_chrome = ft.Column(
+        [reg_progress_label, reg_progress_bar],
+        spacing=4,
+        visible=False,
+    )
     case_dd = ft.Dropdown(label="症例", options=[], width=320, text_size=13)
     new_case_field = ft.TextField(
         label="新規症例名", width=200, text_size=12, hint_text="例: patient3",
@@ -483,7 +551,29 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         ],
         text_size=12,
     )
-    gif_img = ft.Image(visible=False, fit=ft.ImageFit.CONTAIN, width=DISPLAY_WIDTH)
+    # seg_param パネル用スライダー（高影響パラメータのみ）
+    clahe_clip_slider = ft.Slider(
+        min=1.0, max=6.0, value=2.0, divisions=10,
+        label="{value}",
+        width=280,
+    )
+    macula_radius_slider = ft.Slider(
+        min=3.0, max=9.0, value=6.0, divisions=12,
+        label="{value} mm",
+        width=280,
+    )
+    min_size_slider = ft.Slider(
+        min=100, max=2000, value=500, divisions=19,
+        label="{value} px",
+        width=280,
+    )
+    seg_auto_cv_sw = ft.Switch(
+        label="自動CV精緻化",
+        value=True,
+    )
+    gif_img = ft.Image(
+        visible=False, fit=ft.ImageFit.FILL, width=DISPLAY_WIDTH, height=200,
+    )
     graph_area = ft.Column(visible=False)
     graph_metric_dd = ft.Dropdown(
         label="表示する指標",
@@ -498,8 +588,15 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         ],
     )
 
-    disp_scale = {"v": 1.0}
-    disp_size = {"w": DISPLAY_WIDTH, "h": 200}
+    # Shared widget↔image transform (must match _push_image_rgb and all tap/drag paths).
+    disp_xform = {
+        "img_w": 1,
+        "img_h": 1,
+        "box_w": float(DISPLAY_WIDTH),
+        "box_h": 200.0,
+        "off_x": 0.0,
+        "off_y": 0.0,
+    }
     drag = {"active": False, "start": (0.0, 0.0)}
     edit_state = {
         "pressing": False,
@@ -518,13 +615,29 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     series_guard = {"launching": False, "gen": 0, "roi_running": False}
     # gen: invalidate late call_soon_threadsafe progress callbacks after busy clears
     registration_guard = {"running": False, "gen": 0}
+    # Single-image ③解析 / reanalyze: same class of stuck ProgressBar bugs.
+    seg_guard = {"running": False, "gen": 0}
+    # seg_param リアルタイムプレビュー（フル busy スピナーは使わない）
+    seg_preview_guard = {"gen": 0}
     _registration_controls: dict = {"redo_btn": None}
     seg_correction_stats: dict | None = None
     # 遅延生成されるコントロール（registration 確認パネル等）への参照置き場。
     _ui: dict = {}
+    analyze_btn_ref: dict = {"btn": None}
 
     def _set_status(msg: str) -> None:
         status.value = _safe_text(msg)
+
+    def _clear_progress_chrome(*, invalidate_ticks: bool = True) -> None:
+        """Hide ProgressBar/label and drop stale late ticks (never leave indeterminate)."""
+        if invalidate_ticks:
+            registration_guard["gen"] += 1
+            seg_guard["gen"] += 1
+        reg_progress_bar.visible = False
+        reg_progress_label.visible = False
+        reg_progress_bar.value = 0
+        reg_progress_label.value = ""
+        progress_chrome.visible = False
 
     def _batch_saved_count() -> int:
         if not state.files:
@@ -739,11 +852,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         reg_apply_btn.visible = False
         # Case-move / series exit: drop progress chrome; invalidate late ticks.
         # In-flight registration finally still owns registration_guard["running"].
-        registration_guard["gen"] += 1
-        reg_progress_bar.visible = False
-        reg_progress_label.visible = False
-        reg_progress_bar.value = 0
-        reg_progress_label.value = ""
+        _clear_progress_chrome(invalidate_ticks=True)
         if "reg_review_panel" in _ui:
             _ui["reg_review_panel"].visible = False
         if "roi_review_panel" in _ui:
@@ -878,6 +987,12 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         # 独立解析では時系列起動ボタンを出さない
         series_btn.visible = series_ready
         series_launch_row.visible = state.series_mode and saved >= 1
+        # Never let a stale ProgressBar survive batch-UI remounts after ③解析.
+        if not registration_guard["running"] and not seg_guard["running"]:
+            reg_progress_bar.visible = False
+            reg_progress_label.visible = False
+            reg_progress_bar.value = 0
+            progress_chrome.visible = False
         if series_ready:
             label = _safe_text(
                 f"Registration (選択 {selected}/{saved})"
@@ -1483,10 +1598,23 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         image_width_label.value = f"現在の画像: {w} px（水平幅）"
 
     def _to_img_xy(local_x: float, local_y: float) -> tuple[float, float]:
-        h, w = state.img_gray.shape
-        ox = max(0.0, min(w - 1, local_x / disp_scale["v"]))
-        oy = max(0.0, min(h - 1, local_y / disp_scale["v"]))
-        return ox, oy
+        # Always use the last painted frame's transform (same space as overlays).
+        lx = 0.0 if local_x is None else float(local_x)
+        ly = 0.0 if local_y is None else float(local_y)
+        img_w = int(disp_xform["img_w"])
+        img_h = int(disp_xform["img_h"])
+        if (img_w <= 1 or img_h <= 1) and state.img_gray is not None:
+            img_h, img_w = state.img_gray.shape[:2]
+        return local_to_image_xy(
+            lx,
+            ly,
+            img_w=img_w,
+            img_h=img_h,
+            box_w=float(disp_xform["box_w"]),
+            box_h=float(disp_xform["box_h"]),
+            off_x=float(disp_xform["off_x"]),
+            off_y=float(disp_xform["off_y"]),
+        )
 
     def _display_mask() -> np.ndarray:
         if edit_state["preview_mask"] is not None:
@@ -1496,7 +1624,10 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         return np.zeros_like(state.img_gray) if state.img_gray is not None else np.array([])
 
     def _mask_style() -> str:
-        if state.mode in ("seg_review", "seg_erase", "seg_draw", "seg_clear", "seg_clear_confirm"):
+        if state.mode in (
+            "seg_param", "seg_review", "seg_erase", "seg_draw",
+            "seg_clear", "seg_clear_confirm",
+        ):
             return "blend"
         return "solid"
 
@@ -1614,19 +1745,11 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             or state.foveal_correction_strength <= 0
         ):
             return None
-        mask_raw = segmentation.segment_ga(
-            raw,
-            use_clahe=state.use_clahe,
-            clahe_clip=state.clahe_clip,
-            fovea_xy=state.fovea_xy,
-            scale_um_px=state.scale_um_px,
-        )
-        mask_corr = segmentation.segment_ga(
-            seg_gray,
-            use_clahe=state.use_clahe,
-            clahe_clip=state.clahe_clip,
-            fovea_xy=state.fovea_xy,
-            scale_um_px=state.scale_um_px,
+        skw = _segment_kwargs()
+        auto_cv = bool(state.seg_auto_cv)
+        mask_raw = segmentation.segment_ga_with_optional_cv(raw, auto_cv=auto_cv, **skw)
+        mask_corr = segmentation.segment_ga_with_optional_cv(
+            seg_gray, auto_cv=auto_cv, **skw,
         )
         return correction_effect_stats(
             raw, seg_gray, state.fovea_xy, state.scale_um_px,
@@ -1656,13 +1779,20 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             return " - ".join(parts)
         return "原画像 (中心窩補正なし)"
 
+    def _segment_kwargs() -> dict:
+        """state から segment_ga へ渡す高影響パラメータ。"""
+        return {
+            "use_clahe": bool(state.use_clahe),
+            "clahe_clip": float(state.clahe_clip),
+            "fovea_xy": state.fovea_xy,
+            "scale_um_px": state.scale_um_px,
+            "macula_radius_mm": float(state.macula_radius_mm),
+            "min_size": int(state.seg_min_size),
+        }
+
     def _run_segmentation(seg_gray: np.ndarray) -> np.ndarray:
-        return segmentation.segment_ga(
-            seg_gray,
-            use_clahe=state.use_clahe,
-            clahe_clip=state.clahe_clip,
-            fovea_xy=state.fovea_xy,
-            scale_um_px=state.scale_um_px,
+        return segmentation.segment_ga_with_optional_cv(
+            seg_gray, auto_cv=bool(state.seg_auto_cv), **_segment_kwargs(),
         )
 
     def _finalize_mask(mask: np.ndarray) -> np.ndarray:
@@ -1671,7 +1801,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
 
     def _overlay_base_gray() -> np.ndarray | None:
         """オーバーレイ/Erase/Draw と同じグレー画像を返す。"""
-        if state.mask is not None or state.mode in ("seg_review", "seg_erase", "seg_draw"):
+        if state.mask is not None or state.mode in (
+            "seg_param", "seg_review", "seg_erase", "seg_draw",
+        ):
             seg = _gray_for_segmentation()
             if seg is not None:
                 return seg
@@ -1734,7 +1866,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 else (state.crop_pts if state.mode in ("crop_drag", "crop_confirm") else None)
             ),
             show_macula=state.stats is not None and state.mode not in (
-                "seg_review", "seg_erase", "seg_draw", "seg_clear", "seg_clear_confirm",
+                "seg_param", "seg_review", "seg_erase", "seg_draw",
+                "seg_clear", "seg_clear_confirm",
             ),
             scale_um_px=state.scale_um_px,
             mask_style=_mask_style(),
@@ -1742,13 +1875,24 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
 
     def _push_image_rgb(rgb: np.ndarray, *, do_update: bool = True, jpeg_quality: int = 85) -> None:
         h, w = rgb.shape[:2]
-        disp_scale["v"] = DISPLAY_WIDTH / w
-        disp_h = int(h * disp_scale["v"])
-        disp = cv2.resize(rgb, (DISPLAY_WIDTH, disp_h))
-        disp_size["h"] = disp_h
-        img_ctrl.width = DISPLAY_WIDTH
-        img_ctrl.height = disp_h
-        gesture_stack.height = disp_h
+        box_w, box_h = compute_display_box(w, h, DISPLAY_WIDTH)
+        # Bake overlays at full-res, then resize into the widget box. Tap mapping
+        # uses the same box_w/box_h and img w/h (see local_to_image_xy).
+        disp = cv2.resize(rgb, (box_w, box_h))
+        disp_xform["img_w"] = int(w)
+        disp_xform["img_h"] = int(h)
+        disp_xform["box_w"] = float(box_w)
+        disp_xform["box_h"] = float(box_h)
+        disp_xform["off_x"] = 0.0
+        disp_xform["off_y"] = 0.0
+        img_ctrl.width = box_w
+        img_ctrl.height = box_h
+        gif_img.width = box_w
+        gif_img.height = box_h
+        gesture_stack.width = box_w
+        gesture_stack.height = box_h
+        img_stack.width = box_w
+        img_stack.height = box_h
         img_ctrl.src_base64 = _b64_jpeg(disp, quality=jpeg_quality)
         if do_update:
             page.update()
@@ -2128,8 +2272,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 break
         status.value = f"{fname} — 再解析してください（③ 解析）"
         on_analyze()
-        _update_batch_ui()
-        page.update()
+        # on_analyze owns async seg refresh; avoid racing ProgressBar clear.
 
     def refresh_image(*, do_update: bool = True) -> None:
         if state.series_review_active and state.series_results:
@@ -2605,7 +2748,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                     else T.ACCENT_AMBER
                 ),
             ))
-        elif state.fovea_xy and stats and state.mode in (None, "seg_review", "seg_erase", "seg_draw"):
+        elif state.fovea_xy and stats and state.mode in (
+            None, "seg_param", "seg_review", "seg_erase", "seg_draw",
+        ):
             results_col.controls.append(ft.Text(
                 "セグメント入力: 原画像 (中心窩補正なし)",
                 size=11, color=T.ACCENT_AMBER,
@@ -2621,6 +2766,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             "width_cal": "画像の水平方向の実長 (mm) を入力して OK",
             "fovea": "中心窩をタップ",
             "foveal_confirm": "黄斑色素ブロック補正 - 強度を調整して適用または補正しない（自動で解析へ）",
+            "seg_param": "自動セグメンテーション調整 - スライダーでプレビュー、OK で手動編集へ",
             "seg_review": "セグメンテーション確認 - Erase / Draw / 範囲消去・範囲外消去で修正、OK で確定",
             "seg_erase": "長押しで削除 (緑の内外どちらでも可) - やり直しで取消",
             "seg_draw": "長押しで暗部を追加 (緑の内外どちらでも可) - やり直しで取消",
@@ -2880,7 +3026,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     file_dd.on_change = on_file_change
 
     def on_pan_start(e: ft.DragStartEvent) -> None:
-        if state.img_gray is None or state.mode in ("seg_review", "seg_erase", "seg_draw"):
+        if state.img_gray is None or state.mode in (
+            "seg_param", "seg_review", "seg_erase", "seg_draw",
+        ):
             return
         if state.mode == "disc_line":
             drag["active"] = True
@@ -2956,23 +3104,36 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         refresh_image()
         page.update()
 
+    def _grow_kwargs() -> dict:
+        """Phase A 安全レール + 選択モード（preview では cv も standard 相当）。"""
+        mode = state.grow_mode if state.grow_mode == GROW_MODE_LSF else GROW_MODE_STANDARD
+        return {"mode": mode}
+
+    def _wang_a_power(tick: int) -> float:
+        """序盤は中程度、後半は a_max へ収束（別ボタンにしない軽量スケジューリング）。"""
+        # 1 - exp(-t/τ): early moderate rise, late tight toward a_max
+        frac = 1.0 - math.exp(-tick / 10.0)
+        return min(_GROW_A_MAX, _GROW_A_START + (_GROW_A_MAX - _GROW_A_START) * frac)
+
     async def continuous_edit(ix: int, iy: int) -> None:
-        """長押し中、パワー拡大に合わせてプレビューマスクを毎フレーム更新。"""
-        a_power = 0.5
+        """長押し中、パワー拡大に合わせてプレビューマスクを更新（debounce 付き）。"""
         is_erase = state.mode == "seg_erase"
         base_gray = _overlay_base_gray()
+        tick = 0
         try:
             while edit_state["pressing"]:
                 if base_gray is None or state.mask is None:
                     break
+                a_power = _wang_a_power(tick)
+                gkw = _grow_kwargs()
                 if is_erase:
                     preview, delta = erase_oversegmentation_from_mask(
-                        base_gray, state.mask, (ix, iy), a_power,
+                        base_gray, state.mask, (ix, iy), a_power, **gkw,
                     )
                     action = "削除"
                 else:
                     preview, delta = expand_segmentation_from_mask(
-                        base_gray, state.mask, (ix, iy), a_power,
+                        base_gray, state.mask, (ix, iy), a_power, **gkw,
                     )
                     action = "追加"
                 edit_state["preview_mask"] = preview
@@ -2980,12 +3141,15 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                     edit_state["changed"] = True
                 rgb = _build_rgb_frame(preview)
                 _push_image_rgb(rgb, do_update=True, jpeg_quality=72)
+                mode_lbl = _GROW_MODE_LABELS.get(state.grow_mode, "")
                 status.value = (
-                    f"{'Erase' if is_erase else 'Draw'}中… パワー {a_power:.1f}（{action} {delta}px）"
-                    if delta else f"{'Erase' if is_erase else 'Draw'}中… パワー {a_power:.1f}（拡大中）"
+                    f"{'Erase' if is_erase else 'Draw'}中… {mode_lbl} パワー {a_power:.1f}"
+                    f"（{action} {delta}px）"
+                    if delta
+                    else f"{'Erase' if is_erase else 'Draw'}中… {mode_lbl} パワー {a_power:.1f}（拡大中）"
                 )
-                a_power = min(6.0, a_power + 0.2)
-                await asyncio.sleep(0.04)
+                tick += 1
+                await asyncio.sleep(_GROW_DEBOUNCE_S)
         except Exception as exc:
             _log.exception("continuous edit failed")
             edit_state["pressing"] = False
@@ -2995,11 +3159,22 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     def _commit_edit_stroke() -> None:
         if edit_state["changed"] and edit_state["preview_mask"] is not None:
             edit_state["undo_stack"].append(state.mask.copy())
-            state.mask = _finalize_mask(edit_state["preview_mask"].copy())
+            new_mask = edit_state["preview_mask"].copy()
+            cv_note = ""
+            if state.grow_mode == GROW_MODE_CV and state.mode == "seg_draw":
+                base_gray = _overlay_base_gray()
+                if base_gray is not None:
+                    try:
+                        new_mask = refine_mask_chan_vese_light(base_gray, new_mask)
+                        cv_note = " · CV精緻化"
+                    except Exception as exc:
+                        _log.exception("chan-vese refine on commit failed")
+                        cv_note = f" · CVスキップ({exc})"
+            state.mask = _finalize_mask(new_mask)
             status.value = (
-                "削除を適用 — 続けて編集するか ✓ OK で確定"
+                f"削除を適用{cv_note} — 続けて編集するか ✓ OK で確定"
                 if state.mode == "seg_erase"
-                else "追加を適用 — 続けて編集するか ✓ OK で確定"
+                else f"追加を適用{cv_note} — 続けて編集するか ✓ OK で確定"
             )
         else:
             status.value = "変化なし — 別の箇所を長押しするか ✓ OK で確定"
@@ -3017,21 +3192,23 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             edit_state["changed"] = False
             edit_state["seed"] = (ix, iy)
             is_erase = state.mode == "seg_erase"
+            mode_lbl = _GROW_MODE_LABELS.get(state.grow_mode, "")
             status.value = (
-                "Erase中…（緑の内外どちらでも可・明るい縁を削除）"
+                f"Erase中… {mode_lbl}（緑の内外どちらでも可・明るい縁を削除）"
                 if is_erase
-                else "Draw中…（緑の内外どちらでも可・暗部を追加）"
+                else f"Draw中… {mode_lbl}（緑の内外どちらでも可・暗部を追加）"
             )
             base_gray = _overlay_base_gray()
             if base_gray is None:
                 return
+            gkw = _grow_kwargs()
             if is_erase:
                 preview, delta = erase_oversegmentation_from_mask(
-                    base_gray, state.mask, (ix, iy), 0.5,
+                    base_gray, state.mask, (ix, iy), _GROW_A_START, **gkw,
                 )
             else:
                 preview, delta = expand_segmentation_from_mask(
-                    base_gray, state.mask, (ix, iy), 0.5,
+                    base_gray, state.mask, (ix, iy), _GROW_A_START, **gkw,
                 )
             edit_state["preview_mask"] = preview
             if delta > 0:
@@ -3139,7 +3316,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             page.update()
             return
         # 独立解析: OK → ③ 解析（セグメンテーション確認）へ自動進行
-        _run_segmentation_review(status_prefix="解析")
+        if _run_segmentation_review(status_prefix="解析"):
+            return
         refresh_hint()
         update_confirm_visibility()
         refresh_image()
@@ -3165,7 +3343,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             _update_batch_ui()
             page.update()
             return
-        _run_segmentation_review()
+        if _run_segmentation_review():
+            return
         refresh_hint()
         update_confirm_visibility()
         refresh_image()
@@ -3186,7 +3365,6 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         page.update()
 
     def on_reanalyze(_=None) -> None:
-        nonlocal seg_correction_stats
         if state.img_gray is None:
             status.value = "画像を読み込んでください"
         elif state.scale_um_px is None:
@@ -3194,23 +3372,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         elif state.fovea_xy is None:
             status.value = "先に中心窩を指定してください"
         else:
-            seg_gray = _gray_for_segmentation()
-            if seg_gray is None:
-                status.value = "画像を読み込んでください"
-            else:
-                seg_correction_stats = _compute_seg_correction_stats(seg_gray)
-                state.img_gray = seg_gray.copy()
-                state.mask = _run_segmentation(seg_gray)
-                state.stats = None
-                state.mode = "seg_review"
-                edit_state["pressing"] = False
-                edit_state["preview_mask"] = None
-                edit_state["undo_stack"] = []
-                edit_state["session_base"] = None
-                status.value = _safe_text(
-                    f"再解析 ({_segmentation_source_label()})"
-                    " - Erase / Draw / 範囲消去で修正、OK で確定"
-                )
+            if _run_segmentation_review(status_prefix="再解析"):
+                return
         refresh_hint()
         update_confirm_visibility()
         refresh_image()
@@ -3243,24 +3406,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         state.img_gray = apply_foveal_block_correction(
             raw, state.fovea_xy, state.scale_um_px, strength,
         )
-        seg_gray = _gray_for_segmentation()
-        if seg_gray is None:
-            _set_status("画像を読み込んでください")
-            page.update()
+        if _run_segmentation_review(status_prefix="高強度再解析"):
             return
-        seg_correction_stats = _compute_seg_correction_stats(seg_gray)
-        state.img_gray = seg_gray.copy()
-        state.mask = _run_segmentation(seg_gray)
-        state.stats = None
-        state.mode = "seg_review"
-        edit_state["pressing"] = False
-        edit_state["preview_mask"] = None
-        edit_state["undo_stack"] = []
-        edit_state["session_base"] = None
-        _set_status(
-            f"高強度再解析 ({_segmentation_source_label()})"
-            " - Erase / Draw / 範囲消去で修正、OK で確定"
-        )
         refresh_hint()
         update_confirm_visibility()
         refresh_image()
@@ -3274,7 +3421,11 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         except ValueError:
             state.clahe_clip = 2.0
         clahe_clip_dd.disabled = not state.use_clahe
-        if state.mask is not None and state.img_gray is not None and state.fovea_xy is not None:
+        if state.mode == "seg_param":
+            clahe_clip_slider.value = float(state.clahe_clip)
+            _schedule_seg_param_preview()
+            page.update()
+        elif state.mask is not None and state.img_gray is not None and state.fovea_xy is not None:
             on_reanalyze()
         else:
             page.update()
@@ -3368,7 +3519,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         edit_state["changed"] = False
         edit_state["pressing"] = False
         state.mode = "seg_review"
-        _set_status("自動セグメンテーションを消去 — Draw で追加するか OK で確定")
+        _set_status("自動ROIをクリアしました — Draw で島を追加するか OK で確定")
         refresh_hint()
         update_confirm_visibility()
         refresh_image()
@@ -3608,30 +3759,213 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         update_confirm_visibility()
         page.update()
 
-    def _run_segmentation_review(*, status_prefix: str = "セグメンテーション") -> bool:
-        """③ 解析と同じセグメント確認画面へ進める。"""
-        nonlocal seg_correction_stats
+    def _sync_seg_param_sliders_from_state() -> None:
+        clahe_clip_slider.value = float(state.clahe_clip)
+        macula_radius_slider.value = float(state.macula_radius_mm)
+        min_size_slider.value = float(state.seg_min_size)
+        seg_auto_cv_sw.value = bool(state.seg_auto_cv)
+
+    def _read_seg_param_sliders_to_state() -> None:
+        state.clahe_clip = float(clahe_clip_slider.value or _SEG_PARAM_DEFAULTS["clahe_clip"])
+        state.macula_radius_mm = float(
+            macula_radius_slider.value or _SEG_PARAM_DEFAULTS["macula_radius_mm"]
+        )
+        state.seg_min_size = int(
+            round(min_size_slider.value or _SEG_PARAM_DEFAULTS["seg_min_size"])
+        )
+        state.seg_auto_cv = bool(seg_auto_cv_sw.value)
+        # サイドバー CLAHE clip と可能な範囲で同期
+        clip_key = f"{state.clahe_clip:.1f}"
+        if clip_key in ("2.0", "4.0", "6.0"):
+            clahe_clip_dd.value = clip_key
+
+    def _schedule_seg_param_preview(_=None) -> None:
+        """スライダー変更 → debounce 後にプレビュー再計算（フル busy なし）。"""
+        if state.mode != "seg_param":
+            return
+        _read_seg_param_sliders_to_state()
+        seg_preview_guard["gen"] += 1
+        gen = int(seg_preview_guard["gen"])
+        page.run_task(_seg_param_preview_task, gen)
+
+    async def _seg_param_preview_task(gen: int) -> None:
+        await asyncio.sleep(_SEG_PREVIEW_DEBOUNCE_S)
+        if gen != seg_preview_guard["gen"] or state.mode != "seg_param":
+            return
         seg_gray = _gray_for_segmentation()
         if seg_gray is None:
-            _set_status("画像を読み込んでください")
-            return False
-        seg_correction_stats = _compute_seg_correction_stats(seg_gray)
-        state.img_gray = seg_gray.copy()
-        state.mask = _run_segmentation(seg_gray)
+            return
+        # Snapshot for worker — fovea/disc/scale は固定、パラメータのみ反映
+        seg_gray_copy = seg_gray.copy()
+        skw = _segment_kwargs()
+        auto_cv = bool(state.seg_auto_cv)
+        _set_status("プレビュー更新中…")
+        page.update()
+
+        def _work():
+            return segmentation.segment_ga_with_optional_cv(
+                seg_gray_copy, auto_cv=auto_cv, **skw,
+            )
+
+        try:
+            mask = await asyncio.to_thread(_work)
+        except Exception as exc:
+            _log.exception("seg param preview failed")
+            if gen == seg_preview_guard["gen"] and state.mode == "seg_param":
+                _set_status(f"プレビューエラー: {exc}")
+                page.update()
+            return
+        if gen != seg_preview_guard["gen"] or state.mode != "seg_param":
+            return
+        state.mask = mask
         state.stats = None
+        px = int(np.count_nonzero(mask))
+        _set_status(
+            f"プレビュー更新 ({_segmentation_source_label()}) · マスク {px} px"
+            " — 続けて調整、または OK で手動編集へ"
+        )
+        refresh_image(do_update=False)
+        page.update()
+
+    def on_seg_param_reset(_=None) -> None:
+        """パラメータを既定値に戻してプレビュー再計算。"""
+        if state.mode != "seg_param":
+            return
+        state.clahe_clip = float(_SEG_PARAM_DEFAULTS["clahe_clip"])
+        state.macula_radius_mm = float(_SEG_PARAM_DEFAULTS["macula_radius_mm"])
+        state.seg_min_size = int(_SEG_PARAM_DEFAULTS["seg_min_size"])
+        _sync_seg_param_sliders_from_state()
+        clahe_clip_dd.value = f"{state.clahe_clip:.1f}"
+        _schedule_seg_param_preview()
+        page.update()
+
+    def on_seg_param_ok(_=None) -> None:
+        """自動結果をロックして既存の手動編集（seg_review）へ。"""
+        if state.mode != "seg_param":
+            return
+        seg_preview_guard["gen"] += 1  # 進行中プレビューを無効化
+        _read_seg_param_sliders_to_state()
+        if state.mask is None:
+            _set_status("マスクがありません — 解析をやり直してください")
+            page.update()
+            return
         state.mode = "seg_review"
         edit_state["pressing"] = False
         edit_state["preview_mask"] = None
         edit_state["undo_stack"] = []
         edit_state["session_base"] = None
         _set_status(
-            f"{status_prefix}完了 ({_segmentation_source_label()})"
+            f"自動結果を確定 ({_segmentation_source_label()})"
             " - Erase / Draw / 範囲消去で修正、OK で確定"
         )
+        refresh_hint()
+        update_confirm_visibility()
+        refresh_image()
+        page.update()
+
+    def _run_segmentation_review(*, status_prefix: str = "セグメンテーション") -> bool:
+        """③ 解析 → パラメータ調整（seg_param）へ進める（to_thread + finally で必ずクリア）。"""
+        nonlocal seg_correction_stats
+        if seg_guard["running"] or registration_guard["running"]:
+            _set_status("処理中です — 完了を待ってください")
+            return False
+        seg_gray = _gray_for_segmentation()
+        if seg_gray is None:
+            _set_status("画像を読み込んでください")
+            return False
+
+        # Snapshot for worker — never touch UI widgets from the thread.
+        skw = _segment_kwargs()
+        auto_cv = bool(state.seg_auto_cv)
+        fovea_xy = state.fovea_xy
+        scale_um_px = state.scale_um_px
+        raw = _uncorrected_gray()
+        raw_copy = None if raw is None else raw.copy()
+        seg_gray_copy = seg_gray.copy()
+        corr_applied = bool(state.foveal_correction_applied)
+        corr_skipped = bool(state.foveal_correction_skipped)
+        corr_strength = float(state.foveal_correction_strength or 0.0)
+
+        # Set busy synchronously so callers' page.update / _update_batch_ui
+        # cannot clear chrome before the task starts.
+        seg_preview_guard["gen"] += 1  # 旧プレビューを無効化
+        busy_gen = _set_seg_busy(True)
+        _set_status(f"{status_prefix}中…")
+        page.update()
+
+        async def _seg_task() -> None:
+            nonlocal seg_correction_stats
+            try:
+                def _work():
+                    stats = None
+                    if (
+                        raw_copy is not None
+                        and fovea_xy is not None
+                        and scale_um_px is not None
+                        and corr_applied
+                        and not corr_skipped
+                        and corr_strength > 0
+                    ):
+                        mask_raw = segmentation.segment_ga_with_optional_cv(
+                            raw_copy, auto_cv=auto_cv, **skw,
+                        )
+                        mask_corr = segmentation.segment_ga_with_optional_cv(
+                            seg_gray_copy, auto_cv=auto_cv, **skw,
+                        )
+                        stats = correction_effect_stats(
+                            raw_copy, seg_gray_copy, fovea_xy, scale_um_px,
+                            mask_raw=mask_raw, mask_corr=mask_corr,
+                        )
+                    mask = segmentation.segment_ga_with_optional_cv(
+                        seg_gray_copy, auto_cv=auto_cv, **skw,
+                    )
+                    return stats, mask
+
+                stats, mask = await asyncio.to_thread(_work)
+                # Ignore results if a newer invalidate/gen superseded this task.
+                if seg_guard["gen"] == busy_gen and seg_guard["running"]:
+                    seg_correction_stats = stats
+                    state.img_gray = seg_gray_copy
+                    state.mask = mask
+                    state.stats = None
+                    state.mode = "seg_param"
+                    edit_state["pressing"] = False
+                    edit_state["preview_mask"] = None
+                    edit_state["undo_stack"] = []
+                    edit_state["session_base"] = None
+                    _sync_seg_param_sliders_from_state()
+                    _set_status(
+                        f"{status_prefix}完了 ({_segmentation_source_label()})"
+                        " - スライダーで調整、OK で手動編集へ"
+                    )
+                    refresh_hint()
+                    update_confirm_visibility()
+                    refresh_image(do_update=False)
+                    refresh_results()
+            except Exception as exc:
+                _log.exception("segmentation failed")
+                _set_status(f"解析エラー: {exc}")
+            finally:
+                # Always clear busy/spinner (registration_guard pattern).
+                if seg_guard["gen"] == busy_gen:
+                    _set_seg_busy(False)
+                elif seg_guard["running"]:
+                    # Gen invalidated externally — still drop orphaned busy.
+                    seg_guard["running"] = False
+                    if not registration_guard["running"]:
+                        _clear_progress_chrome(invalidate_ticks=False)
+                        btn = analyze_btn_ref.get("btn")
+                        if btn is not None:
+                            btn.disabled = False
+                try:
+                    page.update()
+                except Exception:
+                    pass
+
+        page.run_task(_seg_task)
         return True
 
     def on_analyze(_=None) -> None:
-        nonlocal seg_correction_stats
         if state.scale_um_px is None:
             if modality_dd.value == "hra":
                 _set_status("先にスケール設定 (幅指定または乳頭計測) を完了してください")
@@ -3646,7 +3980,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 if not _apply_pending_foveal_correction():
                     page.update()
                     return
-            _run_segmentation_review()
+            if _run_segmentation_review():
+                # Async task owns refresh / progress clear.
+                return
         refresh_hint()
         update_confirm_visibility()
         refresh_image()
@@ -3891,12 +4227,36 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         redo = _registration_controls.get("redo_btn")
         if redo is not None:
             redo.disabled = busy
-        if not busy:
-            # Hide progress UI; bump gen above already invalidated late threadsafe ticks
-            reg_progress_bar.visible = False
-            reg_progress_label.visible = False
+        btn = analyze_btn_ref.get("btn")
+        if btn is not None:
+            btn.disabled = busy or seg_guard["running"]
+        if busy:
+            progress_chrome.visible = True
             reg_progress_bar.value = 0
-            reg_progress_label.value = ""
+            reg_progress_bar.visible = True
+            reg_progress_label.visible = True
+        else:
+            # Hide progress UI; gen already bumped above — do not double-bump.
+            _clear_progress_chrome(invalidate_ticks=False)
+        return gen
+
+    def _set_seg_busy(busy: bool) -> int:
+        """単画像解析 busy。戻り値は遅延 UI コールバック無効化用の世代。"""
+        seg_guard["gen"] += 1
+        seg_guard["running"] = busy
+        gen = int(seg_guard["gen"])
+        btn = analyze_btn_ref.get("btn")
+        if btn is not None:
+            btn.disabled = busy or registration_guard["running"]
+        if busy:
+            # Determinate placeholder only — never value=None (indeterminate spinner).
+            progress_chrome.visible = True
+            reg_progress_bar.value = 0.0
+            reg_progress_bar.visible = True
+            reg_progress_label.value = "解析中…"
+            reg_progress_label.visible = True
+        else:
+            _clear_progress_chrome(invalidate_ticks=False)
         return gen
 
     def _show_registration_progress(
@@ -3909,6 +4269,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             return
         total = max(int(total), 1)
         done = max(0, min(int(done), total))
+        progress_chrome.visible = True
         reg_progress_bar.value = done / total
         reg_progress_bar.visible = True
         detail = f" · {label}" if label else ""
@@ -4248,7 +4609,12 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 _finish_to_series_results_view()
             finally:
                 series_guard["roi_running"] = False
-                page.update()
+                if not registration_guard["running"] and not seg_guard["running"]:
+                    _clear_progress_chrome(invalidate_ticks=True)
+                try:
+                    page.update()
+                except Exception:
+                    pass
 
         page.run_task(_roi_task)
 
@@ -4299,7 +4665,12 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 _log.exception("aligned pipeline failed")
                 _set_status(f"整列後処理エラー: {exc}")
             finally:
-                page.update()
+                if not registration_guard["running"] and not seg_guard["running"]:
+                    _clear_progress_chrome(invalidate_ticks=True)
+                try:
+                    page.update()
+                except Exception:
+                    pass
 
         page.run_task(_pipeline)
 
@@ -4348,7 +4719,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             if launch_guard_gen is not None:
                 _end_series_launch_guard(launch_guard_gen)
 
-        if registration_guard["running"]:
+        if registration_guard["running"] or seg_guard["running"]:
             _finish_launch_guard()
             return
         if not state.series_mode:
@@ -4406,6 +4777,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                 _set_status("保存済みの位置合わせ行列を適用中…")
             else:
                 _set_status("位置合わせを計算中…")
+            progress_chrome.visible = True
             reg_progress_bar.value = 0
             reg_progress_bar.visible = True
             reg_progress_label.value = ""
@@ -4500,11 +4872,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             _clear_reg_cache()
             # Hide progress UI immediately; invalidate late progress ticks.
             # Do not clear running here — in-flight task finally owns that.
-            registration_guard["gen"] += 1
-            reg_progress_bar.visible = False
-            reg_progress_label.visible = False
-            reg_progress_bar.value = 0
-            reg_progress_label.value = ""
+            _clear_progress_chrome(invalidate_ticks=True)
             if not registration_guard["running"]:
                 series_guard["launching"] = False
                 series_guard["roi_running"] = False
@@ -4543,7 +4911,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         landing_filename: str | None = None,
     ) -> None:
         """時系列モード: Registration を起動（症例内・日時ゲート付き）。"""
-        if registration_guard["running"] or series_guard["launching"]:
+        if registration_guard["running"] or series_guard["launching"] or seg_guard["running"]:
             return
         if not state.series_mode:
             _set_status("時系列モードを ON にしてください")
@@ -4634,9 +5002,12 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         [img_ctrl, gif_img],
         width=DISPLAY_WIDTH,
         height=200,
+        alignment=ft.alignment.top_left,
     )
     img_stack = ft.GestureDetector(
         content=gesture_stack,
+        width=DISPLAY_WIDTH,
+        height=200,
         on_pan_start=on_pan_start,
         on_pan_update=on_pan_update,
         on_pan_end=on_pan_end,
@@ -4656,12 +5027,13 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             roi_correction_sw,
             ft.Row([series_launch_btn], spacing=8),
             reg_apply_btn,
-            reg_progress_label,
-            reg_progress_bar,
         ],
         spacing=6,
         visible=False,
     )
+
+    analyze_btn = btn_primary("③ 解析", on_click=on_analyze)
+    analyze_btn_ref["btn"] = analyze_btn
 
     toolbar = ft.Row(
         [
@@ -4669,7 +5041,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             btn_toolbar("① 乳頭", on_click=lambda _: set_mode("disc_line")),
             btn_toolbar("①' 幅指定", on_click=on_width_start),
             btn_toolbar("② 中心窩", on_click=lambda _: set_mode("fovea")),
-            btn_primary("③ 解析", on_click=on_analyze),
+            analyze_btn,
             prep_confirm_btn,
             series_btn,
         ],
@@ -4679,17 +5051,25 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
 
     def update_confirm_visibility() -> None:
         cancel_row.visible = state.mode in (
-            "disc_line", "crop_drag", "fovea", "seg_review", "seg_erase", "seg_draw",
+            "disc_line", "crop_drag", "fovea",
+            "seg_param", "seg_review", "seg_erase", "seg_draw",
             "seg_clear",
         )
         disc_confirm_row.visible = state.mode == "disc_confirm"
         crop_confirm_row.visible = state.mode == "crop_confirm"
         width_panel.visible = state.mode == "width_cal"
         foveal_confirm_panel.visible = state.mode == "foveal_confirm"
+        seg_param_panel.visible = state.mode == "seg_param"
         seg_confirm_row.visible = state.mode in (
             "seg_review", "seg_erase", "seg_draw", "seg_clear",
         )
         seg_edit_redo_btn.visible = state.mode in ("seg_erase", "seg_draw")
+        grow_vis = state.mode in ("seg_review", "seg_erase", "seg_draw")
+        grow_mode_panel.visible = grow_vis
+        grow_mode_chips_row.visible = grow_vis
+        grow_mode_hint.visible = grow_vis
+        if grow_vis:
+            _refresh_grow_mode_chips()
         seg_clear_confirm_row.visible = state.mode == "seg_clear_confirm"
         seg_auto_clear_btn.visible = state.mode in (
             "seg_review", "seg_erase", "seg_draw",
@@ -4710,7 +5090,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             edit_state["undo_stack"] = []
             state.mode = "seg_review"
             status.value = "編集をキャンセル — ✓ OK で確定"
-        elif state.mode == "seg_review":
+        elif state.mode in ("seg_param", "seg_review"):
+            seg_preview_guard["gen"] += 1
             state.mask = None
             state.stats = None
             _restore_display_gray()
@@ -4739,7 +5120,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         else:
             state.cancel_mode()
         drag["active"] = False
-        if state.mode not in ("seg_review",):
+        if state.mode not in ("seg_review", "seg_param"):
             if (
                 status.value.startswith("編集をキャンセル")
                 or status.value.startswith("範囲消去")
@@ -4757,14 +5138,13 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         page.update()
 
     seg_auto_clear_btn = btn_outlined(
-        "自動セグメンテーションキャンセル",
+        "自動ROIをクリア",
         on_click=on_clear_auto_segmentation,
     )
     seg_auto_clear_btn.visible = False
 
     cancel_row = ft.Row([
         btn_outlined("✕ キャンセル", on_click=on_cancel),
-        seg_auto_clear_btn,
     ], visible=False)
 
     disc_confirm_row = ft.Row([
@@ -4782,10 +5162,56 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
 
     seg_ok_btn = btn_ok("OK", on_click=on_seg_ok)
 
+    def _set_grow_mode(mode: str):
+        def _handler(_=None) -> None:
+            state.grow_mode = mode
+            _refresh_grow_mode_chips()
+            status.value = f"成長モード: {_GROW_MODE_LABELS.get(mode, mode)}"
+            page.update()
+        return _handler
+
+    def _grow_chip(label: str, mode: str) -> ft.ElevatedButton:
+        selected = state.grow_mode == mode
+        return ft.ElevatedButton(
+            label,
+            on_click=_set_grow_mode(mode),
+            style=ft.ButtonStyle(
+                bgcolor=T.PRIMARY if selected else T.BTN_SECONDARY_BG,
+                color=T.BTN_ON_PRIMARY if selected else T.TEXT,
+                shape=ft.RoundedRectangleBorder(radius=8),
+                padding=ft.padding.symmetric(horizontal=12, vertical=8),
+                elevation=0,
+            ),
+        )
+
+    grow_mode_chips_row = ft.Row(spacing=6, wrap=True, visible=False)
+    grow_mode_hint = ft.Text(
+        "成長: 半径・画素上限は常時ON。非隣接クリックは新規島を追加。CVは離したときだけ精緻化。",
+        size=10,
+        color=T.TEXT_MUTED,
+        visible=False,
+    )
+
+    def _refresh_grow_mode_chips() -> None:
+        grow_mode_chips_row.controls = [
+            _grow_chip("標準（安全成長）", GROW_MODE_STANDARD),
+            _grow_chip("局所類似 (LSF)", GROW_MODE_LSF),
+            _grow_chip("確定後CV精緻化", GROW_MODE_CV),
+        ]
+
+    _refresh_grow_mode_chips()
+    grow_mode_panel = ft.Column(
+        [grow_mode_chips_row, grow_mode_hint],
+        spacing=4,
+        tight=True,
+        visible=False,
+    )
+
     seg_confirm_row = ft.Row([
         seg_ok_btn,
         btn_erase("Erase 白領域（長押し）", on_click=on_seg_erase_click),
         btn_draw("Draw 暗部（長押し）", on_click=on_seg_draw_click),
+        seg_auto_clear_btn,
         btn_outlined("範囲消去", on_click=on_seg_clear_start),
         btn_outlined("範囲外消去", on_click=on_seg_clear_outside_start),
         seg_edit_redo_btn,
@@ -4840,6 +5266,10 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
     clahe_clip_dd.disabled = not state.use_clahe
 
     foveal_strength_slider.on_change = on_foveal_slider_change
+    clahe_clip_slider.on_change = _schedule_seg_param_preview
+    macula_radius_slider.on_change = _schedule_seg_param_preview
+    min_size_slider.on_change = _schedule_seg_param_preview
+    seg_auto_cv_sw.on_change = _schedule_seg_param_preview
 
     foveal_confirm_panel = ft.Container(
         visible=False,
@@ -4862,6 +5292,49 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                         btn_ok("✓ OK（解析へ）", on_click=on_foveal_ok),
                         btn_outlined("補正しない", on_click=on_foveal_skip),
                         btn_outlined("↩ やり直し", on_click=on_foveal_redo),
+                    ],
+                    spacing=8,
+                    wrap=True,
+                ),
+            ],
+            spacing=8,
+            tight=True,
+        ),
+    )
+
+    seg_param_panel = ft.Container(
+        visible=False,
+        bgcolor=T.PANEL_BG,
+        border=ft.border.all(1, "#374151"),
+        border_radius=8,
+        padding=ft.padding.all(12),
+        content=ft.Column(
+            [
+                ft.Text(
+                    "自動セグメンテーション調整",
+                    size=13,
+                    weight=ft.FontWeight.W_600,
+                    color=T.PRIMARY,
+                ),
+                ft.Text(
+                    "スライダーでマスクをリアルタイム調整（中心窩・乳頭・スケールは固定）",
+                    size=11,
+                    color=T.TEXT_MUTED,
+                ),
+                ft.Text("CLAHE強調", size=11, color=T.TEXT_MUTED),
+                clahe_clip_slider,
+                ft.Text("黄斑閾値範囲 (mm)", size=11, color=T.TEXT_MUTED),
+                macula_radius_slider,
+                ft.Text("最小病変サイズ (px)", size=11, color=T.TEXT_MUTED),
+                min_size_slider,
+                seg_auto_cv_sw,
+                ft.Row(
+                    [
+                        btn_ok(
+                            "この自動結果でOK → 手動編集へ",
+                            on_click=on_seg_param_ok,
+                        ),
+                        btn_outlined("既定値に戻す", on_click=on_seg_param_reset),
                     ],
                     spacing=8,
                     wrap=True,
@@ -4980,6 +5453,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         "roi_finish_btn": roi_finish_btn,
     })
 
+    # Single scroll Column (nested expand Columns hung Flet web = endless spinner).
+    # Landmark taps use shared disp_xform + ImageFit.FILL (not letterbox math).
     left = ft.Column(
         [
             ft.Text("GA Segmentation Pro", size=22, weight=ft.FontWeight.BOLD, color=T.PRIMARY),
@@ -4991,12 +5466,15 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             crop_confirm_row,
             width_panel,
             foveal_confirm_panel,
+            seg_param_panel,
             seg_confirm_row,
+            grow_mode_panel,
             seg_clear_confirm_row,
             hint,
             disc_info,
             scale_info,
             status,
+            progress_chrome,
             series_launch_row,
             reg_review_panel,
             roi_review_panel,
@@ -5007,6 +5485,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         ],
         spacing=8,
         scroll=ft.ScrollMode.AUTO,
+        expand=True,
     )
 
     def on_case_change(e: ft.ControlEvent) -> None:
@@ -5100,6 +5579,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             _log.exception("case move failed")
             _set_status(f"症例移動エラー: {exc}")
         finally:
+            if not registration_guard["running"]:
+                _clear_progress_chrome(invalidate_ticks=True)
             # Always refresh; _clear_series_display already hid progress chrome.
             page.update()
 
@@ -5233,11 +5714,9 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         finally:
             # Ensure progress chrome is not left visible after autoload.
             if not registration_guard["running"]:
-                registration_guard["gen"] += 1
-                reg_progress_bar.visible = False
-                reg_progress_label.visible = False
-                reg_progress_bar.value = 0
-                reg_progress_label.value = ""
+                _clear_progress_chrome(invalidate_ticks=True)
+                series_guard["launching"] = False
+                series_guard["roi_running"] = False
             try:
                 page.update()
             except Exception:

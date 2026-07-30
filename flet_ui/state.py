@@ -28,7 +28,7 @@ class GAAppState:
     # False=独立解析（既定・registration なし） / True=時系列（症例内のみ）
     series_mode: bool = False
 
-    mode: str | None = None  # disc_line | disc_confirm | width_cal | crop_drag | crop_confirm | fovea | foveal_confirm | seg_review | seg_erase | seg_draw | seg_clear | seg_clear_confirm
+    mode: str | None = None  # disc_line | disc_confirm | width_cal | crop_drag | crop_confirm | fovea | foveal_confirm | seg_param | seg_review | seg_erase | seg_draw | seg_clear | seg_clear_confirm
     image_modality: str = "optos"  # optos | hra
     # disc_1800um | dfd_4.76mm | width（旧スナップショットは disc もあり）
     calibration_source: str | None = None
@@ -44,6 +44,11 @@ class GAAppState:
     foveal_correction_strength: float = 0.0
     use_clahe: bool = True
     clahe_clip: float = 2.0
+    # Auto-seg パラメータ調整（seg_param パネル）
+    macula_radius_mm: float = 6.0
+    seg_min_size: int = 500
+    # 自動セグ後の制約付き Chan-Vese 精緻化（既定 ON）
+    seg_auto_cv: bool = True
     scale_um_px: float | None = None
 
     img_full: np.ndarray | None = None
@@ -54,6 +59,8 @@ class GAAppState:
 
     mask: np.ndarray | None = None
     stats: dict | None = None
+    # Interactive ROI grow: standard | lsf | cv_refine（Phase A 安全レールは常時）
+    grow_mode: str = "standard"
 
     disc_diameter_um: float = 1800.0
     age: int = 75
@@ -154,7 +161,7 @@ class GAAppState:
             pass
         elif self.mode in ("seg_clear", "seg_clear_confirm"):
             self.clear_pts = []
-        elif self.mode in ("seg_review", "seg_erase", "seg_draw"):
+        elif self.mode in ("seg_param", "seg_review", "seg_erase", "seg_draw"):
             self.mask = None
             self.stats = None
         self.mode = None
