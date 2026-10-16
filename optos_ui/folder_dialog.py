@@ -6,7 +6,11 @@ import subprocess
 import sys
 
 _PROMPT = "Optos の画像フォルダを選んでください"
-_SCRIPT = f'POSIX path of (choose folder with prompt "{_PROMPT}")'
+
+
+def _script(kind: str, prompt: str) -> str:
+    safe = prompt.replace('"', "'")
+    return f'POSIX path of (choose {kind} with prompt "{safe}")'
 
 
 def folder_from_osascript(returncode: int, stdout: str, stderr: str) -> str | None:
@@ -22,12 +26,21 @@ def folder_from_osascript(returncode: int, stdout: str, stderr: str) -> str | No
     return path or None
 
 
-def choose_folder() -> str | None:
+def choose_folder(prompt: str = _PROMPT) -> str | None:
     """この Mac 上でフォルダダイアログを出す。キャンセルは None。"""
+    return _choose("folder", prompt)
+
+
+def choose_file(prompt: str) -> str | None:
+    """この Mac 上でファイルダイアログを出す。キャンセルは None。"""
+    return _choose("file", prompt)
+
+
+def _choose(kind: str, prompt: str) -> str | None:
     if sys.platform != "darwin":
-        raise RuntimeError("この画面のフォルダ選択は macOS のダイアログを使います")
+        raise RuntimeError("この画面の選択は macOS のダイアログを使います")
     proc = subprocess.run(
-        ["osascript", "-e", _SCRIPT],
+        ["osascript", "-e", _script(kind, prompt)],
         capture_output=True,
         text=True,
         timeout=600,

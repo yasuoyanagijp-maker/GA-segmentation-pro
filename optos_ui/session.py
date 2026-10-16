@@ -25,7 +25,9 @@ from engine.optos import (
     window_box,
 )
 from engine.region_growing import clear_mask_in_freehand_region
+from optos_ui.csv_export import mark_reversals
 from engine.timeseries import (
+    FOVEAL_GAP_MIN_UM,
     datetime_to_iso,
     describe_foveal_approach,
     estimate_growth_mm2_per_year,
@@ -80,6 +82,8 @@ class OptosSession:
     undo: list[np.ndarray] = field(default_factory=list)
     redo: list[np.ndarray] = field(default_factory=list)
     series_note: str = ""
+    series_summary: dict | None = None
+    series_visit_table: list = field(default_factory=list)
     age: str = ""
     sex: str = "Male"
 
@@ -95,6 +99,45 @@ class OptosSession:
         self.snaps = {}
         self.select_case(ids[0])
         return f"{len(ids)} 症例"
+
+    def load_paths(self, paths: list[Path], *, label: str) -> str:
+        """渡された画像だけを開く。隣の masks フォルダは読まない。"""
+        files = [Path(path) for path in paths]
+        self.folder = str(files[0].parent) if files else ""
+        self.cases = {label: files} if files else {}
+        self.snaps = {}
+        if not files:
+            self.case_id = ""
+            self.files = []
+            self._clear_current()
+            return "画像がありません"
+        self.select_case(label)
+        return f"{len(files)} 画像"
+
+    def reading_payload(self) -> list[dict]:
+        """確定済みの計測だけ。空のマスクは出さない。"""
+        self._stash()
+        saved = self.case_id
+        rows = []
+        try:
+            for key, snap in self.snaps.items():
+                if not snap.confirmed or snap.gray is None or snap.mask is None:
+                    continue
+                if not (snap.fovea_xy and snap.disc_xy and snap.scale_um_px and np.any(snap.mask > 0)):
+                    continue
+                self.case_id = key.split("/", 1)[0]
+                row = self._snap_row(snap)
+                case_id = key.split("/", 1)[0]
+                filename = snap.filename if case_id in {"", "未分類"} else f"{case_id}__{snap.filename}"
+                row["path"] = snap.path
+                row["shape"] = tuple(snap.gray.shape)
+                row["mask"] = snap.mask
+                row["filename"] = filename
+                row["case_id"] = case_id
+                rows.append(row)
+        finally:
+            self.case_id = saved
+        return rows
 
     def snap_for(self, filename: str) -> VisitSnap | None:
         return self.snaps.get(f"{self.case_id}/{filename}")
@@ -320,11 +363,47 @@ class OptosSession:
             return None
         return stats_central(self.mask, self.fovea_xy, self.scale_um_px)
 
+    def _snap_row(self, snap: VisitSnap) -> dict:
+        assert snap.fovea_xy and snap.disc_xy and snap.scale_um_px and snap.mask is not None
+        stats = stats_central(snap.mask, snap.fovea_xy, snap.scale_um_px)
+        gap = robust_foveal_gap_um(snap.mask, snap.fovea_xy, snap.scale_um_px)
+        return {
+            "case_id": self.case_id,
+            "date": snap.date_iso,
+            "filename": snap.filename,
+            "confirmed": int(snap.confirmed),
+            "scale_um_per_px": round(float(snap.scale_um_px), 4),
+            "disc_x": round(float(snap.disc_xy[0]), 1),
+            "disc_y": round(float(snap.disc_xy[1]), 1),
+            "fovea_x": round(float(snap.fovea_xy[0]), 1),
+            "fovea_y": round(float(snap.fovea_xy[1]), 1),
+            "area_mm2": stats.get("area_mm2"),
+            "area_mm_sqrt": stats.get("area_mm_sqrt"),
+            "lesion_count": stats.get("lesion_count"),
+            "gawain": stats.get("gawain"),
+            "dist_um_nearest": stats.get("dist_um"),
+            "gap_um": None if gap is None else round(gap, 1),
+            "intact_1mm_mm2": round(intact_within_mm2(snap.mask, snap.fovea_xy, snap.scale_um_px), 4),
+            "outside_6mm_px": stats.get("outside_quant_px"),
+        }
+
+    def visit_rows(self) -> list[dict]:
+        """マスクと乳頭・中心窩がある時点。確定前も含む。"""
+        self._stash()
+        snaps = [
+            s for s in self._case_snaps()
+            if s.mask is not None and s.fovea_xy and s.disc_xy and s.scale_um_px and np.any(s.mask > 0)
+        ]
+        snaps.sort(key=lambda s: s.date_iso)
+        return [self._snap_row(snap) for snap in snaps]
+
     def run_series(self) -> str:
         self._stash()
         visits = [s for s in self._case_snaps() if s.confirmed and s.mask is not None]
         visits = [s for s in visits if s.fovea_xy and s.disc_xy and s.scale_um_px and s.gray is not None]
         if len(visits) < 2:
+            self.series_summary = None
+            self.series_visit_table = []
             self.series_note = "確定した時点が2つ以上必要です"
             return self.series_note
         visits.sort(key=lambda s: s.date_iso)
@@ -353,13 +432,19 @@ class OptosSession:
         gap_um = estimate_progression_rate_um_per_year(gap_rows)
         latest_gap = gap_rows[-1]["stats"].get("dist_um")
         intact_slope = estimate_intact_mm2_per_year(rows)
+        life_years = self._life_years()
         life = self._life_text()
         first_intact = rows[0]["stats"]["intact_1mm_mm2"]
         last_intact = rows[-1]["stats"]["intact_1mm_mm2"]
+        close = latest_gap is not None and latest_gap < FOVEAL_GAP_MIN_UM
+        years_to = None
+        if latest_gap is not None and gap_um and gap_um > 0 and not close:
+            years_to = round(float(latest_gap) / float(gap_um), 2)
+        foveal_note = describe_foveal_approach(latest_gap, None if close else gap_um)
         parts = [
             f"実測 {mm2 if mm2 is not None else '—'} mm²/年",
             f"√面積 {mm_sqrt if mm_sqrt is not None else '—'} mm/年",
-            describe_foveal_approach(latest_gap, gap_um),
+            foveal_note,
             (
                 f"中心 1 mm の残存 {first_intact:.2f}→{last_intact:.2f} mm²"
                 + (f"（{intact_slope:+.3f} mm²/年）" if intact_slope is not None else "")
@@ -370,17 +455,43 @@ class OptosSession:
         else:
             parts.append("余命は年齢を入れてから")
         parts.append("各時点のスケールで計算")
+        self.series_summary = {
+            "case_id": self.case_id,
+            "n_visits": len(visits),
+            "date_first": rows[0]["date"],
+            "date_last": rows[-1]["date"],
+            "area_mm2_per_year": mm2,
+            "area_mm_sqrt_per_year": mm_sqrt,
+            "gap_um_latest": None if latest_gap is None else round(float(latest_gap), 1),
+            "gap_um_per_year": None if close else gap_um,
+            "years_to_fovea": years_to,
+            "foveal_note": foveal_note,
+            "intact_1mm_first_mm2": round(float(first_intact), 4),
+            "intact_1mm_last_mm2": round(float(last_intact), 4),
+            "intact_1mm_mm2_per_year": intact_slope,
+            "age": (self.age or "").strip(),
+            "sex": self.sex,
+            "life_expectancy_years": None if life_years is None else round(life_years, 2),
+        }
+        self.series_visit_table = mark_reversals([self._snap_row(s) for s in visits])
         self.series_note = " · ".join(parts)
         return self.series_note
 
-    def _life_text(self) -> str:
+    def _life_years(self) -> float | None:
         text = (self.age or "").strip()
         if not text:
-            return ""
+            return None
         try:
-            years = life_expectancy_years(int(text), self.sex)
+            return float(life_expectancy_years(int(text), self.sex))
         except (ValueError, KeyError):
-            return "余命を算出できません"
+            return None
+
+    def _life_text(self) -> str:
+        years = self._life_years()
+        if years is None:
+            if (self.age or "").strip():
+                return "余命を算出できません"
+            return ""
         return f"平均余命 {years:.1f} 年"
 
     def _case_snaps(self) -> list[VisitSnap]:
@@ -458,6 +569,8 @@ class OptosSession:
         self.zoom = 1
         self.pan_xy = (0.0, 0.0)
         self.series_note = ""
+        self.series_summary = None
+        self.series_visit_table = []
 
     def _push_undo(self) -> None:
         if self.mask is None:

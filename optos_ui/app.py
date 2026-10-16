@@ -15,8 +15,17 @@ from engine.optos import px_from_mm, window_box
 from engine.overlay import make_overlay
 from flet_ui import theme as T
 from flet_ui.theme import apply_page_theme
-from optos_ui.folder_dialog import choose_folder
+from ga_reading.bundle import stamped_dir, write_grader_bundle, write_reader_csv
+from ga_reading.merge import merge_graders
+from ga_reading.queue import find_first_grader_csv, recheck_images, second_reader_images
+from ga_reading.triad import resolve_triad
+from optos_ui.csv_export import SERIES_COLUMNS, VISIT_COLUMNS, csv_bytes, download_name, write_download
+from optos_ui.folder_dialog import choose_file, choose_folder
 from optos_ui.session import OptosSession
+
+_ROLE_FIRST = "GRADER1"
+_ROLE_SECOND = "READER2"
+_ROLE_FINAL = "FINAL"
 
 VIEW_W = 760
 VIEW_H = 640
@@ -44,6 +53,38 @@ def centered_crop_origin(
     return x0, y0
 
 
+# 見出しと値を同じ幅にする。日付を含めて右の数字がずれないようにする。
+_SERIES_COLS = (
+    ("date", "日付", None, 92, "left"),
+    ("area_mm_sqrt", "√面積", 2, 50, "right"),
+    ("gawain", "GAWAIN", 1, 56, "right"),
+    ("dist_um_nearest", "最近傍", 0, 52, "right"),
+    ("gap_um", "縁まで", 0, 52, "right"),
+    ("intact_1mm_mm2", "中心1mm", 2, 64, "right"),
+)
+
+
+def _series_cell(text: str, width: int, *, align: str, color: str, bold: bool = False) -> ft.Container:
+    return ft.Container(
+        width=width,
+        content=ft.Text(
+            text,
+            size=12,
+            color=color,
+            weight=ft.FontWeight.BOLD if bold else None,
+            text_align=ft.TextAlign.RIGHT if align == "right" else ft.TextAlign.LEFT,
+            no_wrap=True,
+            font_family="monospace",
+        ),
+    )
+
+
+def _num(value: object, digits: int) -> str:
+    if value is None:
+        return "—"
+    return f"{float(value):.{digits}f}"
+
+
 def _jpeg_b64(rgb: np.ndarray) -> str:
     ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 85])
     if not ok:
@@ -60,6 +101,8 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
     status = ft.Text("フォルダを開いてください", color=T.TEXT_MUTED, size=13)
     metrics = ft.Text("", color=T.TEXT, size=13, selectable=True)
     series_text = ft.Text("", color=T.ACCENT_AMBER, size=13, selectable=True)
+    series_detail = ft.Column(spacing=2)
+    series_warn = ft.Text("", color=T.ACCENT_AMBER, size=12, selectable=True)
     date_field = ft.TextField(label="検査日時", width=220, dense=True, text_size=13)
     age_field = ft.TextField(label="年齢", width=100, dense=True, text_size=13)
     sex_dd = ft.Dropdown(
@@ -72,6 +115,24 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
     case_dd = ft.Dropdown(label="症例", width=220, dense=True, options=[])
     visit_dd = ft.Dropdown(label="時点", width=280, dense=True, options=[])
     folder_field = ft.TextField(label="入力フォルダ", width=640, dense=True, text_size=13)
+    reading = {"scan_root": "", "first_csv": "", "second_csv": "", "summary": "", "final_csv": ""}
+    role_dd = ft.Dropdown(
+        label="読影担当",
+        width=360,
+        dense=True,
+        value=_ROLE_FIRST,
+        options=[
+            ft.dropdown.Option(_ROLE_FIRST, "第1グレーダー"),
+            ft.dropdown.Option(_ROLE_SECOND, "第2リーダー"),
+            ft.dropdown.Option(_ROLE_FINAL, "最終読影者"),
+        ],
+    )
+    role_hint = ft.Text(
+        "画像フォルダを開いて計測し、終わったら「第1読影を書き出す」。そのフォルダが export の親になります。",
+        size=12,
+        color=T.TEXT_MUTED,
+        selectable=True,
+    )
     img = ft.Image(src_base64=_empty_px(), width=VIEW_W, height=VIEW_H, fit=ft.ImageFit.FILL)
     tool_label = ft.Text("道具: 乳頭", color=T.PRIMARY, size=12)
     next_step = ft.Text(session.next_instruction(), size=15, color=T.ACCENT_AMBER, selectable=True)
@@ -136,8 +197,52 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
                 f"  ·  スケール {scale} µm/px"
             )
         series_text.value = session.series_note
+        _fill_series_detail()
         tool_label.value = f"道具: {_tool_name(session.tool)}"
         _refresh_lists()
+
+    def _fill_series_detail() -> None:
+        series_detail.controls.clear()
+        table = session.series_visit_table
+        if not table:
+            series_warn.value = ""
+            return
+        series_detail.controls.append(
+            ft.Row(
+                [
+                    _series_cell(label, width, align=align, color=T.TEXT_MUTED)
+                    for _key, label, _digits, width, align in _SERIES_COLS
+                ],
+                spacing=4,
+            )
+        )
+        any_rev = False
+        for row in table:
+            rev = set(row.get("reversed") or [])
+            any_rev = any_rev or bool(rev)
+            cells = []
+            for key, _label, digits, width, align in _SERIES_COLS:
+                if key == "date":
+                    shown = str(row.get("date") or "—")
+                    marked = False
+                else:
+                    shown = _num(row.get(key), digits or 0)
+                    marked = key in rev
+                cells.append(
+                    _series_cell(
+                        shown,
+                        width,
+                        align=align,
+                        color=T.ACCENT_AMBER if marked else T.TEXT,
+                        bold=marked,
+                    )
+                )
+            series_detail.controls.append(ft.Row(cells, spacing=4))
+        series_warn.value = (
+            "黄色は前の時点より逆行しています。その時点のマスクと中心窩を見直して、再セグしてください。"
+            if any_rev
+            else ""
+        )
 
     def _compose() -> tuple[np.ndarray, tuple[int, int], float]:
         assert session.gray is not None
@@ -228,7 +333,27 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
     async def on_load(_=None) -> None:
         typed = (folder_field.value or "").strip()
         if not typed:
-            await on_pick_folder()
+            await on_reading_start()
+            return
+        if _role() == _ROLE_SECOND:
+            try:
+                images = second_reader_images(Path(typed))
+                reading["scan_root"] = str(Path(typed).resolve())
+                found = find_first_grader_csv(Path(typed))
+                reading["first_csv"] = str(found) if found else ""
+                _after(session.load_paths(images, label="第2") + "。第1のマスクは開きません。")
+            except ValueError as exc:
+                _after(str(exc))
+            return
+        if _role() == _ROLE_FINAL:
+            try:
+                summary = Path(typed)
+                images = recheck_images(summary)
+                reading["summary"] = str(summary.resolve())
+                reading["scan_root"] = str(summary.resolve().parent.parent)
+                _after(session.load_paths(images, label="最終") + f"。RECHECK {len(images)} 画像。")
+            except ValueError as exc:
+                _after(str(exc))
             return
         _open_typed(typed)
 
@@ -278,10 +403,274 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
         session.close_tool()
         _after("道具を閉じました。マスクはそのままです")
 
-    def on_series(_=None) -> None:
+    def _sync_age() -> None:
         session.age = age_field.value or ""
         session.sex = sex_dd.value or "Male"
+
+    def on_series(_=None) -> None:
+        _sync_age()
         _after(session.run_series())
+
+    def on_csv_visits(_=None) -> None:
+        rows = session.visit_rows()
+        if not rows:
+            _after("マスクのある時点がありません")
+            return
+        path = write_download(download_name(session.case_id, "visits"), csv_bytes(VISIT_COLUMNS, rows))
+        _after(f"個別CSV: {path}")
+
+    def on_csv_series(_=None) -> None:
+        _sync_age()
+        note = session.run_series()
+        if session.series_summary is None:
+            _after(note)
+            return
+        path = write_download(
+            download_name(session.case_id, "series"),
+            csv_bytes(SERIES_COLUMNS, [session.series_summary]),
+        )
+        _after(f"時系列CSV: {path}")
+
+    def _role() -> str:
+        return role_dd.value or _ROLE_FIRST
+
+    def _show(title: str, body: str) -> None:
+        dlg = ft.AlertDialog(
+            title=ft.Text(title),
+            content=ft.Container(width=560, content=ft.Text(body, selectable=True, size=12)),
+        )
+
+        def _close(_=None) -> None:
+            if hasattr(page, "close"):
+                page.close(dlg)
+            else:
+                dlg.open = False
+                page.update()
+
+        dlg.actions = [ft.TextButton("閉じる", on_click=_close)]
+        if hasattr(page, "open"):
+            page.open(dlg)
+        else:
+            page.dialog = dlg
+            dlg.open = True
+            page.update()
+
+    def _scan_root() -> Path:
+        root = Path(reading["scan_root"] or session.folder or ".").resolve()
+        if root.name == "images" and root.parent.name == "export":
+            return root.parent.parent
+        return root
+
+    def _apply_role(_=None) -> None:
+        role = _role()
+        if role == _ROLE_FIRST:
+            role_hint.value = (
+                "画像フォルダを開いて計測し、終わったら「第1読影を書き出す」。"
+                "そのフォルダが export の親になります。"
+            )
+            start_btn.text = "画像フォルダを開く"
+        elif role == _ROLE_SECOND:
+            role_hint.value = (
+                "第1の出力フォルダ（export の親）を開きます。マスクは読まず、同じ画像を測り直します。"
+                "保存したあと「統合解析データ」で採用 CSV を作ります。"
+            )
+            start_btn.text = "第1の出力フォルダを開く"
+        else:
+            role_hint.value = (
+                "RECHECK の *_summary.md を選ぶと、その画像だけが開きます。"
+                "保存したあと「トライアッド確定」で中央値を書き出します。他の読影値は画面に出しません。"
+            )
+            start_btn.text = "summary.md を選ぶ"
+        first_export.visible = role == _ROLE_FIRST
+        second_export.visible = role == _ROLE_SECOND
+        merge_btn.visible = role == _ROLE_SECOND
+        final_export.visible = role == _ROLE_FINAL
+        triad_btn.visible = role == _ROLE_FINAL
+        page.update()
+
+    async def on_reading_start(_=None) -> None:
+        role = _role()
+        if role == _ROLE_FIRST:
+            await on_pick_folder()
+            return
+        try:
+            if role == _ROLE_SECOND:
+                path = await asyncio.to_thread(
+                    choose_folder,
+                    "第1グレーダーの出力フォルダ（export の親）を選んでください",
+                )
+                if not path:
+                    _after("フォルダ選択をキャンセルしました")
+                    return
+                images = second_reader_images(Path(path))
+                reading["scan_root"] = str(Path(path).resolve())
+                found = find_first_grader_csv(Path(path))
+                reading["first_csv"] = str(found) if found else ""
+                folder_field.value = reading["scan_root"]
+                note = session.load_paths(images, label="第2") + "。第1のマスクは開きません。"
+                if found:
+                    note += f" 統合には {found.name} を使います。"
+                else:
+                    note += " 第1の grader.csv は統合のときに再検索します。"
+                _after(note)
+                return
+            path = await asyncio.to_thread(choose_file, "RECHECK の summary.md を選んでください")
+            if not path:
+                _after("ファイル選択をキャンセルしました")
+                return
+            summary = Path(path)
+            images = recheck_images(summary)
+            reading["summary"] = str(summary.resolve())
+            reading["scan_root"] = str(summary.resolve().parent.parent)
+            folder_field.value = reading["summary"]
+            _after(
+                session.load_paths(images, label="最終")
+                + f"。RECHECK {len(images)} 画像。他の読影値は表示しません。"
+            )
+        except (ValueError, OSError, RuntimeError) as exc:
+            _after(str(exc))
+
+    async def on_export_first(_=None) -> None:
+        rows = session.reading_payload()
+        if not rows:
+            _after("確定した計測がありません")
+            return
+        path = await asyncio.to_thread(
+            choose_folder,
+            "第1読影の出力フォルダを選んでください。ここが export の親になります",
+        )
+        if not path:
+            _after("出力フォルダの選択をキャンセルしました")
+            return
+        saved = write_grader_bundle(Path(path), rows)
+        reading["scan_root"] = str(Path(path).resolve())
+        reading["first_csv"] = str(saved)
+        _after(f"第1読影を書き出しました。第2はこのフォルダを開きます: {path}")
+
+    def on_export_second(_=None) -> None:
+        rows = session.reading_payload()
+        if not rows:
+            _after("確定した計測がありません")
+            return
+        scan = _scan_root()
+        saved = write_reader_csv(stamped_dir(scan, "second_reader_output"), rows)
+        reading["scan_root"] = str(scan)
+        reading["second_csv"] = str(saved)
+        merge_btn.disabled = False
+        _after(f"第2読影を保存しました。統合解析データが使えます: {saved}")
+
+    def on_merge(_=None) -> None:
+        second = reading["second_csv"]
+        if not second or not Path(second).is_file():
+            _after("先に第2読影を保存してください")
+            return
+        first = reading["first_csv"]
+        if not first or not Path(first).is_file():
+            found = find_first_grader_csv(Path(reading["scan_root"]))
+            first = str(found) if found else ""
+        if not first:
+            _show(
+                "統合解析データ",
+                "第1の grader.csv が見つかりません。第1の出力フォルダ（export の親）を開いたか確認してください。",
+            )
+            return
+        out = stamped_dir(Path(reading["scan_root"]), "integrated_output")
+        try:
+            summary = merge_graders(Path(first), Path(second), out, prefix="GA")
+        except ValueError as exc:
+            _after(str(exc))
+            return
+        _show(
+            "統合解析データを作成しました",
+            "\n".join([
+                f"突合 {summary['n_matched']} 行",
+                f"RECHECK {summary['recheck_cells']} セル / {summary['recheck_files']} 画像",
+                f"採用: {summary['adopted_csv']}",
+                f"参考（提出しない）: {summary['avg_fallback_csv']}",
+                f"最終読影者はこれを選びます: {summary['summary_md']}",
+            ]),
+        )
+        _set_status(f"統合しました: {summary['summary_md']}")
+        page.update()
+
+    def on_export_final(_=None) -> None:
+        rows = session.reading_payload()
+        if not rows:
+            _after("確定した計測がありません")
+            return
+        if not reading["summary"]:
+            _after("先に summary.md を選んでください")
+            return
+        scan = Path(reading["summary"]).resolve().parent.parent
+        saved = write_reader_csv(stamped_dir(scan, "final_reader_output"), rows)
+        reading["scan_root"] = str(scan)
+        reading["final_csv"] = str(saved)
+        triad_btn.disabled = False
+        _after(f"最終読影を保存しました。トライアッド確定が使えます: {saved}")
+
+    def on_triad(_=None) -> None:
+        final_csv = reading["final_csv"]
+        summary_md = reading["summary"]
+        if not final_csv or not Path(final_csv).is_file():
+            _after("先に最終読影を保存してください")
+            return
+        if not summary_md:
+            _after("summary.md が選ばれていません")
+            return
+        out = Path(final_csv).parent
+        try:
+            preview = resolve_triad(Path(summary_md), Path(final_csv), out, dry_run=True)
+        except ValueError as exc:
+            _after(str(exc))
+            return
+        holder: dict = {}
+
+        def _close(_=None) -> None:
+            if hasattr(page, "close"):
+                page.close(holder["dlg"])
+            else:
+                holder["dlg"].open = False
+                page.update()
+
+        def _write(_=None) -> None:
+            _close()
+            try:
+                result = resolve_triad(Path(summary_md), Path(final_csv), out)
+            except ValueError as exc:
+                _after(str(exc))
+                return
+            _after(f"確定しました: {result['triad_csv']}")
+
+        holder["dlg"] = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("トライアッド確定"),
+            content=ft.Container(
+                width=560,
+                content=ft.Text(
+                    "\n".join([
+                        f"RECHECK 画像 {preview['recheck_images']}",
+                        f"中央値で埋めるセル {preview['filled_cells']}",
+                        f"要レビュー {preview['review_cells']}",
+                        "",
+                        *preview["preview"][:30],
+                        "",
+                        "この内容で書き出します。すでに採用したセルと、既存の採用 CSV はそのままです。",
+                    ]),
+                    selectable=True,
+                    size=12,
+                ),
+            ),
+            actions=[
+                ft.TextButton("キャンセル", on_click=_close),
+                ft.ElevatedButton("本確定", on_click=_write),
+            ],
+        )
+        if hasattr(page, "open"):
+            page.open(holder["dlg"])
+        else:
+            page.dialog = holder["dlg"]
+            holder["dlg"].open = True
+            page.update()
 
     def on_tap_down(e: ft.TapEvent) -> None:
         if session.gray is None:
@@ -324,6 +713,44 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
         if session.tool == "clear":
             _after(session.finish_clear())
 
+    start_btn = ft.ElevatedButton(
+        "画像フォルダを開く",
+        on_click=lambda _: page.run_task(on_reading_start),
+        height=36,
+    )
+    first_export = ft.ElevatedButton(
+        "第1読影を書き出す",
+        on_click=lambda _: page.run_task(on_export_first),
+        height=34,
+    )
+    second_export = ft.ElevatedButton(
+        "第2読影を保存",
+        on_click=on_export_second,
+        height=34,
+        visible=False,
+    )
+    merge_btn = ft.ElevatedButton(
+        "統合解析データ",
+        on_click=on_merge,
+        height=34,
+        visible=False,
+        disabled=True,
+    )
+    final_export = ft.ElevatedButton(
+        "最終読影を保存",
+        on_click=on_export_final,
+        height=34,
+        visible=False,
+    )
+    triad_btn = ft.ElevatedButton(
+        "トライアッド確定",
+        on_click=on_triad,
+        height=34,
+        visible=False,
+        disabled=True,
+    )
+    role_dd.on_change = _apply_role
+
     picker = ft.FilePicker(on_result=on_folder_result)
     page.overlay.append(picker)
 
@@ -343,11 +770,13 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
         ft.Column(
             [
                 ft.Text("GA Segmentation Optos", size=22, weight=ft.FontWeight.BOLD, color=T.PRIMARY),
+                ft.Row([role_dd, start_btn], spacing=8),
+                role_hint,
                 ft.Row(
                     [
                         folder_field,
                         _btn("開く", on_load),
-                        _btn("フォルダ選択", on_pick_folder),
+                        _btn("フォルダ選択", lambda _: page.run_task(on_reading_start)),
                     ],
                     spacing=8,
                 ),
@@ -399,7 +828,18 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
                                     ft.Divider(color="#374151"),
                                     ft.Row([age_field, sex_dd], spacing=8),
                                     _btn("時系列を計算", on_series),
+                                    ft.Row([
+                                        _btn("個別CSV", on_csv_visits),
+                                        _btn("時系列CSV", on_csv_series),
+                                    ], spacing=6),
+                                    first_export,
+                                    second_export,
+                                    merge_btn,
+                                    final_export,
+                                    triad_btn,
                                     series_text,
+                                    series_detail,
+                                    series_warn,
                                 ],
                                 spacing=8,
                                 scroll=ft.ScrollMode.AUTO,

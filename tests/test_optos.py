@@ -186,6 +186,81 @@ def test_first_fovea_click_segments_and_disc_click_does_not():
     assert np.array_equal(session.mask, kept)
 
 
+def test_csv_exports_visits_and_withholds_years_when_close():
+    from pathlib import Path
+
+    from optos_ui.csv_export import SERIES_COLUMNS, VISIT_COLUMNS, csv_bytes
+    from optos_ui.session import OptosSession, VisitSnap
+
+    def mask_near():
+        out = np.zeros((240, 240), dtype=np.uint8)
+        cv2.circle(out, (70, 120), 30, 255, thickness=-1)
+        return out
+
+    session = OptosSession()
+    session.case_id = "OD"
+    session.files = [Path("a.png"), Path("b.png")]
+    for name, date in (("a.png", "2020-01-01"), ("b.png", "2021-01-01")):
+        session.snaps[f"OD/{name}"] = VisitSnap(
+            filename=name, path=name, date_iso=date, date_source="filename",
+            gray=np.full((240, 240), 180, dtype=np.uint8),
+            disc_xy=(200.0, 120.0), fovea_xy=(120.0, 120.0),
+            scale_um_px=10.0, mask=mask_near(), confirmed=True,
+        )
+    rows = session.visit_rows()
+    assert len(rows) == 2
+    assert rows[0]["area_mm2"] > 0
+    text = csv_bytes(VISIT_COLUMNS, rows).decode("utf-8-sig")
+    assert text.startswith("case_id,date,")
+    note = session.run_series()
+    assert "出しません" in note
+    summary = session.series_summary
+    assert summary is not None
+    assert summary["years_to_fovea"] is None
+    assert summary["gap_um_per_year"] is None
+    assert summary["area_mm2_per_year"] is not None
+    series = csv_bytes(SERIES_COLUMNS, [summary]).decode("utf-8-sig")
+    assert "years_to_fovea" in series.splitlines()[0]
+    assert series.splitlines()[1].split(",")[8] == ""
+
+
+def test_browser_close_exits_only_when_no_client_remains(monkeypatch):
+    import optos_app
+
+    calls = []
+    monkeypatch.setattr(optos_app.os, "_exit", lambda code: calls.append(code))
+    optos_app._clients = 1
+    optos_app._exit_if_no_clients()
+    assert calls == []
+    optos_app._clients = 0
+    optos_app._exit_if_no_clients()
+    assert calls == [0]
+    optos_app._clients = 0
+
+
+def test_series_table_marks_a_backward_step():
+    from optos_ui.csv_export import mark_reversals
+
+    rows = mark_reversals([
+        {
+            "area_mm_sqrt": 2.0,
+            "gawain": 40.0,
+            "dist_um_nearest": 200.0,
+            "gap_um": 180.0,
+            "intact_1mm_mm2": 1.5,
+        },
+        {
+            "area_mm_sqrt": 1.5,
+            "gawain": 50.0,
+            "dist_um_nearest": 150.0,
+            "gap_um": 220.0,
+            "intact_1mm_mm2": 1.2,
+        },
+    ])
+    assert rows[0]["reversed"] == []
+    assert set(rows[1]["reversed"]) == {"area_mm_sqrt", "gawain", "gap_um"}
+
+
 def test_analysis_circle_is_centered_in_the_view():
     from optos_ui.app import VIEW_H, VIEW_W, analysis_display_zoom, centered_crop_origin
 
