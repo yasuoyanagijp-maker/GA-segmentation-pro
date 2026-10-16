@@ -240,6 +240,35 @@ def _slope_per_year_from_results(
     return float(slope)
 
 
+# 緑 AF の中心窩クリックは、これより近い隙間を年数にすると誤差が年数になる。
+FOVEAL_GAP_MIN_UM = 250.0
+
+
+def describe_foveal_approach(
+    dist_um: float | None,
+    rate_um_per_year: float | None,
+) -> str:
+    """中心窩までの距離を、年数にしてよいかを分けて一文にする。
+
+    隙間が FOVEAL_GAP_MIN_UM 未満のときは、位置合わせしても
+    到達年数にはしない。その症例の進行は面積と中心 1 mm の残存で見る。
+    """
+    if dist_um is None:
+        return "中心窩までの距離は測れていません"
+    if dist_um < FOVEAL_GAP_MIN_UM:
+        return (
+            f"中心窩まで {dist_um:.0f} µm。"
+            "縁に達しているので、到達年数は出しません"
+        )
+    if rate_um_per_year and rate_um_per_year > 0:
+        years = float(dist_um) / float(rate_um_per_year)
+        return (
+            f"中心窩距離 {rate_um_per_year} µm/年"
+            f" · 最新時点から中心窩まで {years:.2f} 年"
+        )
+    return f"中心窩まで {dist_um:.0f} µm"
+
+
 def estimate_progression_rate_um_per_year(results: list[dict]) -> float | None:
     """中心窩距離の時系列から進行速度（μm/年）を線形回帰で推定。"""
     slope = _slope_per_year_from_results(
@@ -255,6 +284,16 @@ def estimate_growth_mm2_per_year(results: list[dict]) -> float | None:
     """GA面積の時系列から拡大速度（mm²/年）を線形回帰で推定。"""
     slope = _slope_per_year_from_results(
         results, lambda r: r['stats']['area_mm2'],
+    )
+    if slope is None:
+        return None
+    return round(slope, 3)
+
+
+def estimate_intact_mm2_per_year(results: list[dict]) -> float | None:
+    """中心 1 mm の残存面積の傾き（mm²/年）。減っていれば負。"""
+    slope = _slope_per_year_from_results(
+        results, lambda r: r['stats'].get('intact_1mm_mm2'),
     )
     if slope is None:
         return None

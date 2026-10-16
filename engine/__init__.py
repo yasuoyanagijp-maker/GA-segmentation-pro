@@ -17,4 +17,5 @@ Flet UI など任意のフロントエンドから同じロジックを呼び出
     timeseries         複数時点の解析・GIF/グラフ用データ生成
     overlay            オーバーレイ画像（可視化）の生成
     export             結果のエクスポート
+    optos              Optos 緑AFの初期マスク（現行 segment_ga とは別経路）
 """
