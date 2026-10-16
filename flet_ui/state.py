@@ -49,6 +49,8 @@ class GAAppState:
     seg_min_size: int = 500
     # 自動セグ後の制約付き Chan-Vese 精緻化（既定 ON）
     seg_auto_cv: bool = True
+    # otsu | seeded（既定 seeded; シード失敗時は Otsu へ自動フォールバック）
+    seg_auto_mode: str = "seeded"
     scale_um_px: float | None = None
 
     img_full: np.ndarray | None = None
@@ -59,7 +61,7 @@ class GAAppState:
 
     mask: np.ndarray | None = None
     stats: dict | None = None
-    # Interactive ROI grow: standard | lsf | cv_refine（Phase A 安全レールは常時）
+    # Interactive ROI grow: standard | lsf | entropy | cv_refine（Phase A 安全レールは常時）
     grow_mode: str = "standard"
 
     disc_diameter_um: float = 1800.0

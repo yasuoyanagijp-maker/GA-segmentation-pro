@@ -3,7 +3,9 @@ import numpy as np
 from engine.region_growing import (
     DEFAULT_MAX_DELTA_PX,
     DEFAULT_RADIUS_PX,
+    GROW_MODE_ENTROPY,
     GROW_MODE_LSF,
+    GROW_MODE_STANDARD,
     erase_bright_from_mask,
     erase_oversegmentation_from_mask,
     expand_segmentation_from_mask,
@@ -200,6 +202,73 @@ def test_expand_lsf_mode_smoke():
     assert out[15, 15] == 255
 
 
+def test_entropy_suppresses_peripheral_leak_on_synthetic():
+    """均質暗部シードから、高エントロピー（混在）帯を越える漏れを抑制。"""
+    rng = np.random.default_rng(0)
+    img = np.full((80, 80), 200, dtype=np.uint8)
+    # Homogeneous dark GA core (low entropy)
+    img[28:52, 28:52] = 45
+    # Mottled dark/bright ring (high entropy) — intensity grow would accept dark half
+    ring = np.zeros((80, 80), dtype=bool)
+    yy, xx = np.ogrid[:80, :80]
+    d2 = (xx - 40) ** 2 + (yy - 40) ** 2
+    ring = (d2 >= 14 ** 2) & (d2 <= 22 ** 2)
+    noise = rng.integers(30, 200, size=(80, 80), dtype=np.uint8)
+    img[ring] = noise[ring]
+    # Outer dark annulus beyond the ring (leak target if entropy off)
+    outer = (d2 > 22 ** 2) & (d2 <= 30 ** 2)
+    img[outer] = 45
+
+    ga_mask = np.zeros((80, 80), dtype=np.uint8)
+    ga_mask[36:44, 36:44] = 255
+    seed = (40, 40)
+
+    out_plain, added_plain = expand_segmentation_from_mask(
+        img, ga_mask, seed, a=2.5,
+        mode=GROW_MODE_LSF,
+        use_entropy_stop=False,
+        radius_px=35,
+        max_delta_px=5000,
+        require_adjacency=True,
+    )
+    out_ent, added_ent = expand_segmentation_from_mask(
+        img, ga_mask, seed, a=2.5,
+        mode=GROW_MODE_ENTROPY,
+        radius_px=35,
+        max_delta_px=5000,
+        require_adjacency=True,
+    )
+    # Entropy path remains callable and grows something in the core
+    assert out_ent[40, 40] == 255
+    assert added_ent >= 0
+    # Outer annulus leak: entropy should add fewer (or equal) pixels there
+    leak_plain = int(np.count_nonzero(out_plain[outer]))
+    leak_ent = int(np.count_nonzero(out_ent[outer]))
+    assert leak_ent <= leak_plain
+    # If plain path leaked at all, entropy should suppress at least some
+    if leak_plain > 0:
+        assert leak_ent < leak_plain or added_ent < added_plain
+
+
+def test_expand_entropy_mode_manual_path_callable():
+    """手動パス相当: GROW_MODE_ENTROPY / use_entropy_stop で呼べる。"""
+    img = np.full((40, 40), 200, dtype=np.uint8)
+    img[10:20, 10:20] = 40
+    ga_mask = np.zeros((40, 40), dtype=np.uint8)
+    ga_mask[12:14, 12:14] = 255
+    out, added = expand_segmentation_from_mask(
+        img, ga_mask, (15, 15), a=1.5, mode=GROW_MODE_ENTROPY,
+    )
+    assert added > 0
+    assert out[15, 15] == 255
+    out2, added2 = expand_segmentation_from_mask(
+        img, ga_mask, (15, 15), a=1.5,
+        mode=GROW_MODE_LSF, use_entropy_stop=True,
+    )
+    assert added2 > 0
+    assert out2[15, 15] == 255
+
+
 def test_erase_max_delta_symmetric_cap():
     img = np.full((40, 40), 180, dtype=np.uint8)
     img[12:18, 12:18] = 50
@@ -221,6 +290,96 @@ def test_refine_mask_chan_vese_light_smoke():
     refined = refine_mask_chan_vese_light(img, mask, num_iter=3, pad=8)
     assert refined.shape == mask.shape
     assert np.any(refined > 0)
+
+
+def test_expand_mottled_dark_lesion_toward_partial_mask():
+    """まだら暗部: 部分緑の上側シードから病変暗部へ成長し、明部背景は拒否。"""
+    rng = np.random.default_rng(2)
+    img = np.full((80, 80), 195, dtype=np.uint8)
+    # 病変域: ベース暗部 + モットル（数〜十数 gray のばらつき）
+    lesion = np.zeros((80, 80), dtype=bool)
+    lesion[24:56, 24:56] = True
+    mottling = rng.integers(-10, 16, size=(80, 80))
+    img[lesion] = np.clip(38 + mottling[lesion], 22, 72).astype(np.uint8)
+    # 細いやや明るい筋（狭い band + 4連結だと分断しやすい）
+    img[34, 26:54] = np.clip(img[34, 26:54].astype(np.int16) + 22, 0, 255).astype(np.uint8)
+    img[42, 26:54] = np.clip(img[42, 26:54].astype(np.int16) + 18, 0, 255).astype(np.uint8)
+
+    ga_mask = np.zeros((80, 80), dtype=np.uint8)
+    ga_mask[48:54, 34:46] = 255  # 病変下部の小さな緑島
+    seed = (40, 30)  # 緑の上側・同一暗部内
+    assert ga_mask[seed[1], seed[0]] == 0
+    assert img[seed[1], seed[0]] < 80
+
+    out, added = expand_segmentation_from_mask(
+        img,
+        ga_mask,
+        seed,
+        a=0.9,
+        window_size=11,
+        radius_px=40,
+        max_delta_px=4000,
+        require_adjacency=True,
+        mode=GROW_MODE_STANDARD,
+    )
+    assert added > 0
+    assert out[seed[1], seed[0]] == 255
+    # マスク方向（下方）の暗部へ伸びる／マスク近傍を含む
+    assert np.any(out[44:54, 34:46] > 0)
+    # 明部背景は拒否
+    assert out[5, 5] == 0
+    assert out[70, 70] == 0
+    assert out[10, 70] == 0
+
+
+def test_expand_fills_enclosed_hole_on_click():
+    """緑マスクに囲まれた黒い抜けをクリックすると埋まる（大きさキャップなし）。"""
+    img = np.full((64, 64), 200, dtype=np.uint8)
+    img[16:48, 16:48] = 40
+    mask = np.zeros((64, 64), dtype=np.uint8)
+    mask[18:46, 18:46] = 255
+    mask[28:36, 28:36] = 0  # enclosed dark hole
+    img[28:36, 28:36] = 25
+    assert mask[32, 32] == 0
+    grown, added = expand_segmentation_from_mask(
+        img,
+        mask,
+        (32, 32),
+        a=1.0,
+        window_size=11,
+        radius_px=5,  # 小さめでも穴全体が埋まること
+        max_delta_px=10,
+        require_adjacency=True,
+        mode=GROW_MODE_STANDARD,
+    )
+    assert added > 10  # max_delta=10 を超えて埋まる
+    assert grown[32, 32] == 255
+    assert np.all(grown[28:36, 28:36] == 255)
+
+
+def test_expand_fills_open_gap_between_lobes():
+    """完全には囲まれていない葉の間の隙間をクリックで埋める。"""
+    img = np.full((80, 80), 200, dtype=np.uint8)
+    img[20:60, 15:65] = 40
+    mask = np.zeros((80, 80), dtype=np.uint8)
+    # 左右2葉（間に開いた隙間 — binary_fill_holes では埋まらない）
+    mask[25:55, 18:32] = 255
+    mask[25:55, 48:62] = 255
+    gap_x, gap_y = 40, 40
+    assert mask[gap_y, gap_x] == 0
+    grown, added = expand_segmentation_from_mask(
+        img,
+        mask,
+        (gap_x, gap_y),
+        a=1.0,
+        window_size=11,
+        radius_px=3,
+        max_delta_px=5,
+        require_adjacency=True,
+        mode=GROW_MODE_STANDARD,
+    )
+    assert added > 5
+    assert grown[gap_y, gap_x] == 255
 
 
 def test_refine_cv_fills_interior_holes():
