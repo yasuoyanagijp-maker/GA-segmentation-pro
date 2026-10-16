@@ -186,6 +186,24 @@ def test_first_fovea_click_segments_and_disc_click_does_not():
     assert np.array_equal(session.mask, kept)
 
 
+def test_analysis_circle_is_centered_in_the_view():
+    from optos_ui.app import VIEW_H, VIEW_W, analysis_display_zoom, centered_crop_origin
+
+    scale = 10.0
+    zoom = analysis_display_zoom(scale, 1)
+    assert zoom < 1
+    diameter = 2 * (6.0 * 1000 / scale) * zoom
+    assert diameter <= min(VIEW_W, VIEW_H)
+    center = (800.0, 800.0)
+    zw = int(round(1600 * zoom))
+    zh = int(round(1600 * zoom))
+    x0, y0 = centered_crop_origin(center, (0.0, 0.0), zoom, (zw, zh))
+    shown_cx = x0 + min(VIEW_W, zw) / 2
+    shown_cy = y0 + min(VIEW_H, zh) / 2
+    assert abs(shown_cx - center[0] * zoom) <= 1
+    assert abs(shown_cy - center[1] * zoom) <= 1
+
+
 def test_next_instruction_follows_the_visit():
     from pathlib import Path
 

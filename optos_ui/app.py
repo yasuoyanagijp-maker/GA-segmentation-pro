@@ -22,6 +22,28 @@ VIEW_W = 760
 VIEW_H = 640
 
 
+def analysis_display_zoom(scale_um_px: float, user_zoom: float) -> float:
+    """1x で中心 6 mm の円が画面に収まる。2x・4x はその倍率。"""
+    diameter = max(1.0, 2.0 * px_from_mm(6.0, scale_um_px))
+    fit = min(VIEW_W / (diameter * 1.08), VIEW_H / (diameter * 1.08), 1.0)
+    return fit * float(user_zoom)
+
+
+def centered_crop_origin(
+    center_xy: tuple[float, float],
+    pan_xy: tuple[float, float],
+    zoom: float,
+    image_wh: tuple[int, int],
+) -> tuple[int, int]:
+    """拡大後画像で、center がビュー中央に来る切り出し原点。"""
+    zw, zh = image_wh
+    cx = (float(center_xy[0]) + float(pan_xy[0])) * float(zoom)
+    cy = (float(center_xy[1]) + float(pan_xy[1])) * float(zoom)
+    x0 = int(np.clip(round(cx - VIEW_W / 2), 0, max(0, zw - VIEW_W)))
+    y0 = int(np.clip(round(cy - VIEW_H / 2), 0, max(0, zh - VIEW_H)))
+    return x0, y0
+
+
 def _jpeg_b64(rgb: np.ndarray) -> str:
     ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 85])
     if not ok:
@@ -132,7 +154,7 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
             if session.disc_xy is not None:
                 dc = (int(session.disc_xy[0] - x0), int(session.disc_xy[1] - y0))
                 cv2.circle(rgb, dc, px_from_mm(0.9, session.scale_um_px), (251, 191, 36), 1)
-            return rgb, (x0, y0), float(session.zoom)
+            return rgb, (x0, y0), analysis_display_zoom(session.scale_um_px, session.zoom)
         rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
         if session.disc_xy is not None:
             cv2.circle(rgb, (int(session.disc_xy[0]), int(session.disc_xy[1])), 8, (251, 191, 36), 2)
@@ -144,11 +166,12 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
         if session.fovea_xy is None:
             zw, zh = max(1, int(rgb.shape[1] * z)), max(1, int(rgb.shape[0] * z))
             return cv2.resize(rgb, (zw, zh), interpolation=cv2.INTER_AREA)
-        zw, zh = max(1, int(rgb.shape[1] * z)), max(1, int(rgb.shape[0] * z))
-        big = cv2.resize(rgb, (zw, zh), interpolation=cv2.INTER_NEAREST)
-        px, py = session.pan_xy
-        x0 = int(np.clip(px * z, 0, max(0, zw - VIEW_W)))
-        y0 = int(np.clip(py * z, 0, max(0, zh - VIEW_H)))
+        zw, zh = max(1, int(round(rgb.shape[1] * z))), max(1, int(round(rgb.shape[0] * z)))
+        interp = cv2.INTER_AREA if z < 1 else cv2.INTER_NEAREST
+        big = cv2.resize(rgb, (zw, zh), interpolation=interp)
+        ox, oy = view["origin"]
+        center = (session.fovea_xy[0] - ox, session.fovea_xy[1] - oy)
+        x0, y0 = centered_crop_origin(center, session.pan_xy, z, (zw, zh))
         view["pan"] = (x0, y0)
         return big[y0:y0 + VIEW_H, x0:x0 + VIEW_W].copy()
 
@@ -292,7 +315,7 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
             session.extend_clear(_to_image(e.local_x, e.local_y))
         elif session.tool == "pan" and session.fovea_xy is not None and "drag" in view:
             sx, sy, (px, py) = view["drag"]
-            z = float(session.zoom) or 1.0
+            z = float(view["zoom"]) or 1.0
             session.pan_xy = (px - (e.local_x - sx) / z, py - (e.local_y - sy) / z)
             _paint()
             page.update()
