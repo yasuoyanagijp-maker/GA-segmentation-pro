@@ -165,6 +165,27 @@ def test_grow_to_edge_returns_mask():
     assert added >= 0
 
 
+def test_first_fovea_click_segments_and_disc_click_does_not():
+    from optos_ui.session import OptosSession
+
+    img, fovea, disc, _scale = _scene()
+    session = OptosSession()
+    session.gray = img
+    session.mask = np.zeros(img.shape, dtype=np.uint8)
+    session.place_disc(disc)
+    assert session.fovea_xy is not None
+    assert session.fovea_user_placed is False
+    assert not np.any(session.mask)
+    session.place_fovea(fovea)
+    assert session.fovea_user_placed is True
+    assert session.mask_stale is False
+    assert np.any(session.mask)
+    kept = session.mask.copy()
+    session.place_fovea((fovea[0] + 8.0, fovea[1]))
+    assert session.mask_stale is True
+    assert np.array_equal(session.mask, kept)
+
+
 def test_next_instruction_follows_the_visit():
     from pathlib import Path
 

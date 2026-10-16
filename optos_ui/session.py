@@ -137,14 +137,13 @@ class OptosSession:
                 self.disc_xy, self.gray.shape[:2], scale_um_px=provisional,
             )
             self.scale_um_px = scale_from_dfd(self.disc_xy, self.fovea_xy)
-            self.resegment()
             self.tool = "fovea"
             scale = f"{self.scale_um_px:.2f}"
             if provisional:
                 return (
                     f"この時点のスケール {scale} µm/px。"
                     "乳頭の大きさから中心窩を 4.76 mm 先に置きました。"
-                    "中心窩を動かすと、この時点だけの DFD スケールに変わります"
+                    "中心窩をクリックすると、その位置のスケールでマスクが出ます"
                 )
             return (
                 f"中心窩は仮位置です。合わせるとこの時点の DFD スケール"
@@ -161,6 +160,7 @@ class OptosSession:
     def place_fovea(self, xy: tuple[float, float]) -> str:
         if self.gray is None:
             return "画像がありません"
+        first_placement = not self.fovea_user_placed
         self.fovea_xy = (float(xy[0]), float(xy[1]))
         if self.disc_xy is not None:
             self.scale_um_px = scale_from_dfd(self.disc_xy, self.fovea_xy)
@@ -168,18 +168,25 @@ class OptosSession:
         self.fovea_user_placed = True
         self.mask_stale = True
         self.pan_xy = (0.0, 0.0)
-        if self.scale_um_px:
+        if first_placement and self.disc_xy is not None and self.scale_um_px:
+            self.resegment()
+            text = (
+                f"中心窩からマスクを作りました。この時点の DFD スケールは {self.scale_um_px:.2f} µm/px です。"
+                "他の時点には使いません"
+            )
+        elif self.scale_um_px:
             text = (
                 f"中心窩を移動しました。この時点の DFD スケールは {self.scale_um_px:.2f} µm/px です。"
                 "他の時点には使いません。マスクは再セグまでそのままです"
             )
-            if self.gray is not None and self.disc_xy is not None:
-                rim = provisional_scale_from_disc(self.gray, self.disc_xy)
-                note = scale_disagreement_note(self.scale_um_px, rim)
-                if note:
-                    text = f"{text}。{note}"
-            return text
-        return "中心窩を移動しました。乳頭が決まるとこの時点の DFD スケールになります"
+        else:
+            return "中心窩を移動しました。乳頭が決まるとこの時点の DFD スケールになります"
+        if self.gray is not None and self.disc_xy is not None:
+            rim = provisional_scale_from_disc(self.gray, self.disc_xy)
+            note = scale_disagreement_note(self.scale_um_px, rim)
+            if note:
+                text = f"{text}。{note}"
+        return text
 
     def resegment(self) -> str:
         if self.gray is None or self.fovea_xy is None or self.disc_xy is None or not self.scale_um_px:
@@ -281,7 +288,7 @@ class OptosSession:
             return (
                 "「中心窩」で、中心窩らしい場所をクリックしてください。"
                 "仮の点は乳頭から 4.76 mm 先です。"
-                "クリックすると、この時点だけのスケールになります。"
+                "クリックすると、この時点のスケールでマスクが出ます。"
             )
         if self.mask_stale:
             return "「再セグ」を押してください。マスクが、この時点のスケールで作り直されます。"
