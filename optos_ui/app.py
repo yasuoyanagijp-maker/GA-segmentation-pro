@@ -17,7 +17,7 @@ from flet_ui import theme as T
 from flet_ui.theme import apply_page_theme
 from ga_reading.bundle import stamped_dir, write_grader_bundle, write_reader_csv
 from ga_reading.merge import merge_graders
-from ga_reading.queue import find_first_grader_csv, recheck_images, second_reader_images
+from ga_reading.queue import find_first_grader_csv, latest_workflow_csv, recheck_images, second_reader_images
 from ga_reading.triad import resolve_triad
 from optos_ui.csv_export import SERIES_COLUMNS, VISIT_COLUMNS, csv_bytes, download_name, write_download
 from optos_ui.folder_dialog import choose_file, choose_folder
@@ -29,6 +29,11 @@ _ROLE_FINAL = "FINAL"
 
 VIEW_W = 760
 VIEW_H = 640
+
+
+def uses_macula_window(fovea_user_placed: bool, fovea_xy, scale_um_px) -> bool:
+    """中心窩をユーザーが置くまでは全体と同じ縮尺で見せる。仮の点では拡大しない。"""
+    return bool(fovea_user_placed and fovea_xy is not None and scale_um_px)
 
 
 def analysis_display_zoom(scale_um_px: float, user_zoom: float) -> float:
@@ -85,6 +90,19 @@ def _num(value: object, digits: int) -> str:
     return f"{float(value):.{digits}f}"
 
 
+def _sync_option_list(options: list, pairs: list[tuple[str, str]]) -> None:
+    """既存の Option を残したまま見出しを変える。作り直すと Flet が ID なしの削除を送って画面が止まる。"""
+    for opt, (key, text) in zip(options, pairs):
+        if opt.key != key:
+            opt.key = key
+        if opt.text != text:
+            opt.text = text
+    if len(options) > len(pairs):
+        del options[len(pairs):]
+    elif len(options) < len(pairs):
+        options.extend(ft.dropdown.Option(key, text) for key, text in pairs[len(options):])
+
+
 def _jpeg_b64(rgb: np.ndarray) -> str:
     ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 85])
     if not ok:
@@ -135,20 +153,27 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
     )
     img = ft.Image(src_base64=_empty_px(), width=VIEW_W, height=VIEW_H, fit=ft.ImageFit.FILL)
     tool_label = ft.Text("道具: 乳頭", color=T.PRIMARY, size=12)
+    tool_buttons: dict[str, ft.IconButton] = {}
+    zoom_buttons: dict[int, ft.IconButton] = {}
     next_step = ft.Text(session.next_instruction(), size=15, color=T.ACCENT_AMBER, selectable=True)
 
     view = {"origin": (0, 0), "zoom": 1.0, "pan": (0.0, 0.0)}
+    series_rows: list[tuple[list[ft.Text], ft.Text]] = []
 
     def _set_status(text: str) -> None:
         status.value = text
 
+    def _set_if_changed(ctrl, attr: str, value) -> None:
+        if getattr(ctrl, attr) != value:
+            setattr(ctrl, attr, value)
+
     def _refresh_lists() -> None:
-        case_dd.options = [
-            ft.dropdown.Option(key, f"{key} ({len(session.cases[key])})")
-            for key in session.cases
-        ]
-        case_dd.value = session.case_id or None
-        visit_dd.options = []
+        _sync_option_list(
+            case_dd.options,
+            [(key, f"{key} ({len(session.cases[key])})") for key in session.cases],
+        )
+        _set_if_changed(case_dd, "value", session.case_id or None)
+        visit_pairs = []
         for i, path in enumerate(session.files):
             snap = session.snap_for(path.name)
             mark = "済 " if snap is not None and snap.confirmed else ""
@@ -158,22 +183,18 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
                 scale_note = f"  {snap.scale_um_px:.1f}µm/px"
             else:
                 scale_note = ""
-            visit_dd.options.append(
-                ft.dropdown.Option(str(i), f"{mark}{path.name}{scale_note}")
-            )
-        if session.files:
-            visit_dd.value = str(session.index)
-        date_field.value = session.date_iso
-        age_field.value = session.age
-        sex_dd.value = session.sex
+            visit_pairs.append((str(i), f"{mark}{path.name}{scale_note}"))
+        _sync_option_list(visit_dd.options, visit_pairs)
+        _set_if_changed(visit_dd, "value", str(session.index) if session.files else None)
+        _set_if_changed(date_field, "value", session.date_iso)
+        _set_if_changed(age_field, "value", session.age)
+        _set_if_changed(sex_dd, "value", session.sex)
 
-    def _paint() -> None:
-        next_step.value = session.next_instruction()
+    def _paint_image() -> None:
         if session.gray is None:
             img.src_base64 = _empty_px()
             img.width = VIEW_W
             img.height = 200
-            metrics.value = ""
             return
         rgb, origin, src_zoom = _compose()
         view["origin"] = origin
@@ -182,62 +203,103 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
         img.src_base64 = _jpeg_b64(shown)
         img.width = shown.shape[1]
         img.height = shown.shape[0]
+
+    def _paint_metrics() -> None:
         stats = session.live_stats()
         if stats is None:
-            metrics.value = "面積は中心 6 mm だけを数えます"
+            metrics.value = "面積は中心 6 mm だけを数えます" if session.gray is not None else ""
+            return
+        scale = f"{session.scale_um_px:.2f}" if session.scale_um_px else "—"
+        metrics.value = (
+            f"中心6mm {stats['area_mm2']:.3f} mm²"
+            f"  ·  24mmモデル {_num(stats.get('area_mm2_24mm'), 3)} mm²"
+            f"  ·  √{stats['area_mm_sqrt']:.2f} mm"
+            f"  ·  病変 {stats['lesion_count']}"
+            f"  ·  GAWAIN {stats['gawain']}"
+            f"  ·  中心窩まで {stats['dist_um']} µm"
+            f"\n6mm の外 {stats['outside_quant_px']} px は面積に入れていません"
+            f"  ·  スケール {scale} µm/px"
+        )
+
+    def _paint() -> None:
+        next_step.value = session.next_instruction()
+        _paint_image()
+        if session.gray is None:
+            metrics.value = ""
         else:
-            scale = f"{session.scale_um_px:.2f}" if session.scale_um_px else "—"
-            metrics.value = (
-                f"中心6mm {stats['area_mm2']:.3f} mm²"
-                f"  ·  √{stats['area_mm_sqrt']:.2f} mm"
-                f"  ·  病変 {stats['lesion_count']}"
-                f"  ·  GAWAIN {stats['gawain']}"
-                f"  ·  中心窩まで {stats['dist_um']} µm"
-                f"\n6mm の外 {stats['outside_quant_px']} px は面積に入れていません"
-                f"  ·  スケール {scale} µm/px"
-            )
+            _paint_metrics()
         series_text.value = session.series_note
         _fill_series_detail()
         tool_label.value = f"道具: {_tool_name(session.tool)}"
+        _sync_tool_chrome()
         _refresh_lists()
 
+    def _clear_series_rows() -> None:
+        if series_detail.controls:
+            series_detail.controls.clear()
+        series_rows.clear()
+
+    def _append_series_row() -> None:
+        texts: list[ft.Text] = []
+        cells = []
+        for _key, _label, _digits, width, align in _SERIES_COLS:
+            cell = _series_cell("—", width, align=align, color=T.TEXT)
+            texts.append(cell.content)
+            cells.append(cell)
+        globe = ft.Text("", size=11, color=T.TEXT_MUTED, font_family="monospace")
+        series_detail.controls.append(ft.Row(cells, spacing=4))
+        series_detail.controls.append(globe)
+        series_rows.append((texts, globe))
+
+    def _style_series_text(ctrl: ft.Text, shown: str, *, marked: bool) -> None:
+        color = T.ACCENT_AMBER if marked else T.TEXT
+        weight = ft.FontWeight.BOLD if marked else None
+        if ctrl.value != shown:
+            ctrl.value = shown
+        if ctrl.color != color:
+            ctrl.color = color
+        if ctrl.weight != weight:
+            ctrl.weight = weight
+
     def _fill_series_detail() -> None:
-        series_detail.controls.clear()
         table = session.series_visit_table
         if not table:
+            _clear_series_rows()
             series_warn.value = ""
             return
-        series_detail.controls.append(
-            ft.Row(
-                [
-                    _series_cell(label, width, align=align, color=T.TEXT_MUTED)
-                    for _key, label, _digits, width, align in _SERIES_COLS
-                ],
-                spacing=4,
+        if not series_detail.controls:
+            series_detail.controls.append(
+                ft.Row(
+                    [
+                        _series_cell(label, width, align=align, color=T.TEXT_MUTED)
+                        for _key, label, _digits, width, align in _SERIES_COLS
+                    ],
+                    spacing=4,
+                )
             )
-        )
+        while len(series_rows) < len(table):
+            _append_series_row()
+        while len(series_rows) > len(table):
+            series_rows.pop()
+            series_detail.controls.pop()
+            series_detail.controls.pop()
         any_rev = False
-        for row in table:
+        for row, (texts, globe) in zip(table, series_rows):
             rev = set(row.get("reversed") or [])
             any_rev = any_rev or bool(rev)
-            cells = []
-            for key, _label, digits, width, align in _SERIES_COLS:
+            for (key, _label, digits, _width, _align), ctrl in zip(_SERIES_COLS, texts):
                 if key == "date":
-                    shown = str(row.get("date") or "—")
-                    marked = False
+                    _style_series_text(ctrl, str(row.get("date") or "—"), marked=False)
                 else:
-                    shown = _num(row.get(key), digits or 0)
-                    marked = key in rev
-                cells.append(
-                    _series_cell(
-                        shown,
-                        width,
-                        align=align,
-                        color=T.ACCENT_AMBER if marked else T.TEXT,
-                        bold=marked,
+                    _style_series_text(
+                        ctrl,
+                        _num(row.get(key), digits or 0),
+                        marked=key in rev,
                     )
-                )
-            series_detail.controls.append(ft.Row(cells, spacing=4))
+            globe_value = row.get("area_mm2_24mm")
+            globe_text = "—" if globe_value is None else f"24mmモデル {_num(globe_value, 3)} mm²"
+            if globe.value != globe_text:
+                globe.value = globe_text
         series_warn.value = (
             "黄色は前の時点より逆行しています。その時点のマスクと中心窩を見直して、再セグしてください。"
             if any_rev
@@ -248,7 +310,7 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
         assert session.gray is not None
         gray = session.gray
         mask = session.mask if session.mask is not None else np.zeros(gray.shape[:2], dtype=np.uint8)
-        if session.fovea_xy is not None and session.scale_um_px:
+        if uses_macula_window(session.fovea_user_placed, session.fovea_xy, session.scale_um_px):
             x0, y0, x1, y1 = window_box(gray.shape[:2], session.fovea_xy, session.scale_um_px)
             crop_g = gray[y0:y1, x0:x1]
             crop_m = mask[y0:y1, x0:x1]
@@ -261,14 +323,21 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
                 cv2.circle(rgb, dc, px_from_mm(0.9, session.scale_um_px), (251, 191, 36), 1)
             return rgb, (x0, y0), analysis_display_zoom(session.scale_um_px, session.zoom)
         rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-        if session.disc_xy is not None:
-            cv2.circle(rgb, (int(session.disc_xy[0]), int(session.disc_xy[1])), 8, (251, 191, 36), 2)
         fit = min(VIEW_W / rgb.shape[1], VIEW_H / rgb.shape[0])
+        radius = max(8, int(round(14 / max(fit, 1e-6))))
+        thick = max(2, int(round(2 / max(fit, 1e-6))))
+        if session.disc_xy is not None:
+            cv2.circle(rgb, (int(session.disc_xy[0]), int(session.disc_xy[1])), radius, (251, 191, 36), thick)
+        if session.fovea_xy is not None and not session.fovea_user_placed:
+            fx, fy = int(session.fovea_xy[0]), int(session.fovea_xy[1])
+            arm = radius
+            cv2.line(rgb, (fx - arm, fy), (fx + arm, fy), (34, 211, 238), thick)
+            cv2.line(rgb, (fx, fy - arm), (fx, fy + arm), (34, 211, 238), thick)
         return rgb, (0, 0), fit
 
     def _viewport(rgb: np.ndarray) -> np.ndarray:
         z = float(view["zoom"])
-        if session.fovea_xy is None:
+        if not uses_macula_window(session.fovea_user_placed, session.fovea_xy, session.scale_um_px):
             zw, zh = max(1, int(rgb.shape[1] * z)), max(1, int(rgb.shape[0] * z))
             return cv2.resize(rgb, (zw, zh), interpolation=cv2.INTER_AREA)
         zw, zh = max(1, int(round(rgb.shape[1] * z))), max(1, int(round(rgb.shape[0] * z)))
@@ -283,7 +352,7 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
     def _to_image(local_x: float, local_y: float) -> tuple[float, float]:
         ox, oy = view["origin"]
         z = float(view["zoom"]) or 1.0
-        if session.fovea_xy is None:
+        if not uses_macula_window(session.fovea_user_placed, session.fovea_xy, session.scale_um_px):
             return ox + local_x / z, oy + local_y / z
         pan_x, pan_y = view["pan"]
         return ox + (pan_x + local_x) / z, oy + (pan_y + local_y) / z
@@ -562,7 +631,11 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
     def on_merge(_=None) -> None:
         second = reading["second_csv"]
         if not second or not Path(second).is_file():
-            _after("先に第2読影を保存してください")
+            found_second = latest_workflow_csv(_scan_root(), "second_reader_output")
+            second = str(found_second) if found_second else ""
+            reading["second_csv"] = second
+        if not second or not Path(second).is_file():
+            _show("統合解析データ", "先に第2読影を保存してください。")
             return
         first = reading["first_csv"]
         if not first or not Path(first).is_file():
@@ -578,7 +651,11 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
         try:
             summary = merge_graders(Path(first), Path(second), out, prefix="GA")
         except ValueError as exc:
-            _after(str(exc))
+            try:
+                out.rmdir()
+            except OSError:
+                pass
+            _show("統合解析データ", str(exc))
             return
         _show(
             "統合解析データを作成しました",
@@ -612,7 +689,12 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
         final_csv = reading["final_csv"]
         summary_md = reading["summary"]
         if not final_csv or not Path(final_csv).is_file():
-            _after("先に最終読影を保存してください")
+            if summary_md:
+                found_final = latest_workflow_csv(Path(summary_md).resolve().parent.parent, "final_reader_output")
+                final_csv = str(found_final) if found_final else ""
+                reading["final_csv"] = final_csv
+        if not final_csv or not Path(final_csv).is_file():
+            _show("トライアッド確定", "先に最終読影を保存してください。")
             return
         if not summary_md:
             _after("summary.md が選ばれていません")
@@ -698,7 +780,8 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
     def on_pan_update(e: ft.DragUpdateEvent) -> None:
         if session.tool in ("brush_add", "brush_erase"):
             session.edit_at(_to_image(e.local_x, e.local_y), record=False)
-            _paint()
+            _paint_image()
+            _paint_metrics()
             page.update()
         elif session.tool == "clear":
             session.extend_clear(_to_image(e.local_x, e.local_y))
@@ -706,7 +789,7 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
             sx, sy, (px, py) = view["drag"]
             z = float(view["zoom"]) or 1.0
             session.pan_xy = (px - (e.local_x - sx) / z, py - (e.local_y - sy) / z)
-            _paint()
+            _paint_image()
             page.update()
 
     def on_pan_end(_e: ft.DragEndEvent) -> None:
@@ -757,6 +840,67 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
     def _btn(label: str, handler) -> ft.ElevatedButton:
         return ft.ElevatedButton(label, on_click=handler, height=34, style=ft.ButtonStyle(text_style=ft.TextStyle(size=12)))
 
+    def _apply_chrome(btn: ft.IconButton, active: bool) -> None:
+        color, bg = _tool_colors(active)
+        if btn.icon_color != color:
+            btn.icon_color = color
+        if btn.bgcolor != bg:
+            btn.bgcolor = bg
+        if isinstance(btn.content, ft.Text) and btn.content.color != color:
+            btn.content.color = color
+            btn.content.weight = ft.FontWeight.BOLD if active else None
+
+    def _sync_tool_chrome() -> None:
+        for name, btn in tool_buttons.items():
+            _apply_chrome(btn, session.tool == name)
+        for level, btn in zoom_buttons.items():
+            _apply_chrome(btn, session.zoom == level)
+
+    def _tool_btn(name: str) -> ft.IconButton:
+        label = _tool_name(name)
+        icon = next(icon for key, _label, icon in _TOOL_SPECS if key == name)
+        color, bg = _tool_colors(session.tool == name)
+        btn = ft.IconButton(
+            icon=icon,
+            tooltip=label,
+            icon_size=22,
+            icon_color=color,
+            bgcolor=bg,
+            width=40,
+            height=40,
+            on_click=on_tool(name),
+            style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8)),
+        )
+        tool_buttons[name] = btn
+        return btn
+
+    def _zoom_btn(level: int) -> ft.IconButton:
+        color, bg = _tool_colors(session.zoom == level)
+        btn = ft.IconButton(
+            content=ft.Text(f"{level}x", size=13, color=color, weight=ft.FontWeight.BOLD if session.zoom == level else None),
+            tooltip=f"表示 {level}x",
+            bgcolor=bg,
+            width=44,
+            height=40,
+            on_click=on_zoom(level),
+            style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8), padding=0),
+        )
+        zoom_buttons[level] = btn
+        return btn
+
+    def _action_btn(icon: str, tip: str, handler, *, color: str = T.PRIMARY) -> ft.IconButton:
+        return ft.IconButton(
+            icon=icon,
+            tooltip=tip,
+            icon_size=22,
+            icon_color=color,
+            bgcolor=T.BTN_SECONDARY_BG,
+            width=40,
+            height=40,
+            on_click=handler,
+            style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8)),
+        )
+
     gesture = ft.GestureDetector(
         content=img,
         on_tap_down=on_tap_down,
@@ -796,28 +940,38 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
                                     ft.Divider(color="#374151"),
                                     tool_label,
                                     ft.Row([
-                                        _btn("乳頭", on_tool("disc")),
-                                        _btn("中心窩", on_tool("fovea")),
-                                        _btn("移動", on_tool("pan")),
-                                    ], wrap=True, spacing=6),
+                                        _tool_btn("disc"),
+                                        _tool_btn("fovea"),
+                                        _tool_btn("pan"),
+                                        _tool_btn("grow"),
+                                    ], spacing=4),
                                     ft.Row([
-                                        _btn("縁まで", on_tool("grow")),
-                                        _btn("塗る", on_tool("brush_add")),
-                                        _btn("消す", on_tool("brush_erase")),
-                                        _btn("範囲消去", on_tool("clear")),
-                                    ], wrap=True, spacing=6),
+                                        _tool_btn("brush_add"),
+                                        _tool_btn("brush_erase"),
+                                        _tool_btn("clear"),
+                                        ft.IconButton(
+                                            icon=ft.Icons.HIGHLIGHT_OFF,
+                                            tooltip="道具を閉じる",
+                                            icon_size=22,
+                                            icon_color=T.TEXT_MUTED,
+                                            bgcolor=T.BTN_SECONDARY_BG,
+                                            width=40,
+                                            height=40,
+                                            on_click=on_close_tool,
+                                            style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8)),
+                                        ),
+                                    ], spacing=4),
                                     ft.Row([
-                                        _btn("1x", on_zoom(1)),
-                                        _btn("2x", on_zoom(2)),
-                                        _btn("4x", on_zoom(4)),
-                                        _btn("道具を閉じる", on_close_tool),
-                                    ], wrap=True, spacing=6),
+                                        _zoom_btn(1),
+                                        _zoom_btn(2),
+                                        _zoom_btn(4),
+                                    ], spacing=4),
                                     ft.Row([
-                                        _btn("再セグ", on_reseg),
-                                        _btn("取消", on_undo),
-                                        _btn("やり直し", on_redo),
-                                        _btn("この時点を確定", on_confirm),
-                                    ], wrap=True, spacing=6),
+                                        _action_btn(ft.Icons.AUTORENEW, "再セグ", on_reseg),
+                                        _action_btn(ft.Icons.UNDO, "取消", on_undo),
+                                        _action_btn(ft.Icons.REDO, "やり直し", on_redo),
+                                        _action_btn(ft.Icons.CHECK_CIRCLE, "この時点を確定", on_confirm, color=T.ACCENT_GREEN),
+                                    ], spacing=4),
                                     ft.Divider(color="#374151"),
                                     metrics,
                                     ft.Text(
@@ -862,13 +1016,26 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
     page.update()
 
 
+_TOOL_SPECS: tuple[tuple[str, str, str], ...] = (
+    ("disc", "乳頭", ft.Icons.ADJUST),
+    ("fovea", "中心窩", ft.Icons.CENTER_FOCUS_STRONG),
+    ("pan", "移動", ft.Icons.PAN_TOOL),
+    ("grow", "縁まで", ft.Icons.FORMAT_COLOR_FILL),
+    ("brush_add", "塗る", ft.Icons.BRUSH),
+    ("brush_erase", "消す", ft.Icons.FORMAT_COLOR_RESET),
+    ("clear", "範囲消去", ft.Icons.GESTURE),
+)
+_TOOL_ON_BG = "#083344"
+
+
 def _tool_name(tool: str) -> str:
-    return {
-        "disc": "乳頭",
-        "fovea": "中心窩",
-        "pan": "移動",
-        "grow": "縁まで",
-        "brush_add": "塗る",
-        "brush_erase": "消す",
-        "clear": "範囲消去",
-    }.get(tool, tool)
+    for key, label, _icon in _TOOL_SPECS:
+        if key == tool:
+            return label
+    return tool
+
+
+def _tool_colors(active: bool) -> tuple[str, str]:
+    if active:
+        return T.PRIMARY, _TOOL_ON_BG
+    return T.TEXT_MUTED, T.BTN_SECONDARY_BG

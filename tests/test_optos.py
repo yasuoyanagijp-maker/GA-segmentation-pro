@@ -1,9 +1,13 @@
 """Optos 専用経路。現行 segment_ga の既定は変えない。"""
 
+import math
+
 import cv2
+import pytest
 import numpy as np
 
 from engine.optos import (
+    area_mm2_on_24mm_globe,
     disc_circle_mask,
     drop_border_touching,
     estimate_disc_radius_px,
@@ -106,6 +110,25 @@ def test_stats_central_ignores_pixels_outside_6mm():
     stats = stats_central(mask, fovea, scale)
     assert stats["area_px"] == 1
     assert stats["outside_quant_px"] == 1
+
+
+def test_24mm_model_is_smaller_away_from_the_fovea():
+    fovea = (100.0, 100.0)
+    disc = (200.0, 100.0)
+    near_mask = np.zeros((200, 400), dtype=np.uint8)
+    near_mask[100, 100] = 255
+    far_mask = np.zeros_like(near_mask)
+    far_mask[100, 180] = 255
+    near = area_mm2_on_24mm_globe(near_mask, fovea, disc)
+    far = area_mm2_on_24mm_globe(far_mask, fovea, disc)
+    radius = 12.0
+    theta = 4.76 / radius
+    mm_per_px = (2.0 * radius * math.tan(theta / 2.0)) / 100.0
+    assert near == pytest.approx(mm_per_px ** 2)
+    assert far < near
+    stats = stats_central(near_mask, fovea, 47.6, disc)
+    assert stats["area_mm2_24mm"] == pytest.approx(near, abs=0.001)
+    assert stats_central(near_mask, fovea, 47.6)["area_mm2_24mm"] is None
 
 
 def test_window_box_contains_fovea():
@@ -261,6 +284,41 @@ def test_series_table_marks_a_backward_step():
     assert set(rows[1]["reversed"]) == {"area_mm_sqrt", "gawain", "gap_um"}
 
 
+def test_reader_role_does_not_prefix_the_export_filename():
+    from optos_ui.session import OptosSession, VisitSnap
+
+    session = OptosSession()
+    session.case_id = "第2"
+    gray = np.full((40, 40), 180, dtype=np.uint8)
+    mask = np.zeros((40, 40), dtype=np.uint8)
+    mask[10:20, 10:20] = 255
+    session.snaps["第2/2022-02-25.png"] = VisitSnap(
+        filename="2022-02-25.png",
+        path="2022-02-25.png",
+        date_iso="2022-02-25",
+        date_source="filename",
+        gray=gray,
+        disc_xy=(30.0, 20.0),
+        fovea_xy=(12.0, 15.0),
+        scale_um_px=20.0,
+        mask=mask,
+        confirmed=True,
+        fovea_user_placed=True,
+    )
+    rows = session.reading_payload()
+    assert len(rows) == 1
+    assert rows[0]["filename"] == "2022-02-25.png"
+
+
+def test_provisional_fovea_keeps_the_full_image_scale():
+    from optos_ui.app import uses_macula_window
+
+    assert uses_macula_window(False, (10.0, 10.0), 15.0) is False
+    assert uses_macula_window(True, (10.0, 10.0), 15.0) is True
+    assert uses_macula_window(True, None, 15.0) is False
+    assert uses_macula_window(True, (10.0, 10.0), None) is False
+
+
 def test_analysis_circle_is_centered_in_the_view():
     from optos_ui.app import VIEW_H, VIEW_W, analysis_display_zoom, centered_crop_origin
 
@@ -382,6 +440,35 @@ def test_scale_disagreement_note_only_when_far_apart():
     assert scale_disagreement_note(10.0, 12.0) == ""
     note = scale_disagreement_note(15.8, 10.0)
     assert "15.8" in note and "10.0" in note
+
+
+def test_tool_colors_mark_only_the_active_tool():
+    from optos_ui.app import _tool_colors, _tool_name
+
+    on_fg, on_bg = _tool_colors(True)
+    off_fg, off_bg = _tool_colors(False)
+    assert on_fg != off_fg
+    assert on_bg != off_bg
+    assert _tool_name("fovea") == "中心窩"
+    assert _tool_name("brush_erase") == "消す"
+
+
+def test_sync_option_list_updates_labels_without_replacing_controls():
+    import flet as ft
+
+    from optos_ui.app import _sync_option_list
+
+    options = [ft.dropdown.Option("0", "a"), ft.dropdown.Option("1", "b")]
+    first, second = options
+    _sync_option_list(options, [("0", "済 a"), ("1", "b")])
+    assert options[0] is first and options[1] is second
+    assert options[0].text == "済 a"
+    _sync_option_list(options, [("0", "済 a")])
+    assert options == [first]
+    _sync_option_list(options, [("0", "済 a"), ("2", "c")])
+    assert options[0] is first
+    assert options[1].key == "2"
+    assert options[1].text == "c"
 
 
 def test_drop_border_keeps_a_central_blob():

@@ -128,7 +128,8 @@ class OptosSession:
                 self.case_id = key.split("/", 1)[0]
                 row = self._snap_row(snap)
                 case_id = key.split("/", 1)[0]
-                filename = snap.filename if case_id in {"", "未分類"} else f"{case_id}__{snap.filename}"
+                # 「第2」「最終」は画面上の役割名。画像名に付けると第1と突合できない。
+                filename = snap.filename if case_id in {"", "未分類", "第2", "最終"} else f"{case_id}__{snap.filename}"
                 row["path"] = snap.path
                 row["shape"] = tuple(snap.gray.shape)
                 row["mask"] = snap.mask
@@ -361,11 +362,11 @@ class OptosSession:
             or not np.any(self.mask > 0)
         ):
             return None
-        return stats_central(self.mask, self.fovea_xy, self.scale_um_px)
+        return stats_central(self.mask, self.fovea_xy, self.scale_um_px, self.disc_xy)
 
     def _snap_row(self, snap: VisitSnap) -> dict:
         assert snap.fovea_xy and snap.disc_xy and snap.scale_um_px and snap.mask is not None
-        stats = stats_central(snap.mask, snap.fovea_xy, snap.scale_um_px)
+        stats = stats_central(snap.mask, snap.fovea_xy, snap.scale_um_px, snap.disc_xy)
         gap = robust_foveal_gap_um(snap.mask, snap.fovea_xy, snap.scale_um_px)
         return {
             "case_id": self.case_id,
@@ -378,6 +379,7 @@ class OptosSession:
             "fovea_x": round(float(snap.fovea_xy[0]), 1),
             "fovea_y": round(float(snap.fovea_xy[1]), 1),
             "area_mm2": stats.get("area_mm2"),
+            "area_mm2_24mm": stats.get("area_mm2_24mm"),
             "area_mm_sqrt": stats.get("area_mm_sqrt"),
             "lesion_count": stats.get("lesion_count"),
             "gawain": stats.get("gawain"),

@@ -28,8 +28,17 @@ RECHECK_FIELDS = (
 )
 
 
+_ROLE_STEM_PREFIXES = ("第2__", "最終__")
+
+
 def file_stem(name: str) -> str:
-    return Path(str(name or "").strip()).stem.lower()
+    """突合キー。役割ラベルの接頭辞は画像名の一部ではない。"""
+    stem = Path(str(name or "").strip()).stem
+    for prefix in _ROLE_STEM_PREFIXES:
+        if stem.startswith(prefix):
+            stem = stem[len(prefix):]
+            break
+    return stem.lower()
 
 
 def read_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:

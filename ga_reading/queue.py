@@ -12,6 +12,25 @@ _IMAGE = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 _WORKFLOW_PREFIXES = ("second_reader_output", "integrated_output", "final_reader_output")
 
 
+def latest_workflow_csv(scan_root: Path, prefix: str) -> Path | None:
+    """second_reader_output_* や final_reader_output_* のうち、新しい grader.csv。"""
+    root = Path(scan_root)
+    if not root.is_dir():
+        return None
+    folders = sorted(
+        (
+            child for child in root.iterdir()
+            if child.is_dir() and child.name.startswith(f"{prefix}_")
+        ),
+        key=lambda path: path.name,
+    )
+    for folder in reversed(folders):
+        candidate = folder / "grader.csv"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def find_first_grader_csv(scan_root: Path) -> Path | None:
     """第1の grader.csv。第2・統合・最終の出力フォルダは見ない。"""
     root = Path(scan_root)

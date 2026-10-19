@@ -35,6 +35,34 @@ def _write(path: Path, rows: list[dict[str, str]]) -> None:
     write_csv(path, fields, rows)
 
 
+def test_role_prefix_does_not_change_the_match_key():
+    assert file_stem("第2__2022-02-25.png") == "2022-02-25"
+    assert file_stem("最終__2022-02-25.png") == "2022-02-25"
+    assert file_stem("2022-02-25.png") == "2022-02-25"
+
+
+def test_prefixed_reader_files_still_merge_and_resolve(tmp_path: Path):
+    first = tmp_path / "g1.csv"
+    second = tmp_path / "g2.csv"
+    left = _row("2022-02-25.png", "6.0", "2.4")
+    right = _row("第2__2022-02-25.png", "6.2", "2.5")
+    right["dist_um_nearest"] = "200"
+    _write(first, [left])
+    _write(second, [right])
+    summary = merge_graders(first, second, tmp_path / "out", prefix="GA")
+    assert summary["n_matched"] == 1
+    assert "2022-02-25.png" in summary["recheck_by_file"]
+    final = tmp_path / "final.csv"
+    done = _row("最終__2022-02-25.png", "6.1", "2.45")
+    done["dist_um_nearest"] = "140"
+    _write(final, [done])
+    result = resolve_triad(Path(summary["summary_md"]), final, tmp_path / "out")
+    _fields, rows = read_csv(Path(result["triad_csv"]))
+    assert file_stem(rows[0]["File"]) == "2022-02-25"
+    assert float(rows[0]["dist_um_nearest"]) == 140
+    assert float(rows[0]["area_mm2"]) == 6.1
+
+
 def test_primary_metrics_are_the_ga_outputs():
     assert GA_PRIMARY_METRICS == (
         "area_mm2",

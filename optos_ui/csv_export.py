@@ -62,6 +62,7 @@ VISIT_COLUMNS = (
     "fovea_x",
     "fovea_y",
     "area_mm2",
+    "area_mm2_24mm",
     "area_mm_sqrt",
     "lesion_count",
     "gawain",

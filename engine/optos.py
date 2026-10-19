@@ -469,10 +469,45 @@ def paint_brush(
     return out
 
 
+# ビューワーの既定に合わせた球体。網膜面の半径はその半分。
+GLOBE_DIAMETER_MM = 24.0
+
+
+def area_mm2_on_24mm_globe(
+    mask: np.ndarray,
+    fovea_xy: tuple[float, float],
+    disc_xy: tuple[float, float],
+    *,
+    dfd_mm: float = DEFAULT_DFD_UM / 1000.0,
+    globe_diameter_mm: float = GLOBE_DIAMETER_MM,
+) -> float | None:
+    """中心窩を投影中心とした stereographic 投影で、球面上の面積を足す。
+
+    乳頭–中心窩 4.76 mm は球面上の弧とする。画像上の距離は接平面の
+    ρ = 2R tan(θ/2) に対応させ、各画素の球面面積は接平面の面積に
+    1 / (1 + (ρ/2R)²)² を掛けたもの。R は 12 mm。
+    """
+    radius = float(globe_diameter_mm) / 2.0
+    d_px = math.hypot(float(disc_xy[0]) - float(fovea_xy[0]), float(disc_xy[1]) - float(fovea_xy[1]))
+    if d_px < 1.0 or radius <= 0.0 or dfd_mm <= 0.0:
+        return None
+    theta = float(dfd_mm) / radius
+    if theta >= math.pi:
+        return None
+    mm_per_px = (2.0 * radius * math.tan(theta / 2.0)) / d_px
+    ys, xs = np.nonzero(mask > 0)
+    if ys.size == 0:
+        return 0.0
+    rho = np.hypot(xs - float(fovea_xy[0]), ys - float(fovea_xy[1])) * mm_per_px
+    weight = 1.0 / (1.0 + (rho / (2.0 * radius)) ** 2) ** 2
+    return float(np.sum(weight) * (mm_per_px ** 2))
+
+
 def stats_central(
     mask: np.ndarray,
     fovea_xy: tuple[float, float],
     scale_um_px: float,
+    disc_xy: tuple[float, float] | None = None,
 ) -> dict:
     """面積・GAWAIN・中心窩距離は中心 6 mm の内側だけ。"""
     roi = central_roi_mask(mask.shape, fovea_xy, scale_um_px, QUANT_RADIUS_MM)
@@ -480,4 +515,6 @@ def stats_central(
     stats = ga_stats(clipped, scale_um_px, fovea_xy)
     stats["outside_quant_px"] = int(np.sum((mask > 0) & ~roi))
     stats["quant_radius_mm"] = QUANT_RADIUS_MM
+    globe = None if disc_xy is None else area_mm2_on_24mm_globe(clipped, fovea_xy, disc_xy)
+    stats["area_mm2_24mm"] = None if globe is None else round(globe, 3)
     return stats
