@@ -76,7 +76,7 @@ def resolve_triad(
                 fr = to_float((final.get(stem) or {}).get(column))
                 a = to_float((g1.get(stem) or {}).get(column))
                 b = to_float((g2.get(stem) or {}).get(column))
-                if fr is None or (a is None and b is None):
+                if fr is None:
                     out[column] = "NA" if text.upper() == "NA" else ""
                     continue
                 median = triad_median([a, b, fr])

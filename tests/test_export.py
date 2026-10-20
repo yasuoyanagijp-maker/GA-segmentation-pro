@@ -115,6 +115,29 @@ def test_generate_pdf_report_bytes_japanese_text():
     assert len(pdf_bytes) > 100
 
 
+def test_generate_pdf_report_bytes_without_unicode_font(monkeypatch):
+    """日本語フォントが無いときも、未分類などの文字で出力が落ちない。"""
+    monkeypatch.setattr("engine.export._resolve_unicode_font_path", lambda: None)
+    overlay = np.zeros((40, 40, 3), dtype=np.uint8)
+    pdf_bytes = generate_pdf_report_bytes(
+        filename="test.jpg",
+        date="2024-03-15",
+        stats={
+            "area_mm2": 1.0,
+            "area_mm_sqrt": 1.0,
+            "gawain": 75.0,
+            "dist_um": 400.0,
+            "lesion_count": 1,
+        },
+        overlay_rgb=overlay,
+        case_id="未分類",
+        calibration_source="disc_1800um",
+        scale_um_px=21.43,
+    )
+    assert pdf_bytes.startswith(b"%PDF")
+    assert len(pdf_bytes) > 100
+
+
 def test_suggested_csv_filename():
     name = suggested_csv_filename()
     assert name.startswith("GA_batch_")

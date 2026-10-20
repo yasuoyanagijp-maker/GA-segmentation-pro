@@ -13,6 +13,7 @@ from engine.optos import (
     estimate_disc_radius_px,
     flatten_illumination,
     grow_to_edge,
+    growth_image,
     intact_within_mm2,
     paint_brush,
     propose_fovea_from_disc,
@@ -177,6 +178,63 @@ def test_barrier_blocks_growth_across_a_dark_band():
     assert out[40, 30] == 255
     assert out[40, 50] == 0
     assert out[40, 40] == 0
+
+
+def test_manual_grow_uses_the_segmentation_image(monkeypatch):
+    from optos_ui.session import OptosSession
+
+    img, fovea, disc, scale = _scene()
+    session = OptosSession()
+    session.gray = img
+    session.disc_xy = disc
+    session.fovea_xy = fovea
+    session.scale_um_px = scale
+    session.mask = np.zeros(img.shape, dtype=np.uint8)
+    session.mask[int(fovea[1]), int(fovea[0]) - 40] = 255
+    session.tool = "grow"
+    seen = {}
+
+    def fake(gray, mask, seed, scale_um_px, **kwargs):
+        seen["gray"] = gray
+        return mask, 0
+
+    monkeypatch.setattr("optos_ui.session.grow_to_edge", fake)
+    session.edit_at((fovea[0] - 40, fovea[1]), record=False)
+    expected = growth_image(img, disc, scale)
+    assert np.array_equal(seen["gray"], expected)
+    assert not np.array_equal(seen["gray"], img)
+
+
+def test_confirm_refuses_an_empty_mask():
+    from optos_ui.session import OptosSession
+
+    img, fovea, disc, scale = _scene()
+    session = OptosSession()
+    session.gray = img
+    session.disc_xy = disc
+    session.fovea_xy = fovea
+    session.fovea_user_placed = True
+    session.scale_um_px = scale
+    session.mask = np.zeros(img.shape, dtype=np.uint8)
+    assert "領域がない" in session.confirm()
+    assert session.confirmed is False
+
+
+def test_confirm_waits_until_the_user_places_the_fovea():
+    from optos_ui.session import OptosSession
+
+    img, fovea, disc, _scale = _scene()
+    session = OptosSession()
+    session.gray = img
+    session.mask = np.zeros(img.shape, dtype=np.uint8)
+    session.place_disc(disc)
+    assert session.fovea_xy is not None
+    assert session.fovea_user_placed is False
+    assert "中心窩" in session.confirm()
+    assert session.confirmed is False
+    session.place_fovea(fovea)
+    assert "確定" in session.confirm()
+    assert session.confirmed is True
 
 
 def test_grow_to_edge_returns_mask():
@@ -434,6 +492,56 @@ def test_close_gap_does_not_become_years():
     assert "18" not in text
     far = describe_foveal_approach(1000.0, 100.0)
     assert "10.00 年" in far
+    assert "中心窩まで 1000 µm" in far
+    assert "接近速度 100.0 µm/年" in far
+    assert "中心窩距離" not in far
+
+
+def test_visit_switch_keeps_the_series_and_case_switch_clears_it():
+    from pathlib import Path
+
+    from optos_ui.session import OptosSession, VisitSnap
+
+    def snap(name: str, date: str) -> VisitSnap:
+        return VisitSnap(
+            filename=name, path=name, date_iso=date, date_source="filename",
+            gray=np.full((80, 80), 180, dtype=np.uint8),
+            disc_xy=(60.0, 40.0), fovea_xy=(40.0, 40.0),
+            scale_um_px=10.0,
+            mask=np.full((80, 80), 255, dtype=np.uint8),
+            confirmed=True, fovea_user_placed=True,
+        )
+
+    session = OptosSession()
+    session.case_id = "OD"
+    session.cases = {"OD": [Path("a.png"), Path("b.png")], "OS": [Path("c.png")]}
+    session.files = list(session.cases["OD"])
+    session.index = 0
+    session.snaps = {
+        "OD/a.png": snap("a.png", "2020-01-01"),
+        "OD/b.png": snap("b.png", "2021-01-01"),
+        "OS/c.png": snap("c.png", "2020-06-01"),
+    }
+    first = session.snaps["OD/a.png"]
+    session.gray = first.gray
+    session.mask = first.mask.copy()
+    session.disc_xy = first.disc_xy
+    session.fovea_xy = first.fovea_xy
+    session.scale_um_px = first.scale_um_px
+    session.confirmed = True
+    session.fovea_user_placed = True
+    session.date_iso = first.date_iso
+    session.date_source = first.date_source
+    note = session.run_series()
+    assert session.series_summary is not None
+    session.open_index(1)
+    assert session.series_note == note
+    assert session.series_summary is not None
+    assert session.series_visit_table
+    session.select_case("OS")
+    assert session.series_summary is None
+    assert session.series_visit_table == []
+    assert session.series_note == ""
 
 
 def test_scale_disagreement_note_only_when_far_apart():

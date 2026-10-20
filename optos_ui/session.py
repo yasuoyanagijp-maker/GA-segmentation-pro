@@ -12,6 +12,7 @@ from engine.io_utils import load_gray
 from engine.life_table import life_expectancy_years
 from engine.optos import (
     grow_to_edge,
+    growth_image,
     intact_within_mm2,
     paint_brush,
     propose_fovea_from_disc,
@@ -97,6 +98,7 @@ class OptosSession:
             self._clear_current()
             return "画像がありません"
         self.snaps = {}
+        self._clear_series_result()
         self.select_case(ids[0])
         return f"{len(ids)} 症例"
 
@@ -106,6 +108,7 @@ class OptosSession:
         self.folder = str(files[0].parent) if files else ""
         self.cases = {label: files} if files else {}
         self.snaps = {}
+        self._clear_series_result()
         if not files:
             self.case_id = ""
             self.files = []
@@ -145,6 +148,8 @@ class OptosSession:
 
     def select_case(self, case_id: str) -> None:
         self._stash()
+        if case_id != self.case_id:
+            self._clear_series_result()
         self.case_id = case_id
         self.files = list(self.cases.get(case_id) or [])
         if self.files:
@@ -265,8 +270,11 @@ class OptosSession:
         if record:
             self._push_undo()
         if self.tool == "grow":
+            image = self.gray
+            if self.disc_xy is not None:
+                image = growth_image(self.gray, self.disc_xy, self.scale_um_px)
             self.mask, added = grow_to_edge(
-                self.gray, self.mask, (x, y), self.scale_um_px,
+                image, self.mask, (x, y), self.scale_um_px,
             )
             self.confirmed = False
             return f"縁まで成長 +{added} px"
@@ -313,8 +321,12 @@ class OptosSession:
         return "編集をやり直しました"
 
     def confirm(self) -> str:
+        if not self.fovea_user_placed:
+            return "中心窩をクリックしてから確定します"
         if self.fovea_xy is None or self.disc_xy is None or self.mask is None or not self.scale_um_px:
             return "乳頭、中心窩、マスクが揃ってから確定します"
+        if not np.any(self.mask > 0):
+            return "マスクに領域がないので確定できません。縁まで、または塗りで囲んでください"
         self.confirmed = True
         self._stash()
         done = sum(1 for s in self._case_snaps() if s.confirmed)
@@ -561,6 +573,7 @@ class OptosSession:
         self.date_source = "missing"
         self.confirmed = False
         self._clear_edit_state()
+        self._clear_series_result()
 
     def _clear_edit_state(self) -> None:
         self.undo = []
@@ -570,6 +583,9 @@ class OptosSession:
         self.mask_stale = False
         self.zoom = 1
         self.pan_xy = (0.0, 0.0)
+
+    def _clear_series_result(self) -> None:
+        """時系列の要約は症例単位。受診の切り替えでは消さない。"""
         self.series_note = ""
         self.series_summary = None
         self.series_visit_table = []

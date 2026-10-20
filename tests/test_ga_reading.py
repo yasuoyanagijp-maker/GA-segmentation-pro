@@ -200,6 +200,26 @@ def test_second_reader_csv_is_not_the_first_and_recheck_queue_is_narrow(tmp_path
     assert [path.name for path in recheck_images(summary)] == ["keep.png"]
 
 
+def test_triad_uses_the_final_reader_when_both_graders_are_blank(tmp_path: Path):
+    first = tmp_path / "g1.csv"
+    second = tmp_path / "g2.csv"
+    left = _row("gap.png", "4.0", "2.0")
+    right = _row("gap.png", "4.1", "2.02")
+    left["dist_um_nearest"] = ""
+    right["dist_um_nearest"] = ""
+    _write(first, [left])
+    _write(second, [right])
+    summary = merge_graders(first, second, tmp_path / "out", prefix="GA")
+    final = tmp_path / "final.csv"
+    done = _row("gap.png", "4.05", "2.01")
+    done["dist_um_nearest"] = "140"
+    _write(final, [done])
+    result = resolve_triad(Path(summary["summary_md"]), final, tmp_path / "out")
+    _fields, rows = read_csv(Path(result["triad_csv"]))
+    assert float(rows[0]["dist_um_nearest"]) == 140
+    assert float(rows[0]["area_mm2"]) == 4.05
+
+
 def test_triad_preview_does_not_write(tmp_path: Path):
     first = tmp_path / "g1.csv"
     second = tmp_path / "g2.csv"

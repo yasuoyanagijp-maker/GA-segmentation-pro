@@ -908,19 +908,27 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             if not landmarks_ready_for_registration(snap):
                 lm_pending += 1
         prefix = f"{just_fname} の日時を確定。 " if just_fname else "日時を確定。 "
+        landmark_step = (
+            "幅指定＋中心窩" if modality_dd.value == "hra" else "乳頭＋中心窩"
+        )
         if dates_pending > 0:
             return _safe_text(
                 f"{prefix}残り {dates_pending}/{n} 枚の日時を入力し「確定」"
-                " → 続けて各画像で乳頭＋中心窩を確認"
+                f" → 続けて各画像で{landmark_step}を確認"
             )
         if lm_pending > 0:
+            step = (
+                "①'幅指定→②中心窩"
+                if modality_dd.value == "hra"
+                else "①乳頭→②中心窩"
+            )
             return _safe_text(
-                f"{prefix}次: 各画像で①乳頭→②中心窩→「時系列準備として確定」"
+                f"{prefix}次: 各画像で{step}→「時系列準備として確定」"
                 f"（未準備 {lm_pending}/{n} 枚）"
             )
         if _selected_count() >= 2:
             return _safe_text(
-                f"{prefix}全画像の日時・乳頭・中心窩が揃いました — "
+                f"{prefix}全画像の日時・{landmark_step}が揃いました — "
                 "④ Registration を押してください"
             )
         return _safe_text(
@@ -955,7 +963,8 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             )
         elif state.series_mode and _selected_count() >= 2 and not landmarks_ok:
             reg_apply_btn.tooltip = (
-                "全対象画像で乳頭（disc）と中心窩を確認し「時系列準備として確定」してください"
+                "全対象画像で中心窩と、乳頭または幅指定スケールを確認し"
+                "「時系列準備として確定」してください"
             )
         else:
             reg_apply_btn.tooltip = (
@@ -1409,9 +1418,18 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
                         dx, dy = lm["disc_xy"]
                         lm_note += f" · 乳頭 ({dx:.0f},{dy:.0f})"
                 if not lm_ready:
-                    lm_note = (lm_note + " — " if lm_note else "") + "乳頭+中心窩の確認が必要"
+                    gap = (
+                        "幅指定と中心窩"
+                        if modality_dd.value == "hra"
+                        else "乳頭と中心窩"
+                    )
+                    lm_note = (lm_note + " — " if lm_note else "") + f"{gap}の確認が必要"
             elif date_ok:
-                lm_note = "次: ①乳頭 → ②中心窩 → 準備確定"
+                lm_note = (
+                    "次: ①' 幅指定 → ②中心窩 → 準備確定"
+                    if modality_dd.value == "hra"
+                    else "次: ①乳頭 → ②中心窩 → 準備確定"
+                )
             src_label = {
                 "exif": "EXIF",
                 "filename": "ファイル名",
@@ -2050,9 +2068,16 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             _set_status("先に乳頭/スケールと中心窩を完了してください")
             page.update()
             return
-        if not state.disc_pts or len(state.disc_pts) != 2:
+        width_ready = (
+            state.calibration_source == calibration.SOURCE_WIDTH
+            and state.scale_um_px is not None
+            and state.scale_um_px > 0
+        )
+        if not width_ready and (not state.disc_pts or len(state.disc_pts) != 2):
             _set_status(
                 "Registration には各画像の乳頭確認が必要です — 「① 乳頭」で端点を指定"
+                if modality_dd.value != "hra"
+                else "HRA は「①' 幅指定」でスケールを入れるか、乳頭が見えるときは端点を指定してください"
             )
             page.update()
             return
@@ -2079,8 +2104,12 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             1 for f in state.files
             if not landmarks_ready_for_registration(state.per_file_results.get(f.name))
         )
+        ready_label = "幅指定と中心窩" if width_ready else "乳頭と中心窩"
         if lm_left > 0:
-            next_msg = f" — 「次へ ▶」で未準備 {lm_left}/{n} 枚の乳頭＋中心窩を確認"
+            next_msg = (
+                f" — 「次へ ▶」で未準備 {lm_left}/{n} 枚の"
+                "中心窩と乳頭または幅指定を確認"
+            )
         elif not _selected_dates_ready():
             next_msg = " — 残り画像の日時を確定してから Registration"
         elif selected >= 2:
@@ -2089,7 +2118,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             next_msg = " — 対象を2枚以上選択してください"
         _set_status(
             _safe_text(
-                f"準備確定 {saved}/{n} · 対象 {selected} 枚（乳頭＋中心窩確認済）"
+                f"準備確定 {saved}/{n} · 対象 {selected} 枚（{ready_label}確認済）"
                 f"{next_msg}"
             )
         )
@@ -4812,7 +4841,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
         if not _selected_landmarks_ready():
             _finish_launch_guard()
             _set_status(
-                "Registration 前に、対象の各画像で乳頭と中心窩を確認し"
+                "Registration 前に、対象の各画像で中心窩と乳頭または幅指定スケールを確認し"
                 "「時系列準備として確定」してください"
             )
             refresh_series_dates_ui()
@@ -5002,7 +5031,7 @@ async def build_main_view(page: ft.Page, state: GAAppState) -> None:
             return
         if not _selected_landmarks_ready():
             _set_status(
-                "Registration 前に、対象の各画像で乳頭（disc）と中心窩を確認し"
+                "Registration 前に、対象の各画像で中心窩と乳頭または幅指定スケールを確認し"
                 "「時系列準備として確定」してください"
             )
             _update_registration_controls()

@@ -384,6 +384,15 @@ def intact_within_mm2(
     return float(np.sum(intact)) * (float(scale_um_px) ** 2) / 1e6
 
 
+def growth_image(
+    gray: np.ndarray,
+    disc_xy: tuple[float, float],
+    scale_um_px: float,
+) -> np.ndarray:
+    """縁までの成長に使う輝度。初期マスクと同じ乳頭埋めと照明平坦化。"""
+    return flatten_illumination(_fill_disc(gray, disc_xy, scale_um_px), scale_um_px)
+
+
 def grow_to_edge(
     gray: np.ndarray,
     mask: np.ndarray,
@@ -415,8 +424,7 @@ def segment_optos(
     scale_um_px: float,
 ) -> np.ndarray:
     """乳頭を除いた多巣マスク。コアから暗部の縁まで伸ばす。"""
-    filled = _fill_disc(gray, disc_xy, scale_um_px)
-    flat = flatten_illumination(filled, scale_um_px)
+    flat = growth_image(gray, disc_xy, scale_um_px)
     enhanced = _enhance(flat, use_clahe=True, clahe_clip=None)
     disc = disc_circle_mask(enhanced.shape, disc_xy, scale_um_px)
     cores = drop_border_touching(

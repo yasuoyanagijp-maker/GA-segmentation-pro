@@ -49,6 +49,23 @@ def test_landmarks_ready_for_registration():
     assert landmarks_ready_for_registration(
         {"fovea_xy": (1.0, 2.0), "disc_xy": (3.0, 4.0)}
     )
+    assert landmarks_ready_for_registration(
+        {
+            "fovea_xy": (10.0, 20.0),
+            "scale_um_px": 11.5,
+            "calibration_source": "width",
+        }
+    )
+    assert not landmarks_ready_for_registration(
+        {
+            "fovea_xy": (10.0, 20.0),
+            "scale_um_px": 11.5,
+            "calibration_source": "disc_1800um",
+        }
+    )
+    assert not landmarks_ready_for_registration(
+        {"fovea_xy": (10.0, 20.0), "calibration_source": "width"}
+    )
 
 
 def test_estimate_progression_rate_positive():

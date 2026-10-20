@@ -91,6 +91,14 @@ def _dash(val) -> str:
 def _pdf_safe(text: str) -> str:
     return text.replace("\u2013", "-").replace("\u2014", "-").replace("—", "-")
 
+
+def _pdf_text(text: str, *, unicode_font: bool) -> str:
+    """描画文字列。コアフォントでは Latin-1 に入らない文字を置換して出力を続ける。"""
+    safe = _pdf_safe(str(text))
+    if unicode_font:
+        return safe
+    return safe.encode("latin-1", errors="replace").decode("latin-1")
+
 def _foveal_correction_label(
     *,
     applied: bool | None,
@@ -239,16 +247,20 @@ def generate_pdf_report_bytes(
     # case_id「未分類」や calibration_source_label（乳頭/幅指定）は JP を含むため
     # Helvetica ではなく Unicode フォントを使う。
     font = _configure_pdf_font(pdf)
+    unicode_font = font != _PDF_CORE_FONT
+
+    def show(text: str) -> str:
+        return _pdf_text(text, unicode_font=unicode_font)
 
     pdf.set_font(font, "B", 14)
     pdf.cell(0, 10, "GA Segmentation Pro - Analysis Report", new_x="LMARGIN", new_y="NEXT")
     pdf.set_font(font, size=11)
     if case_id:
-        pdf.cell(0, 7, f"Case: {_pdf_safe(case_id)}", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 7, f"File: {_pdf_safe(filename)}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 7, show(f"Case: {case_id}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, show(f"File: {filename}"), new_x="LMARGIN", new_y="NEXT")
     pdf.cell(
         0, 7,
-        f"Exam datetime: {_pdf_safe(exam_datetime or date)}",
+        show(f"Exam datetime: {exam_datetime or date}"),
         new_x="LMARGIN", new_y="NEXT",
     )
     pdf.ln(3)
@@ -260,14 +272,14 @@ def generate_pdf_report_bytes(
     for label, val in [
         ("GA Area (mm2)", s.get("area_mm2")),
         ("GA Area SQRT (mm)", s.get("area_mm_sqrt")),
-        (_pdf_safe(GAWAIN_LABEL), _pdf_safe(format_gawain_display(s.get("gawain")))),
+        (GAWAIN_LABEL, format_gawain_display(s.get("gawain"))),
         ("Dist to fovea (um)", s.get("dist_um")),
         ("Lesion count", s.get("lesion_count")),
     ]:
-        pdf.cell(0, 6, _pdf_safe(f"{label}: {_dash(val)}"), new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 6, show(f"{label}: {_dash(val)}"), new_x="LMARGIN", new_y="NEXT")
     if roi_qc_note:
         pdf.set_font(font, "I", 9)
-        pdf.cell(0, 6, _pdf_safe(f"Mask QC: {roi_qc_note}"), new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 6, show(f"Mask QC: {roi_qc_note}"), new_x="LMARGIN", new_y="NEXT")
         pdf.set_font(font, size=10)
 
     lesions = s.get("lesions") or []
@@ -304,7 +316,7 @@ def generate_pdf_report_bytes(
             ),
         ),
     ]:
-        pdf.cell(0, 6, _pdf_safe(f"{label}: {_dash(val)}"), new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 6, show(f"{label}: {_dash(val)}"), new_x="LMARGIN", new_y="NEXT")
 
     pdf.ln(3)
     pdf.set_font(font, "B", 11)

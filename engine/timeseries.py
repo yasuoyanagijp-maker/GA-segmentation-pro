@@ -263,7 +263,8 @@ def describe_foveal_approach(
     if rate_um_per_year and rate_um_per_year > 0:
         years = float(dist_um) / float(rate_um_per_year)
         return (
-            f"中心窩距離 {rate_um_per_year} µm/年"
+            f"中心窩まで {dist_um:.0f} µm"
+            f" · 接近速度 {rate_um_per_year} µm/年"
             f" · 最新時点から中心窩まで {years:.2f} 年"
         )
     return f"中心窩まで {dist_um:.0f} µm"
@@ -389,11 +390,25 @@ def landmarks_from_snapshot(snap: dict) -> dict:
 
 
 def landmarks_ready_for_registration(snap: dict | None) -> bool:
-    """Registration 前ゲート: 各画像で乳頭（disc）と中心窩がユーザー確認済みか。"""
+    """Registration 前ゲート。
+
+    乳頭と中心窩が揃っていれば可。HRA の幅指定は乳頭が写らないので、
+    中心窩と正の scale_um_px（calibration_source=width）で可。
+    """
     if not snap:
         return False
     lm = landmarks_from_snapshot(snap)
-    return lm.get("fovea_xy") is not None and lm.get("disc_xy") is not None
+    if lm.get("fovea_xy") is None:
+        return False
+    if lm.get("disc_xy") is not None:
+        return True
+    if snap.get("calibration_source") != "width":
+        return False
+    scale = snap.get("scale_um_px")
+    try:
+        return scale is not None and float(scale) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _maybe_resegment_aligned(

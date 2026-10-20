@@ -41,7 +41,6 @@ cleanup_port() {
     pkill -f "[f]let run.*${port}" 2>/dev/null || true
     pkill -f "[f]let.*${port}" 2>/dev/null || true
     pkill -f "[G]A-segmentation-pro/main_app.py" 2>/dev/null || true
-    pkill -f "[m]ain_app.py" 2>/dev/null || true
     sleep 1
     for i in 1 2 3 4 5 6 8; do
         local left

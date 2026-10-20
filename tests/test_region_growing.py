@@ -250,6 +250,21 @@ def test_entropy_suppresses_peripheral_leak_on_synthetic():
         assert leak_ent < leak_plain or added_ent < added_plain
 
 
+def test_entropy_click_on_mask_does_not_keep_disconnected_speckles():
+    """既存マスク上のクリックでは、エントロピー後に離れた点を足さない。"""
+    from engine.region_growing import _filter_add_by_entropy
+
+    gray = np.full((40, 40), 40, dtype=np.uint8)
+    add = np.zeros((40, 40), dtype=np.uint8)
+    add[10:14, 10:14] = 255
+    add[30:33, 30:33] = 255
+    anchor = np.zeros((40, 40), dtype=np.uint8)
+    anchor[14, 10:14] = 255
+    kept = _filter_add_by_entropy(gray, add, (14, 12), anchor=anchor)
+    assert np.any(kept[10:14, 10:14] > 0)
+    assert not np.any(kept[30:33, 30:33] > 0)
+
+
 def test_expand_entropy_mode_manual_path_callable():
     """手動パス相当: GROW_MODE_ENTROPY / use_entropy_stop で呼べる。"""
     img = np.full((40, 40), 200, dtype=np.uint8)

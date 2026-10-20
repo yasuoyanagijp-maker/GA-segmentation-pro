@@ -314,6 +314,25 @@ def _local_entropy_map(gray: np.ndarray, radius: int = ENTROPY_WINDOW_RADIUS) ->
     return entropy(g, disk(r)).astype(np.float32)
 
 
+def _closest_component(mask_u8: np.ndarray, seed: tuple[int, int]) -> np.ndarray:
+    """4連結の塊のうち、シードに最も近いものだけを残す。"""
+    num, labels = cv2.connectedComponents((mask_u8 > 0).astype(np.uint8), connectivity=4)
+    if num <= 1:
+        return np.zeros_like(mask_u8)
+    x, y = int(seed[0]), int(seed[1])
+    best = 0
+    best_d = None
+    for lab in range(1, num):
+        ys, xs = np.where(labels == lab)
+        dist = int(np.min((xs - x) ** 2 + (ys - y) ** 2))
+        if best_d is None or dist < best_d:
+            best_d = dist
+            best = lab
+    out = np.zeros_like(mask_u8)
+    out[labels == best] = 255
+    return out
+
+
 def _filter_add_by_entropy(
     gray: np.ndarray,
     add: np.ndarray,
@@ -321,6 +340,7 @@ def _filter_add_by_entropy(
     *,
     window_radius: int = ENTROPY_WINDOW_RADIUS,
     relative_margin: float = ENTROPY_RELATIVE_MARGIN,
+    anchor: np.ndarray | None = None,
 ) -> np.ndarray:
     """Suppress add pixels on high-entropy frontier (boundary mix).
 
@@ -348,11 +368,17 @@ def _filter_add_by_entropy(
     if not np.any(keep):
         return np.zeros_like(add)
 
-    # Drop speckles that lost connectivity after high-H suppression
+    # Drop speckles that lost connectivity after high-H suppression.
+    # A click on the existing mask is not itself in `add`, so flood cannot
+    # start there. Keep only the component still touching that mask.
     keep_u8 = np.where(keep, 255, 0).astype(np.uint8)
-    if keep_u8[y, x] == 0:
-        # seed not in add — keep closest surviving blob to seed
-        return keep_u8
+    seed_in_keep = 0 <= y < h and 0 <= x < w and keep_u8[y, x] > 0
+    if not seed_in_keep:
+        if anchor is not None and anchor.shape[:2] == keep_u8.shape[:2] and np.any(anchor > 0):
+            linked = _restrict_connected_to_mask(keep_u8, anchor, connectivity=4)
+            if np.any(linked):
+                return linked
+        return _closest_component(keep_u8, (x, y))
     flooded = _flood_from_potential(keep_u8, (x, y))
     return flooded
 
@@ -653,7 +679,7 @@ def expand_segmentation_from_mask(
             else float(entropy_relative_margin)
         )
         add = _filter_add_by_entropy(
-            gray, add, (x, y), relative_margin=e_margin,
+            gray, add, (x, y), relative_margin=e_margin, anchor=mask,
         )
     add = _cap_delta_by_distance(
         add,
