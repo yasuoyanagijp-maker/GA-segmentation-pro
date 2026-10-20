@@ -33,8 +33,12 @@ _EXIF_DATETIME_FORMATS = (
 _PLOT_EPOCH = datetime(1970, 1, 1)
 
 
-def guess_image_datetime(path: Path) -> datetime:
-    """EXIF → ファイル名 → 更新日時の順で撮影日時を推定する。"""
+def extract_image_datetime(path: Path) -> tuple[datetime | None, str]:
+    """撮影日時を推定し (datetime|None, source) を返す。
+
+    source: ``exif`` | ``filename`` | ``mtime`` | ``missing``
+    EXIF / ファイル名が取れない場合は mtime を候補として返す（確定扱いしない）。
+    """
     path = Path(path)
 
     try:
@@ -46,7 +50,7 @@ def guess_image_datetime(path: Path) -> datetime:
                     text = str(raw).strip()
                     for fmt in _EXIF_DATETIME_FORMATS:
                         try:
-                            return datetime.strptime(text[:19], fmt)
+                            return datetime.strptime(text[:19], fmt), "exif"
                         except ValueError:
                             continue
     except Exception:
@@ -58,11 +62,28 @@ def guess_image_datetime(path: Path) -> datetime:
         if match:
             y, m, d = map(int, match.groups())
             try:
-                return datetime(y, m, d)
+                return datetime(y, m, d), "filename"
             except ValueError:
                 continue
 
-    return datetime.fromtimestamp(path.stat().st_mtime)
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime), "mtime"
+    except OSError:
+        return None, "missing"
+
+
+def guess_image_datetime(path: Path) -> datetime:
+    """EXIF → ファイル名 → 更新日時の順で撮影日時を推定する。"""
+    dt, source = extract_image_datetime(path)
+    if dt is not None:
+        return dt
+    # フォールバック（通常は mtime で返る）
+    return datetime.fromtimestamp(Path(path).stat().st_mtime)
+
+
+def is_datetime_source_confirmed(source: str | None) -> bool:
+    """Registration ゲート用: EXIF / ファイル名 / 手動入力は確定扱い。"""
+    return source in ("exif", "filename", "manual")
 
 
 def datetime_to_iso(dt: datetime) -> str:
@@ -125,6 +146,24 @@ def refresh_series_dates_for_files(
     for f in files:
         if f.name in filenames and f.name not in skip:
             refreshed[f.name] = datetime_to_iso(guess_image_datetime(f))
+    return refreshed
+
+
+def refresh_series_datetimes_for_files(
+    files: list[Path],
+    filenames: set[str],
+    *,
+    skip_manual: set[str] | None = None,
+) -> dict[str, tuple[str, str]]:
+    """対象ファイルの (iso, source) を再取得。skip_manual は上書きしない。"""
+    skip = skip_manual or set()
+    refreshed: dict[str, tuple[str, str]] = {}
+    for f in files:
+        if f.name in filenames and f.name not in skip:
+            dt, source = extract_image_datetime(f)
+            if dt is None:
+                continue
+            refreshed[f.name] = (datetime_to_iso(dt), source)
     return refreshed
 
 
@@ -201,6 +240,36 @@ def _slope_per_year_from_results(
     return float(slope)
 
 
+# 緑 AF の中心窩クリックは、これより近い隙間を年数にすると誤差が年数になる。
+FOVEAL_GAP_MIN_UM = 250.0
+
+
+def describe_foveal_approach(
+    dist_um: float | None,
+    rate_um_per_year: float | None,
+) -> str:
+    """中心窩までの距離を、年数にしてよいかを分けて一文にする。
+
+    隙間が FOVEAL_GAP_MIN_UM 未満のときは、位置合わせしても
+    到達年数にはしない。その症例の進行は面積と中心 1 mm の残存で見る。
+    """
+    if dist_um is None:
+        return "中心窩までの距離は測れていません"
+    if dist_um < FOVEAL_GAP_MIN_UM:
+        return (
+            f"中心窩まで {dist_um:.0f} µm。"
+            "縁に達しているので、到達年数は出しません"
+        )
+    if rate_um_per_year and rate_um_per_year > 0:
+        years = float(dist_um) / float(rate_um_per_year)
+        return (
+            f"中心窩まで {dist_um:.0f} µm"
+            f" · 接近速度 {rate_um_per_year} µm/年"
+            f" · 最新時点から中心窩まで {years:.2f} 年"
+        )
+    return f"中心窩まで {dist_um:.0f} µm"
+
+
 def estimate_progression_rate_um_per_year(results: list[dict]) -> float | None:
     """中心窩距離の時系列から進行速度（μm/年）を線形回帰で推定。"""
     slope = _slope_per_year_from_results(
@@ -216,6 +285,16 @@ def estimate_growth_mm2_per_year(results: list[dict]) -> float | None:
     """GA面積の時系列から拡大速度（mm²/年）を線形回帰で推定。"""
     slope = _slope_per_year_from_results(
         results, lambda r: r['stats']['area_mm2'],
+    )
+    if slope is None:
+        return None
+    return round(slope, 3)
+
+
+def estimate_intact_mm2_per_year(results: list[dict]) -> float | None:
+    """中心 1 mm の残存面積の傾き（mm²/年）。減っていれば負。"""
+    slope = _slope_per_year_from_results(
+        results, lambda r: r['stats'].get('intact_1mm_mm2'),
     )
     if slope is None:
         return None
@@ -310,6 +389,55 @@ def landmarks_from_snapshot(snap: dict) -> dict:
     return {"fovea_xy": fovea, "disc_pts": disc_pts, "disc_xy": disc_xy}
 
 
+def landmarks_ready_for_registration(snap: dict | None) -> bool:
+    """Registration 前ゲート。
+
+    乳頭と中心窩が揃っていれば可。HRA の幅指定は乳頭が写らないので、
+    中心窩と正の scale_um_px（calibration_source=width）で可。
+    """
+    if not snap:
+        return False
+    lm = landmarks_from_snapshot(snap)
+    if lm.get("fovea_xy") is None:
+        return False
+    if lm.get("disc_xy") is not None:
+        return True
+    if snap.get("calibration_source") != "width":
+        return False
+    scale = snap.get("scale_um_px")
+    try:
+        return scale is not None and float(scale) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _maybe_resegment_aligned(
+    img: np.ndarray,
+    warped_mask: np.ndarray,
+    fovea,
+    scale: float,
+    *,
+    enabled: bool,
+    fname: str,
+) -> tuple[np.ndarray, str]:
+    """位置合わせ後画像で再segmentation。失敗時は warp マスクへフォールバック。"""
+    if not enabled:
+        return warped_mask, "warp"
+    from engine.segmentation import segment_ga
+
+    try:
+        reseged = segment_ga(img, fovea_xy=fovea, scale_um_px=scale)
+    except Exception as exc:
+        _perf_log.warning("resegment failed for %s: %s — keep warped mask", fname, exc)
+        return warped_mask, "warp_fallback_error"
+    if reseged is None or not np.any(reseged):
+        _perf_log.warning(
+            "resegment empty for %s — keep warped mask", fname,
+        )
+        return warped_mask, "warp_fallback_empty"
+    return reseged, "resegment"
+
+
 def build_series_from_saved(
     per_file: dict[str, dict],
     files: list[Path],
@@ -320,13 +448,16 @@ def build_series_from_saved(
     methods: dict[str, str] | None = None,
     prior_matrices: dict[str, np.ndarray] | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    resegment_after_reg: bool = True,
 ) -> list[dict]:
-    """メモリ上の個別解析結果から時系列表示用データを構築（再セグメントなし）。
+    """メモリ上の個別解析結果から時系列表示用データを構築する。
 
     - selected: 時系列対象に含めるファイル名の集合（None なら確定済み全件）。
     - methods: ファイル名 → 位置合わせ手法（redo 用。既定 "affine"）。
     - prior_matrices: ファイル名 → 既知のアフィン行列。あれば再計算せず適用する。
     - progress_callback: (done, total, label) — 移動側時点の進捗（UI 用）。
+    - resegment_after_reg: True なら位置合わせ後の画像で GA を再segmentation
+      （失敗時は warp マスクへフォールバック）。False なら従来どおりマスクを warp。
 
     先頭時点（最古の撮影日）を基準に、各画像・マスク・中心窩を同じアフィン
     行列で整列する。中心窩は必ず基準の中心窩へ一致させる（fovea anchoring）。
@@ -356,7 +487,14 @@ def build_series_from_saved(
 
     snapshots = [per_file[f.name] for f in ordered]
     raw_images = [s["image"] for s in snapshots]
-    raw_masks = [s["mask"] for s in snapshots]
+    # 時系列本線（reg→seg）では prep 時点で mask が無いことがある → 空マスク
+    raw_masks = []
+    for s, img in zip(snapshots, raw_images):
+        m = s.get("mask")
+        if m is None:
+            raw_masks.append(np.zeros(img.shape[:2], dtype=np.uint8))
+        else:
+            raw_masks.append(m)
     images, img_scales = resize_to_reference_with_scales(raw_images)
     masks, _ = resize_to_reference_with_scales(raw_masks)
 
@@ -461,6 +599,7 @@ def build_series_from_saved(
             disc_pts = lm["disc_pts"]
             matrix = np.eye(2, 3, dtype=np.float32)
             method = "reference" if i == 0 else methods.get(fname, "affine")
+            mask_source = "reference" if i == 0 else "native"
         elif fname in prior_matrices:
             method = methods.get(fname) or "affine"
             matrix = np.asarray(prior_matrices[fname], dtype=np.float32)
@@ -470,6 +609,10 @@ def build_series_from_saved(
             fovea = warp_point(moving_fovea, matrix) or ref_fovea
             disc_xy = warp_point(moving_disc, matrix) or ref_disc
             disc_pts = lm["disc_pts"]
+            mask, mask_source = _maybe_resegment_aligned(
+                img, mask, fovea, scale,
+                enabled=resegment_after_reg, fname=fname,
+            )
             _report_progress(f"適用 {fname}")
         else:
             method = reg_methods[i]
@@ -480,8 +623,12 @@ def build_series_from_saved(
             disc_xy = reg["disc_xy"] or ref_disc
             disc_pts = lm["disc_pts"]
             matrix = reg["matrix"]
+            mask, mask_source = _maybe_resegment_aligned(
+                img, mask, fovea, scale,
+                enabled=resegment_after_reg, fname=fname,
+            )
 
-        stats = _compute_row_stats(mask, scale, fovea, snap["stats"])
+        stats = _compute_row_stats(mask, scale, fovea, snap.get("stats"))
         results.append({
             "index": i,
             "path": snap["path"],
@@ -495,6 +642,9 @@ def build_series_from_saved(
             "disc_pts": disc_pts,
             "disc_xy": disc_xy,
             "scale_um_px": scale,
+            "calibration_source": ref_snap.get("calibration_source"),
+            "mask_source": mask_source,
+            "case_id": snap.get("case_id") or ref_snap.get("case_id"),
             "reg_method": method,
             "reg_matrix": matrix,
             "reg_ok": (i == 0) or (fname in prior_matrices),
@@ -503,12 +653,76 @@ def build_series_from_saved(
     return results
 
 
+def segment_aligned_series(
+    results: list[dict],
+    *,
+    allow_warp_fallback: bool = True,
+) -> list[dict]:
+    """整列済み時系列の各時点で GA を segmentation し、同一 scale で再計測する。
+
+    時系列本線: Registration → 整列QC → **この関数** → 測定 → 任意マスクQC。
+    再seg が空/失敗で、かつ warp 済みマスクに画素がある場合のみフォールバック。
+    """
+    from engine.segmentation import segment_ga
+
+    if not results:
+        return results
+
+    out: list[dict] = []
+    for row in results:
+        updated = dict(row)
+        img = row["image"]
+        fovea = row.get("fovea_xy")
+        scale = row.get("scale_um_px")
+        prior_mask = row.get("mask")
+        mask_source = "resegment"
+        mask = None
+        try:
+            mask = segment_ga(img, fovea_xy=fovea, scale_um_px=scale)
+        except Exception as exc:
+            _perf_log.warning(
+                "aligned seg failed for %s: %s", row.get("filename"), exc,
+            )
+            mask = None
+            mask_source = "warp_fallback_error"
+
+        if mask is None or not np.any(mask):
+            if (
+                allow_warp_fallback
+                and prior_mask is not None
+                and np.any(prior_mask)
+            ):
+                mask = prior_mask
+                if mask_source == "resegment":
+                    mask_source = "warp_fallback_empty"
+            else:
+                h, w = img.shape[:2]
+                mask = (
+                    prior_mask
+                    if prior_mask is not None
+                    else np.zeros((h, w), dtype=np.uint8)
+                )
+                if mask_source == "resegment":
+                    mask_source = "empty"
+
+        if row.get("is_reference") and mask_source == "resegment":
+            mask_source = "reference"
+
+        stats = _compute_row_stats(mask, scale, fovea, row.get("stats"))
+        updated["mask"] = mask
+        updated["stats"] = stats
+        updated["mask_source"] = mask_source
+        out.append(updated)
+    return out
+
+
 def reregister_timepoint(
     results: list[dict],
     time_idx: int,
     per_file: dict[str, dict],
     *,
     method: str,
+    resegment_after_reg: bool = True,
 ) -> dict:
     """既存 series の 1 時点だけを別手法で再位置合わせして更新行を返す。"""
     from engine.series_registration import register_moving_to_reference
@@ -526,7 +740,13 @@ def reregister_timepoint(
     lm_raw = landmarks_from_snapshot(snap)
 
     raw_images = [ref_snap["image"], snap["image"]]
-    raw_masks = [ref_snap["mask"], snap["mask"]]
+    raw_masks = []
+    for s, img in zip((ref_snap, snap), raw_images):
+        m = s.get("mask")
+        if m is None:
+            raw_masks.append(np.zeros(img.shape[:2], dtype=np.uint8))
+        else:
+            raw_masks.append(m)
     images, img_scales = resize_to_reference_with_scales(raw_images)
     masks, _ = resize_to_reference_with_scales(raw_masks)
     ref_img = images[0]
@@ -556,18 +776,24 @@ def reregister_timepoint(
     )
     fovea = reg["fovea_xy"] or ref_fovea
     disc_xy = reg["disc_xy"] or ref_disc
-    stats = _compute_row_stats(reg["mask"], scale, fovea, snap["stats"])
+    mask, mask_source = _maybe_resegment_aligned(
+        reg["image"], reg["mask"], fovea, scale,
+        enabled=resegment_after_reg, fname=row["filename"],
+    )
+    stats = _compute_row_stats(mask, scale, fovea, snap["stats"])
 
     updated = dict(row)
     updated.update({
         "image": reg["image"],
-        "mask": reg["mask"],
+        "mask": mask,
         "stats": stats,
         "fovea_xy": fovea,
         "source_fovea_xy": lm_raw["fovea_xy"],
         "disc_pts": lm["disc_pts"],
         "disc_xy": disc_xy,
         "scale_um_px": scale,
+        "calibration_source": ref_snap.get("calibration_source"),
+        "mask_source": mask_source,
         "reg_method": method,
         "reg_matrix": reg["matrix"],
         "reg_ok": True,

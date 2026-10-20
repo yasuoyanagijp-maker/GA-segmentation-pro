@@ -167,27 +167,33 @@ def test_series_ready_at_two_confirmed_not_all():
     assert series_ready is True
 
 
-def test_registration_and_roi_defaults_on():
-    """④ の既定動作: 位置合わせ ON・マスクQC補正 ON（リセット後も維持）。"""
+def test_independent_mode_defaults():
+    """既定は独立解析（series_mode OFF）。マスクQC補正は時系列時 ON。"""
     state = GAAppState()
-    assert state.series_registration_enabled is True
+    assert state.series_mode is False
+    assert state.series_registration_enabled is False
+    assert state.series_resegment_enabled is True
     assert state.series_roi_enabled is True
     assert state.series_roi_applied is False
 
-    # フルリセット後も既定は ON に戻る
-    state.series_registration_enabled = False
+    # フルリセット後も独立解析既定に戻る
+    state.series_mode = True
+    state.series_registration_enabled = True
     state.series_roi_enabled = False
     state.series_roi_applied = True
     state.reset_analysis()
-    assert state.series_registration_enabled is True
+    assert state.series_mode is False
+    assert state.series_registration_enabled is False
     assert state.series_roi_enabled is True
     assert state.series_roi_applied is False
 
     # keep_series=True では時系列設定は温存される
-    state.series_registration_enabled = False
+    state.series_mode = True
+    state.series_registration_enabled = True
     state.series_roi_enabled = False
     state.reset_analysis(keep_series=True)
-    assert state.series_registration_enabled is False
+    assert state.series_mode is True
+    assert state.series_registration_enabled is True
     assert state.series_roi_enabled is False
 
 
