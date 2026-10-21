@@ -27,9 +27,7 @@ cat > /tmp/ga_launcher.applescript <<EOF
 -- ${APP_NAME} サーバー起動（/Applications/${APP_NAME}/run.sh）
 set installDir to "/Applications/${APP_NAME}"
 do shell script "cd " & quoted form of installDir & " && (./run.sh >/dev/null 2>&1 &) &>/dev/null"
-delay 3
-do shell script "open http://127.0.0.1:8551/"
-display notification "ブラウザで http://127.0.0.1:8551 を開きました" with title "${APP_NAME}" sound name "Glass"
+display notification "アプリのウィンドウを開いています" with title "${APP_NAME}" sound name "Glass"
 EOF
 
 rm -rf "$APP_BUNDLE"

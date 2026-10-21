@@ -1,6 +1,7 @@
 """GA Segmentation Pro — Flet エントリポイント。"""
 
 import os
+import sys
 
 import flet as ft
 
@@ -38,10 +39,17 @@ async def main(page: ft.Page) -> None:
         raise
 
 
-if __name__ == "__main__":
-    use_web = os.environ.get("FLET_USE_WEB", "1").strip().lower() not in (
+def _use_web() -> bool:
+    """配布した .app と通常起動はウィンドウ。FLET_USE_WEB=1 のときだけブラウザ。"""
+    if getattr(sys, "frozen", False):
+        return False
+    return os.environ.get("FLET_USE_WEB", "0").strip().lower() not in (
         "0", "false", "no", "native", "desktop",
     )
+
+
+if __name__ == "__main__":
+    use_web = _use_web()
     port = int(os.environ.get("FLET_PORT", "8551"))
     ft.app(
         target=main,
