@@ -1,4 +1,4 @@
-name: Windows desktop build
+name: Desktop release
 
 on:
   workflow_dispatch:
@@ -6,22 +6,96 @@ on:
     tags:
       - "desktop-v*"
 
+permissions:
+  contents: write
+
 jobs:
   windows:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install
-        run: pip install -r requirements.txt pyinstaller
+        run: python -m pip install -r requirements.txt pyinstaller
       - name: Build windowed apps
         run: python scripts/build_desktop.py
+      - name: Name the Windows executables
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/release | Out-Null
+          Copy-Item -LiteralPath "dist/pro/GA Segmentation Pro.exe" -Destination "dist/release/GA-Segmentation-Pro-windows-x64.exe"
+          Copy-Item -LiteralPath "dist/optos/GA Segmentation Optos.exe" -Destination "dist/release/GA-Segmentation-Optos-windows-x64.exe"
+          Get-ChildItem dist/release | Format-Table Name, Length
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64
-          path: |
-            dist/pro/GA Segmentation Pro.exe
-            dist/optos/GA Segmentation Optos.exe
+          path: dist/release/*.exe
           if-no-files-found: error
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Confirm Apple Silicon
+        run: |
+          uname -m
+          python -c "import platform; assert platform.machine().lower() == 'arm64', platform.machine()"
+      - name: Install
+        run: python -m pip install -r requirements.txt pyinstaller
+      - name: Build Apple Silicon apps
+        run: bash scripts/build_macos_arm64.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: dist/mac-release/*-macOS-arm64.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [windows, macos]
+    if: startsWith(github.ref, 'refs/tags/desktop-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ls -lh release-assets
+          mapfile -t files < <(find release-assets -type f | sort)
+          if [[ ${#files[@]} -ne 4 ]]; then
+            echo "expected 4 release files, found ${#files[@]}" >&2
+            printf '  %s\n' "${files[@]}" >&2
+            exit 1
+          fi
+          notes="$(mktemp)"
+          cat > "$notes" <<EOF
+          Mac（Apple Silicon）と Windows（64 bit）のデスクトップアプリです。
+
+          ### Mac（Apple Silicon）
+          ZIP を展開し、中の「インストール.command」を右クリック →「開く」で実行してください。Apple の公証は使いません。
+
+          - \`pro-macOS-arm64.zip\` … GA Segmentation Pro
+          - \`optos-macOS-arm64.zip\` … GA Segmentation Optos
+
+          ### Windows（64 bit）
+          ダウンロードした exe をダブルクリックして起動します。
+
+          - \`GA-Segmentation-Pro-windows-x64.exe\` … GA Segmentation Pro
+          - \`GA-Segmentation-Optos-windows-x64.exe\` … GA Segmentation Optos
+          EOF
+          gh release create "${GITHUB_REF_NAME}" "${files[@]}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "GA Segmentation ${GITHUB_REF_NAME}" \
+            --notes-file "$notes"

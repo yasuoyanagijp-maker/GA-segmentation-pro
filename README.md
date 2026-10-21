@@ -13,6 +13,17 @@
 
 どちらもウィンドウが開きます。ブラウザで開くときだけ `FLET_USE_WEB=1` を付けます。Dock の名前は Flet になることがあります。ウィンドウのタイトルがアプリ名です。
 
+## ダウンロード
+
+ビルド済みのアプリは [Releases](https://github.com/yasuoyanagijp-maker/GA-segmentation-pro/releases) にあります。`desktop-v*` のタグを push すると、Mac（Apple Silicon）と Windows（64 bit）を作って同じ Release に載せます。
+
+| 環境 | ファイル |
+|---|---|
+| Mac（Apple Silicon） | `pro-macOS-arm64.zip`、`optos-macOS-arm64.zip` |
+| Windows（64 bit） | `GA-Segmentation-Pro-windows-x64.exe`、`GA-Segmentation-Optos-windows-x64.exe` |
+
+Mac は ZIP を展開し、「インストール.command」を右クリック →「開く」で Applications に入ります。Apple の公証は使いません。手順はマニュアルの「Mac に入れる」です。Windows は exe をダブルクリックして起動します。
+
 ## 起動
 
 Python 3.12 と、このフォルダの仮想環境が必要です。Python 3.14 では依存パッケージが入りません。
@@ -25,8 +36,6 @@ source myenv/bin/activate
 ```
 
 初回の環境作成はマニュアルの「ソースから起動する」にあります。
-
-Mac の配布 ZIP には `インストール.command` が入っています。右クリック →「開く」で Applications に入ります。Apple の公証は使いません。手順はマニュアルの「Mac に入れる」です。
 
 ## 開発
 
