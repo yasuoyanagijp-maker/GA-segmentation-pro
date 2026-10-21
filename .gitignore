@@ -1,4 +1,6 @@
 myenv/
+build/
+dist/
 venv/
 .venv/
 __pycache__/
@@ -10,3 +12,4 @@ ga_output/
 output/
 ga_roi_correction/demo_output/
 *.log
+*.spec

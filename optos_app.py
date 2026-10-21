@@ -1,6 +1,7 @@
 """GA Segmentation Optos — 現行アプリとは別の入口。"""
 
 import os
+import sys
 import threading
 
 import flet as ft
@@ -38,8 +39,18 @@ def _watch_browser_close(page: ft.Page) -> None:
     page.on_close = _on_disconnect
 
 
+def _use_web() -> bool:
+    """配布した .app と通常起動はウィンドウ。FLET_USE_WEB=1 のときだけブラウザ。"""
+    if getattr(sys, "frozen", False):
+        return False
+    return os.environ.get("FLET_USE_WEB", "0").strip().lower() not in (
+        "0", "false", "no", "native", "desktop",
+    )
+
+
 async def main(page: ft.Page) -> None:
-    _watch_browser_close(page)
+    if _use_web():
+        _watch_browser_close(page)
     page.title = "GA Segmentation Optos"
     page.theme_mode = ft.ThemeMode.DARK
     apply_page_theme(page)
@@ -70,9 +81,7 @@ async def main(page: ft.Page) -> None:
 
 
 if __name__ == "__main__":
-    use_web = os.environ.get("FLET_USE_WEB", "1").strip().lower() not in (
-        "0", "false", "no", "native", "desktop",
-    )
+    use_web = _use_web()
     port = int(os.environ.get("FLET_PORT", "8552"))
     ft.app(
         target=main,

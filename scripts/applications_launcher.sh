@@ -63,7 +63,7 @@ fi
 if [ -n "$UPDATE_MSG" ]; then
     notify "$UPDATE_MSG — サーバーを起動中…"
 else
-    notify "サーバーを起動中… http://127.0.0.1:8551"
+    notify "アプリのウィンドウを開いています"
 fi
 
 cd "$PROJECT_DIR"

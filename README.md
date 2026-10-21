@@ -71,6 +71,10 @@ pip install -r requirements.txt
 
 ---
 
+## ダウンロード
+
+ビルド済みのウィンドウアプリは [Releases](https://github.com/yasuoyanagijp-maker/GA-segmentation-pro/releases) にある。Mac は Apple Silicon、Windows は 64 bit。ブラウザではなくアプリのウィンドウが開く。
+
 ## 起動方法
 
 リポジトリ直下の起動スクリプトは **`run_flet.sh`** です。`/Applications/GA Segmentation Pro/run.sh` は git pull とランチャー同期のあと `run_flet.sh` を呼ぶ **ラッパー** であり、旧 Streamlit 用の `run.sh` とは別物です。
@@ -83,7 +87,7 @@ source myenv/bin/activate
 ./run_flet.sh
 ```
 
-ブラウザが自動で開く（`http://127.0.0.1:8551`）。ネイティブウィンドウで起動する場合は `FLET_USE_WEB=0 ./run_flet.sh`。
+ウィンドウが開く。ブラウザで開く場合は `FLET_USE_WEB=1 ./run_flet.sh`（`http://127.0.0.1:8551`）。
 
 ### /Applications ランチャー
 
