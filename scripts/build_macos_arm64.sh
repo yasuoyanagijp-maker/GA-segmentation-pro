@@ -22,6 +22,25 @@ fi
 python -c "import PyInstaller" 2>/dev/null || pip install "pyinstaller>=6.11"
 python scripts/build_desktop.py "$@"
 
+# build_desktop.py の --only と同じく、指定したアプリだけ ZIP にする。
+ONLY="all"
+prev=""
+for arg in "$@"; do
+  if [[ "$prev" == "--only" ]]; then
+    ONLY="$arg"
+  elif [[ "$arg" == --only=* ]]; then
+    ONLY="${arg#--only=}"
+  fi
+  prev="$arg"
+done
+case "$ONLY" in
+  all|optos|pro) ;;
+  *)
+    echo "unknown --only ${ONLY}" >&2
+    exit 1
+    ;;
+esac
+
 STAGE="${ROOT}/dist/mac-release"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
@@ -57,5 +76,9 @@ bundle_one() {
   echo "zip ${zip}"
 }
 
-bundle_one "GA Segmentation Optos" "optos"
-bundle_one "GA Segmentation Pro" "pro"
+if [[ "$ONLY" == "all" || "$ONLY" == "optos" ]]; then
+  bundle_one "GA Segmentation Optos" "optos"
+fi
+if [[ "$ONLY" == "all" || "$ONLY" == "pro" ]]; then
+  bundle_one "GA Segmentation Pro" "pro"
+fi
