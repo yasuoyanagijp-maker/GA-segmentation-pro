@@ -62,6 +62,7 @@ def main() -> None:
         sys.exit(f"この OS ではビルドできません: {system}")
 
     for app in _selected(args.only):
+        layout = "--onedir" if system == "Darwin" else "--onefile"
         cmd = [
             sys.executable,
             "-m",
@@ -69,7 +70,7 @@ def main() -> None:
             "--noconfirm",
             "--clean",
             "--windowed",
-            "--onefile",
+            layout,
             *arch,
             "--name",
             app["name"],
@@ -94,7 +95,12 @@ def main() -> None:
         subprocess.check_call(cmd, cwd=ROOT)
         if system == "Darwin":
             bundle = ROOT / app["dist"] / f"{app['name']}.app"
-            subprocess.check_call(["codesign", "--force", "--deep", "--sign", "-", str(bundle)])
+            strip = ROOT / "scripts" / "strip_mac_codesign_poison.sh"
+            subprocess.check_call(["bash", str(strip), str(bundle)])
+            subprocess.check_call(["xattr", "-cr", str(bundle)])
+            subprocess.check_call(
+                ["codesign", "--force", "--deep", "--sign", "-", str(bundle)]
+            )
             print(bundle)
 
 

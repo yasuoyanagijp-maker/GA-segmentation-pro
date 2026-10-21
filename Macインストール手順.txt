@@ -1,0 +1,33 @@
+GA Segmentation — macOS インストール手順（Apple Silicon）
+
+【同梱ファイル】
+  • GA Segmentation Pro.app / GA Segmentation Optos.app … アプリケーション本体
+  • インストール.command … インストーラー（このファイルと一緒に使います）
+  • Macインストール手順.txt … 本ファイル
+
+■ インストール方法
+
+1. ダウンロードした ZIP をダブルクリックして展開してください。
+
+2. 展開されたフォルダを開き、「インストール.command」を
+   右クリック（または Control + クリック）→「開く」で実行してください。
+
+   初回は「開発元を確認できないため開けません」と出ることがあります。
+   その場合も右クリック →「開く」で続行できます。
+
+3. インストーラーは Apple の公証を使いません。この Mac 上で
+   隔離属性の解除（xattr -cr）とアドホック再署名（codesign --sign -）を行い、
+   Applications フォルダへコピーして起動します。
+
+4. 次回以降は Applications フォルダのアプリをダブルクリックして起動できます。
+
+■ うまく開けない場合
+
+• 「インストール.command」と .app が同じフォルダにあるか確認してください。
+• ターミナルで次を実行してから、アプリを起動し直してください。
+
+    xattr -cr "/Applications/GA Segmentation Pro.app"
+    codesign --force --deep --sign - "/Applications/GA Segmentation Pro.app"
+
+  Optos の場合はアプリ名を「GA Segmentation Optos.app」に読み替えてください。
+  xattr だけでは直らないことがあります。そのあとの codesign まで実行してください。
