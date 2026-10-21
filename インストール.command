@@ -53,6 +53,13 @@ for APP_SRC in "${apps[@]}"; do
 
     echo -e "${GREEN}[3/4]${NC} このMac向けに再署名中（公証なし）..."
     xattr -cr "$STAGE_APP"
+    # ZIP 展開で戻る AppleDouble と pip の metadata は codesign --deep を止める。
+    while IFS= read -r -d '' path; do
+        rm -rf "$path"
+    done < <(find "$STAGE_APP" \( -name '*.dist-info' -o -name '*.egg-info' -o -name '._*' \) -print0 2>/dev/null)
+    if command -v dot_clean >/dev/null 2>&1; then
+        dot_clean -m "$STAGE_APP" 2>/dev/null || true
+    fi
     if codesign --force --deep --sign - "$STAGE_APP"; then
         echo "       再署名が完了しました。"
     else
@@ -62,10 +69,18 @@ for APP_SRC in "${apps[@]}"; do
 
     if [[ -d "$APP_DEST" ]]; then
         rm -rf "$BACKUP_APP"
-        mv "$APP_DEST" "$BACKUP_APP"
+        if ! mv "$APP_DEST" "$BACKUP_APP" || [[ -e "$APP_DEST" ]]; then
+            rm -rf "$STAGE_APP"
+            fail "今のアプリを退避できなかったので、置き換えませんでした。"
+        fi
     fi
-    if ! mv "$STAGE_APP" "$APP_DEST"; then
-        if [[ -d "$BACKUP_APP" ]]; then
+    if [[ -e "$APP_DEST" ]]; then
+        rm -rf "$STAGE_APP"
+        fail "置き換え先が残っているので、中止しました。"
+    fi
+    if ! mv "$STAGE_APP" "$APP_DEST" || [[ ! -d "$APP_DEST" ]]; then
+        rm -rf "$STAGE_APP"
+        if [[ -d "$BACKUP_APP" && ! -e "$APP_DEST" ]]; then
             mv "$BACKUP_APP" "$APP_DEST"
         fi
         fail "置き換えに失敗しました。以前のアプリを戻しました。"
