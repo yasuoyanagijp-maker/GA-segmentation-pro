@@ -121,6 +121,11 @@ class VisitSnap:
     hypo_threshold: float | None = None
     needs_review: str = ""
     area_note: str = ""
+    # 前の時点の輪郭を初期マスクにしている。時点を移しても、別の時点へ持ち越さない。
+    mask_from_prior: bool = False
+    # 血管で写した暫定中心窩。戻ったあとのクリックが、この位置と比べられる。
+    fovea_proposal_xy: tuple[float, float] | None = None
+    fovea_proposal_source: str = ""
     # 血管位置合わせでスケールを決めたときの、1枚目に対する倍率。None なら DFD 比。
     registration_zoom: float | None = None
 
@@ -380,7 +385,8 @@ class OptosSession:
             if snap is None or snap.gray is None or snap.disc_xy is None or not snap.disc_radius_px:
                 continue
             if snap.fovea_xy is not None and (snap.fovea_user_placed or snap.registration_zoom):
-                # クリック済み、または血管で写した位置は乳頭ベクトルで上書きしない。
+                # クリック済み、または血管で写した位置は、1枚目の中心窩を
+                # 直しても動かさない。スケールだけ 1枚目の µm/px ÷ 保存した倍率で追従する。
                 fovea = snap.fovea_xy
             else:
                 fovea = fovea_from_reference(
@@ -1247,6 +1253,9 @@ class OptosSession:
             hypo_threshold=self.baseline_threshold,
             needs_review=self.needs_review,
             area_note=self.area_note,
+            mask_from_prior=self.mask_from_prior,
+            fovea_proposal_xy=self.fovea_proposal_xy,
+            fovea_proposal_source=self.fovea_proposal_source,
             registration_zoom=self.registration_zoom,
         )
 
@@ -1268,9 +1277,17 @@ class OptosSession:
             self.baseline_threshold = snap.hypo_threshold
         self.needs_review = snap.needs_review
         self.area_note = snap.area_note
+        self.mask_from_prior = snap.mask_from_prior
+        self.fovea_proposal_xy = snap.fovea_proposal_xy
+        self.fovea_proposal_source = snap.fovea_proposal_source
         self.registration_zoom = snap.registration_zoom
         self.alignment_gray = None
-        self.tool = "pan" if self.fovea_xy is not None else "disc"
+        if self.fovea_xy is None:
+            self.tool = "disc"
+        elif not self.fovea_user_placed:
+            self.tool = "fovea"
+        else:
+            self.tool = "pan"
 
     def _clear_current(self) -> None:
         self.gray = None
@@ -1295,6 +1312,7 @@ class OptosSession:
         self.clear_pts = []
         self.fovea_user_placed = False
         self.mask_stale = False
+        self.mask_from_prior = False
         self.fovea_proposal_xy = None
         self.fovea_proposal_source = ""
         self.registration_zoom = None

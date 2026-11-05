@@ -1332,6 +1332,62 @@ def test_close_gap_does_not_become_years():
     assert "中心窩距離" not in far
 
 
+def test_visit_switch_keeps_the_prior_mask_flag_and_the_fovea_proposal():
+    from pathlib import Path
+
+    from optos_ui.session import OptosSession, VisitSnap
+
+    session = OptosSession()
+    session.case_id = "OD"
+    early = Path("a.png")
+    late = Path("b.png")
+    session.files = [early, late]
+    session.index = 1
+    gray = np.full((40, 40), 180, dtype=np.uint8)
+    session.snaps["OD/a.png"] = VisitSnap(
+        filename="a.png",
+        path="a.png",
+        date_iso="2024-01-01",
+        date_source="filename",
+        gray=gray,
+        disc_xy=(30.0, 20.0),
+        fovea_xy=(10.0, 20.0),
+        scale_um_px=50.0,
+        mask=np.zeros((40, 40), dtype=np.uint8),
+        confirmed=True,
+        fovea_user_placed=True,
+    )
+    session.gray = gray
+    session.date_iso = "2024-06-01"
+    session.date_source = "filename"
+    session.disc_xy = (31.0, 20.0)
+    session.fovea_xy = (12.0, 21.0)
+    session.fovea_user_placed = False
+    session.scale_um_px = 50.0
+    session.registration_zoom = 1.01
+    session.fovea_proposal_xy = (12.0, 21.0)
+    session.fovea_proposal_source = "registration"
+    session.mask = np.zeros((40, 40), dtype=np.uint8)
+    session.mask[20, 12] = 255
+    session.mask_from_prior = True
+    session.tool = "fovea"
+
+    session.open_index(0)
+    assert session.mask_from_prior is False
+    assert session.fovea_proposal_xy is None
+    assert session.fovea_proposal_source == ""
+    assert session.tool == "pan"
+
+    session.open_index(1)
+    assert session.mask_from_prior is True
+    assert session.fovea_proposal_xy == (12.0, 21.0)
+    assert session.fovea_proposal_source == "registration"
+    assert session.registration_zoom == pytest.approx(1.01)
+    assert session.fovea_user_placed is False
+    assert session.tool == "fovea"
+    assert session.mask[20, 12] == 255
+
+
 def test_visit_switch_keeps_the_series_and_case_switch_clears_it():
     from pathlib import Path
 
