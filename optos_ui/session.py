@@ -792,11 +792,12 @@ class OptosSession:
         self.tool = "pan"
         warn = self._fovea_proposal_note()
         suffix = f"。{warn}" if warn else ""
-        if self.mask is not None and np.any(self.mask > 0):
-            self.mask_stale = False
-            return f"中心窩を確定しました。マスクをいつもの色で表示しています{suffix}"
-        self.mask_stale = True
-        return f"中心窩を確定しました。マスクがないので「再セグ」を押してください{suffix}"
+        if self.mask is None or not np.any(self.mask > 0):
+            self.mask_stale = True
+            return f"中心窩を確定しました。マスクがないので「再セグ」を押してください{suffix}"
+        if self.mask_stale:
+            return f"中心窩を確定しました。マスクが古いので「再セグ」で作り直してください{suffix}"
+        return f"中心窩を確定しました。マスクをいつもの色で表示しています{suffix}"
 
     def resegment(self) -> str:
         if self.gray is None or self.fovea_xy is None or self.disc_xy is None or not self.scale_um_px:

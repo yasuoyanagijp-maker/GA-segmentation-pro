@@ -541,6 +541,11 @@ def test_first_fovea_click_segments_and_disc_click_does_not():
     session.place_fovea((fovea[0] + 8.0, fovea[1]))
     assert session.mask_stale is True
     assert np.array_equal(session.mask, kept)
+    note = session.confirm_fovea()
+    assert "再セグ" in note
+    assert session.mask_stale is True
+    assert "再セグ" in session.confirm()
+    assert session.confirmed is False
 
 
 def test_csv_exports_visits_and_withholds_years_when_close():
