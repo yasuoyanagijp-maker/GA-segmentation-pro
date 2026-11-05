@@ -122,6 +122,9 @@ VISIT_COLUMNS = (
     "gap_um",
     "intact_1mm_mm2",
     "outside_6mm_px",
+    "mask_px",
+    "scale_estimate_um_per_px",
+    "scale_outlier",
 )
 
 SERIES_COLUMNS = (

@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from engine.cases import discover_cases, folder_exclusions, ordered_case_ids
+from engine.eye_scale import fixed_eye_scale, is_scale_outlier
 from engine.io_utils import load_gray
 from engine.life_table import life_expectancy_years
 from engine.optos import (
@@ -244,7 +245,13 @@ class OptosSession:
                 row["mask"] = snap.mask
                 row["filename"] = filename
                 row["case_id"] = case_id
-                row["needs_review"] = snap.needs_review
+                review = snap.needs_review or ""
+                if row.get("scale_outlier"):
+                    flags = [part for part in review.split(";") if part]
+                    if "scale_outlier" not in flags:
+                        flags.append("scale_outlier")
+                    review = ";".join(flags)
+                row["needs_review"] = review
                 rows.append(row)
         finally:
             self.case_id = saved
@@ -934,7 +941,10 @@ class OptosSession:
                 or not snap.scale_um_px
             ):
                 continue
-            previous = stats_central(snap.mask, snap.fovea_xy, snap.scale_um_px, snap.disc_xy)
+            used = self.measurement_scale_um_px(snap.scale_um_px)
+            if used is None:
+                continue
+            previous = stats_central(snap.mask, snap.fovea_xy, used, snap.disc_xy)
             if previous.get("area_mm2") is None:
                 continue
             earlier.append((snap.date_iso, float(previous["area_mm2"]), snap))
@@ -946,8 +956,10 @@ class OptosSession:
             (prev_date, prev_area),
             (self.date_iso, float(stats["area_mm2"])),
         ])
-        prev_gap = robust_foveal_gap_um(prev_snap.mask, prev_snap.fovea_xy, prev_snap.scale_um_px)
-        gap = robust_foveal_gap_um(self.mask, self.fovea_xy, self.scale_um_px)
+        prev_used = self.measurement_scale_um_px(prev_snap.scale_um_px)
+        current_used = self.measurement_scale_um_px(self.scale_um_px)
+        prev_gap = robust_foveal_gap_um(prev_snap.mask, prev_snap.fovea_xy, prev_used or prev_snap.scale_um_px)
+        gap = robust_foveal_gap_um(self.mask, self.fovea_xy, current_used or self.scale_um_px)
         notes += gap_reopen_warnings([
             (prev_date, prev_gap),
             (self.date_iso, gap),
@@ -1043,26 +1055,74 @@ class OptosSession:
             return f"{text} {self.area_note}"
         return text
 
+    def _usable_scale_estimate(
+        self,
+        scale: float | None,
+        *,
+        confirmed: bool,
+        fovea_user_placed: bool,
+    ) -> bool:
+        return bool(scale) and float(scale) > 0 and (confirmed or fovea_user_placed)
+
+    def _scale_estimates(self) -> list[float]:
+        """この眼の時点ごとの推定 µm/px。仮の乳頭スケールは入れない。"""
+        values: list[float] = []
+        current = self.files[self.index].name if self.files else None
+        for snap in self._case_snaps():
+            if current is not None and snap.filename == current:
+                continue
+            if self._usable_scale_estimate(
+                snap.scale_um_px,
+                confirmed=snap.confirmed,
+                fovea_user_placed=snap.fovea_user_placed,
+            ):
+                values.append(float(snap.scale_um_px))
+        if self._usable_scale_estimate(
+            self.scale_um_px,
+            confirmed=self.confirmed,
+            fovea_user_placed=self.fovea_user_placed,
+        ):
+            values.append(float(self.scale_um_px))
+        return values
+
+    def eye_scale_um_px(self) -> float | None:
+        """面積換算に使う、この眼の固定 µm/px（時点推定の中央値）。"""
+        return fixed_eye_scale(self._scale_estimates())
+
+    def measurement_scale_um_px(self, estimate: float | None = None) -> float | None:
+        """計測に使う µm/px。眼の中央値が無ければ、その時点の推定。"""
+        fixed = self.eye_scale_um_px()
+        if fixed is not None:
+            return fixed
+        if estimate is not None and float(estimate) > 0:
+            return float(estimate)
+        return None
+
     def live_stats(self) -> dict | None:
+        used = self.measurement_scale_um_px(self.scale_um_px)
         if (
             self.mask is None
             or self.fovea_xy is None
-            or not self.scale_um_px
+            or not used
             or not np.any(self.mask > 0)
         ):
             return None
-        return stats_central(self.mask, self.fovea_xy, self.scale_um_px, self.disc_xy)
+        return stats_central(self.mask, self.fovea_xy, used, self.disc_xy)
 
     def _snap_row(self, snap: VisitSnap) -> dict:
         assert snap.fovea_xy and snap.disc_xy and snap.scale_um_px and snap.mask is not None
-        stats = stats_central(snap.mask, snap.fovea_xy, snap.scale_um_px, snap.disc_xy)
-        gap = robust_foveal_gap_um(snap.mask, snap.fovea_xy, snap.scale_um_px)
+        estimate = float(snap.scale_um_px)
+        used = self.measurement_scale_um_px(estimate)
+        assert used is not None
+        stats = stats_central(snap.mask, snap.fovea_xy, used, snap.disc_xy)
+        gap = robust_foveal_gap_um(snap.mask, snap.fovea_xy, used)
+        outlier = is_scale_outlier(estimate, used)
         return {
             "case_id": self.case_id,
             "date": snap.date_iso,
             "filename": snap.filename,
             "confirmed": int(snap.confirmed),
-            "scale_um_per_px": round(float(snap.scale_um_px), 4),
+            "scale_um_per_px": round(float(used), 4),
             "disc_x": round(float(snap.disc_xy[0]), 1),
             "disc_y": round(float(snap.disc_xy[1]), 1),
             "fovea_x": round(float(snap.fovea_xy[0]), 1),
@@ -1074,8 +1134,11 @@ class OptosSession:
             "gawain": stats.get("gawain"),
             "dist_um_nearest": stats.get("dist_um"),
             "gap_um": None if gap is None else round(gap, 1),
-            "intact_1mm_mm2": round(intact_within_mm2(snap.mask, snap.fovea_xy, snap.scale_um_px), 4),
+            "intact_1mm_mm2": round(intact_within_mm2(snap.mask, snap.fovea_xy, used), 4),
             "outside_6mm_px": stats.get("outside_quant_px"),
+            "mask_px": int(np.count_nonzero(snap.mask > 0)),
+            "scale_estimate_um_per_px": round(estimate, 4),
+            "scale_outlier": int(outlier),
         }
 
     def visit_rows(self) -> list[dict]:
@@ -1102,9 +1165,11 @@ class OptosSession:
         gap_rows = []
         for s in visits:
             assert s.fovea_xy and s.scale_um_px and s.mask is not None
-            stats = stats_central(s.mask, s.fovea_xy, s.scale_um_px)
-            gap = robust_foveal_gap_um(s.mask, s.fovea_xy, s.scale_um_px)
-            intact = intact_within_mm2(s.mask, s.fovea_xy, s.scale_um_px)
+            used = self.measurement_scale_um_px(s.scale_um_px)
+            assert used is not None
+            stats = stats_central(s.mask, s.fovea_xy, used)
+            gap = robust_foveal_gap_um(s.mask, s.fovea_xy, used)
+            intact = intact_within_mm2(s.mask, s.fovea_xy, used)
             stats["intact_1mm_mm2"] = intact
             rows.append({
                 "date": s.date_iso,
