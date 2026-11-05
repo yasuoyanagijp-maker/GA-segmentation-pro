@@ -10,6 +10,16 @@ from ga_reading.metrics import RPD_THRESHOLD_PCT
 EPS = 1e-12
 
 
+def sync_area_sqrt(row: dict) -> None:
+    """√面積は、確定した面積から取り直す。列ごとに平均や中央値を取らない。"""
+    area = to_float(row.get("area_mm2"))
+    if area is None or area < 0:
+        if str(row.get("area_mm2", "")).strip().upper() == "NA":
+            row["area_mm_sqrt"] = "NA"
+        return
+    row["area_mm_sqrt"] = f"{round(math.sqrt(area), 2):.10g}"
+
+
 def to_float(value: Any) -> float | None:
     """空欄と NA は欠損。0 は 0 のまま残す。"""
     if value is None:

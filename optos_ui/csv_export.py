@@ -19,6 +19,58 @@ REVERSAL_TOLERANCE = {
 }
 
 
+def area_change_warnings(visits: list[tuple[str, float]]) -> list[str]:
+    """前回より減ったとき、または半年以内に2倍を超えたときに文を返す。"""
+    parsed: list[tuple[datetime, float, str]] = []
+    for text, area in visits:
+        try:
+            parsed.append((datetime.fromisoformat(str(text)[:10]), float(area), str(text)[:10]))
+        except ValueError:
+            continue
+    parsed.sort(key=lambda item: item[0])
+    notes: list[str] = []
+    for index in range(1, len(parsed)):
+        prev_dt, prev_area, prev_text = parsed[index - 1]
+        current_dt, area, text = parsed[index]
+        if prev_area > 0 and area + 1e-9 < prev_area:
+            notes.append(
+                f"{text}: 前回 {prev_text} より面積が減りました（{prev_area:.3f} → {area:.3f} mm²）"
+            )
+        days = (current_dt - prev_dt).days
+        if 0 < days <= 183 and prev_area > 0 and area > prev_area * 2.0:
+            notes.append(
+                f"{text}: {days} 日で面積が2倍を超えました（{prev_area:.3f} → {area:.3f} mm²）"
+            )
+    return notes
+
+
+def gap_reopen_warnings(visits: list[tuple[str, float | None]]) -> list[str]:
+    """中心窩が萎縮の中（縁まで 0）だった後で、縁までが正に戻ったら文を返す。
+
+    萎縮は戻らないので、中心窩の位置か輪郭のどちらかが前回とずれている。
+    """
+    parsed: list[tuple[datetime, float, str]] = []
+    for text, gap in visits:
+        if gap is None:
+            continue
+        try:
+            parsed.append((datetime.fromisoformat(str(text)[:10]), float(gap), str(text)[:10]))
+        except ValueError:
+            continue
+    parsed.sort(key=lambda item: item[0])
+    notes: list[str] = []
+    for index in range(1, len(parsed)):
+        _, prev_gap, prev_text = parsed[index - 1]
+        _, gap, text = parsed[index]
+        if prev_gap == 0 and gap > 0:
+            notes.append(
+                f"{text}: 前回 {prev_text} は中心窩が萎縮の中（縁まで 0 µm）でしたが、"
+                f"今回は {gap:.0f} µm 離れています。萎縮は戻らないので、"
+                "中心窩の位置か輪郭を確認してください"
+            )
+    return notes
+
+
 def mark_reversals(rows: list[dict]) -> list[dict]:
     """前の時点より進行と逆向きなら、その列名を reversed に入れる。"""
     out: list[dict] = []

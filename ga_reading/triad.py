@@ -12,7 +12,7 @@ from typing import Any
 from ga_reading.merge import file_stem, read_csv, write_csv
 from ga_reading.metrics import FILE_COL, GA_PRIMARY_METRICS, RPD_THRESHOLD_PCT
 from ga_reading.queue import recheck_targets
-from ga_reading.rpd import rpd_pct, to_float
+from ga_reading.rpd import rpd_pct, sync_area_sqrt, to_float
 
 
 def triad_median(values: list[float | None]) -> float | None:
@@ -70,6 +70,8 @@ def resolve_triad(
         flags: list[str] = []
         if stem in queue:
             for column in GA_PRIMARY_METRICS:
+                if column == "area_mm_sqrt":
+                    continue
                 text = str(out.get(column, "")).strip()
                 if text.upper() != "NA" and text != "":
                     continue
@@ -94,6 +96,7 @@ def resolve_triad(
                     f"{out.get(FILE_COL, stem)}  {column}={out[column]}"
                     + ("  要レビュー" if marked else "")
                 )
+        sync_area_sqrt(out)
         out["needs_review"] = ";".join(flags)
         resolved.append(out)
 
@@ -123,6 +126,7 @@ def resolve_triad(
             f"- 要レビュー（中央値と最終読影者の RPD が {rpd_threshold:g}% 超）: {review_cells}",
             "- 値は採用したまま、needs_review に列名を付ける。",
             "- すでに採用済みのセルは上書きしない。",
+            "- √面積は確定した面積から取り直す。速度もこの平方根を使う。",
             "- 正式な確定ファイルは *_triad_adopted_values.csv。",
             "",
         ]),

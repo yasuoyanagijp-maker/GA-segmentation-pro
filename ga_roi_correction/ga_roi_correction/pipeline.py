@@ -185,7 +185,8 @@ def correct_ga_series(images: list[np.ndarray], masks: list[np.ndarray],
     corrected_original: list[np.ndarray] = []
     for i in range(n):
         inv = cv2.invertAffineTransform(reg_results[i].warp_matrix)
-        corrected_original.append(reg.warp_mask(corrected[i], inv, shape_hw))
+        frame_hw = images[i].shape[:2]
+        corrected_original.append(reg.warp_mask(corrected[i], inv, frame_hw))
 
     out = {
         "corrected_masks_aligned": corrected,
