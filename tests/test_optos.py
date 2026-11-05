@@ -433,6 +433,69 @@ def test_later_visit_records_without_moving_the_proposed_fovea():
     assert int(np.count_nonzero(saved.mask)) > int(np.count_nonzero(prior))
 
 
+def test_first_visit_confirm_fovea_requires_a_click():
+    from pathlib import Path
+
+    from optos_ui.session import OptosSession
+
+    session = OptosSession()
+    session.case_id = "OD"
+    session.files = [Path("eye_20240101.png"), Path("eye_20240601.png")]
+    session.index = 0
+    session.date_iso = "2024-01-01"
+    session.gray = np.full((80, 80), 180, dtype=np.uint8)
+    session.disc_xy = (60.0, 40.0)
+    session.fovea_xy = (20.0, 40.0)
+    session.scale_um_px = 50.0
+    session.mask = np.zeros((80, 80), dtype=np.uint8)
+    session.mask[40, 30] = 255
+    note = session.confirm_fovea()
+    assert "クリック" in note
+    assert session.fovea_user_placed is False
+    assert "中心窩" in session.confirm()
+    assert session.confirmed is False
+
+
+def test_failed_confirm_does_not_lock_the_proposed_fovea():
+    from pathlib import Path
+
+    from optos_ui.session import OptosSession, VisitSnap
+
+    session = OptosSession()
+    session.case_id = "OD"
+    early = Path("eye_20240101.png")
+    late = Path("eye_20240601.png")
+    session.files = [early, late]
+    session.index = 1
+    session.date_iso = "2024-06-01"
+    gray = np.full((40, 40), 180, dtype=np.uint8)
+    session.snaps["OD/eye_20240101.png"] = VisitSnap(
+        filename=early.name,
+        path=str(early),
+        date_iso="2024-01-01",
+        date_source="filename",
+        gray=gray,
+        disc_xy=(30.0, 20.0),
+        fovea_xy=(10.0, 20.0),
+        scale_um_px=50.0,
+        disc_radius_px=8.0,
+        mask=np.zeros((40, 40), dtype=np.uint8),
+        confirmed=True,
+        fovea_user_placed=True,
+    )
+    session.gray = gray
+    session.disc_xy = (30.0, 20.0)
+    session.fovea_xy = (12.0, 20.0)
+    session.scale_um_px = 50.0
+    session.mask = np.zeros((40, 40), dtype=np.uint8)
+    session.mask[20, 12] = 255
+    session.mask_stale = True
+    note = session.confirm()
+    assert "再セグ" in note
+    assert session.fovea_user_placed is False
+    assert session.confirmed is False
+
+
 def test_confirm_waits_until_the_user_places_the_fovea():
     from optos_ui.session import OptosSession
 

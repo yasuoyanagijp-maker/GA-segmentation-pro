@@ -785,6 +785,8 @@ class OptosSession:
         """中心窩の位置を確定し、位置合わせの色をやめていつものマスク色に戻す。"""
         if self.gray is None or self.disc_xy is None or self.fovea_xy is None:
             return "先に乳頭と中心窩の位置を決めてください"
+        if not self.fovea_user_placed and self._is_anchor_visit():
+            return "1枚目は、中心窩らしい場所をクリックしてから「中心窩確定」を押してください"
         self.fovea_user_placed = True
         self.alignment_gray = None
         self.tool = "pan"
@@ -965,9 +967,8 @@ class OptosSession:
         if not self.fovea_user_placed:
             # 2枚目以降は、血管で写した中心窩を動かさずに輪郭だけ直して確定できる。
             # 1枚目の仮の中心窩は、クリックするまで確定しない。
+            # ここでは印を付けない。マスク検査で戻ったあとに付ける。
             if self._series_anchor() is not None and self.fovea_xy is not None:
-                self.fovea_user_placed = True
-                self.alignment_gray = None
                 accepted_proposal = True
             else:
                 return "中心窩をクリックしてから確定します"
@@ -977,6 +978,9 @@ class OptosSession:
             return "マスクが古いので確定できません。「再セグ」で作り直してください"
         if not np.any(self.mask > 0):
             return "マスクに領域がないので確定できません。縁まで、または塗りで囲んでください"
+        if accepted_proposal:
+            self.fovea_user_placed = True
+            self.alignment_gray = None
         self.confirmed = True
         note, review = self._area_review()
         self.area_note = note
