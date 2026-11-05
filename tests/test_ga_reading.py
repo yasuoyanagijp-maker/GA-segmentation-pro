@@ -1,14 +1,23 @@
 """GA 指標での第1・第2の採用と、最終読影の中央値。"""
 
+import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from ga_reading.absent import absent_row, write_empty_mask
-from ga_reading.bundle import write_grader_bundle
+from ga_reading.bundle import exclusion_log_text, write_grader_bundle
 from ga_reading.merge import file_stem, merge_graders, read_csv
 from ga_reading.metrics import GA_PRIMARY_METRICS
-from ga_reading.queue import find_first_grader_csv, recheck_images, recheck_stems, second_reader_images
+from ga_reading.queue import (
+    find_first_grader_csv,
+    recheck_images,
+    recheck_stems,
+    second_reader_images,
+    workflow_parent,
+    workflow_parent_from_summary,
+)
 from ga_reading.triad import resolve_triad
 
 
@@ -200,6 +209,57 @@ def test_second_reader_csv_is_not_the_first_and_recheck_queue_is_narrow(tmp_path
     assert [path.name for path in recheck_images(summary)] == ["keep.png"]
 
 
+def test_unconfirmed_images_remain_targets_and_the_reason_is_logged(tmp_path: Path):
+    names = [
+        "eye_20260101.png",
+        "eye_20260101_b.png",
+        "eye_20260102.png",
+        "eye_20260601.png",
+    ]
+    sources = []
+    for name in names:
+        path = tmp_path / name
+        path.write_bytes(b"png")
+        sources.append(path)
+    measured = sources[0]
+    mask = np.zeros((4, 4), dtype=np.uint8)
+    mask[0, 0] = 255
+    gaps = [(path.name, "未確定") for path in sources[1:]]
+    report = exclusion_log_text(len(sources), 1, gaps)
+    root = tmp_path / "reading"
+    write_grader_bundle(
+        root,
+        [{
+            "path": str(measured),
+            "filename": measured.name,
+            "shape": (4, 4),
+            "mask": mask,
+            "lesion_present": "1",
+            "case_id": "OD",
+            "date": "2026-01-01",
+            "area_mm2": 1.0,
+            "area_mm_sqrt": 1.0,
+            "lesion_count": 1,
+            "gawain": 40,
+            "dist_um_nearest": 200,
+            "gap_um": 180,
+            "intact_1mm_mm2": 2.0,
+        }],
+        source_images=sources,
+        log_text=report,
+    )
+    opened = [path.name for path in second_reader_images(root)]
+    assert opened == names
+    _fields, rows = read_csv(root / "grader.csv")
+    assert [row["File"] for row in rows] == ["eye_20260101.png"]
+    log = (root / "reading_exclusions.log").read_text(encoding="utf-8")
+    assert "同じ日付や、短い間隔だけでは外しません。" in log
+    assert "eye_20260101_b.png: 未確定" in log
+    assert "eye_20260102.png: 未確定" in log
+    assert "eye_20260601.png: 未確定" in log
+    assert "eye_20260101.png: 未確定" not in log
+
+
 def test_triad_uses_the_final_reader_when_both_graders_are_blank(tmp_path: Path):
     first = tmp_path / "g1.csv"
     second = tmp_path / "g2.csv"
@@ -235,6 +295,38 @@ def test_triad_preview_does_not_write(tmp_path: Path):
     assert not (out / "GA_triad_adopted_values.csv").exists()
 
 
+def test_sqrt_follows_the_confirmed_area_not_its_own_median(tmp_path: Path):
+    first = tmp_path / "g1.csv"
+    second = tmp_path / "g2.csv"
+    left = _row("case1_OD_20240413.png", "0.566", "0.75")
+    right = _row("case1_OD_20240413.png", "0.714", "0.84")
+    _write(first, [left])
+    _write(second, [right])
+    summary = merge_graders(first, second, tmp_path / "out", prefix="GA")
+    _fields, adopted = read_csv(Path(summary["adopted_csv"]))
+    assert adopted[0]["area_mm2"] == "NA"
+    assert adopted[0]["area_mm_sqrt"] == "NA"
+    assert "area_mm_sqrt" not in summary["recheck_by_file"]["case1_OD_20240413.png"]
+    final = tmp_path / "final.csv"
+    _write(final, [_row("case1_OD_20240413.png", "0.556", "0.75")])
+    result = resolve_triad(Path(summary["summary_md"]), final, tmp_path / "out")
+    _fields, rows = read_csv(Path(result["triad_csv"]))
+    assert float(rows[0]["area_mm2"]) == pytest.approx(0.566)
+    assert float(rows[0]["area_mm_sqrt"]) == 0.75
+
+
+def test_sqrt_disagreement_alone_does_not_open_a_recheck(tmp_path: Path):
+    first = tmp_path / "g1.csv"
+    second = tmp_path / "g2.csv"
+    _write(first, [_row("same.png", "1.0", "1.0")])
+    _write(second, [_row("same.png", "1.0", "2.0")])
+    summary = merge_graders(first, second, tmp_path / "out", prefix="GA")
+    assert summary["recheck_files"] == 0
+    _fields, rows = read_csv(Path(summary["adopted_csv"]))
+    assert float(rows[0]["area_mm2"]) == 1.0
+    assert float(rows[0]["area_mm_sqrt"]) == 1.0
+
+
 def test_load_paths_does_not_open_masks(tmp_path: Path):
     import cv2
 
@@ -250,6 +342,89 @@ def test_load_paths_does_not_open_masks(tmp_path: Path):
     session.load_paths(second_reader_images(tmp_path), label="第2")
     assert [path.name for path in session.files] == ["visit.png"]
     assert session.files[0].parent.name == "images"
+
+
+def test_reader_outputs_sit_beside_the_first_folder_and_images_stay_there(tmp_path: Path):
+    grader = tmp_path / "grader1"
+    images = grader / "export" / "images"
+    images.mkdir(parents=True)
+    (images / "keep.png").write_bytes(b"png")
+    (images / "extra").mkdir()
+    (images / "extra" / "wrong.png").write_bytes(b"png")
+    nested = grader / "second_reader_output_old"
+    nested.mkdir()
+    (nested / "wrong.png").write_bytes(b"png")
+    (grader / "grader.csv").write_text("File\nkeep.png\n", encoding="utf-8")
+    decoy = tmp_path / "export" / "images"
+    decoy.mkdir(parents=True)
+    (decoy / "other-eye.png").write_bytes(b"decoy")
+    other = tmp_path / "OS" / "export" / "images"
+    other.mkdir(parents=True)
+    (other / "os.png").write_bytes(b"os")
+    (tmp_path / "OS" / "grader.csv").write_text("File\nos.png\n", encoding="utf-8")
+
+    opened = second_reader_images(grader)
+    assert [path.name for path in opened] == ["keep.png"]
+    assert workflow_parent(grader) == grader.resolve()
+    try:
+        second_reader_images(tmp_path)
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "複数" in str(exc)
+
+    summary = tmp_path / "integrated_output_x" / "GA_summary.md"
+    summary.parent.mkdir()
+    summary.write_text(
+        "\n".join([
+            "## RECHECK",
+            "",
+            "- keep.png: area_mm2",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+    (summary.parent / "GA_source_csvs.json").write_text(
+        json.dumps({"first_csv": str(grader / "grader.csv")}),
+        encoding="utf-8",
+    )
+    picked = recheck_images(summary)
+    assert [path.resolve() for path in picked] == [(images / "keep.png").resolve()]
+    assert workflow_parent_from_summary(summary) == grader.resolve()
+
+
+def test_summary_without_source_stays_in_the_reading_folder(tmp_path: Path):
+    reading = tmp_path / "OD_reading"
+    images = reading / "export" / "images"
+    images.mkdir(parents=True)
+    (images / "keep.png").write_bytes(b"png")
+    (reading / "grader.csv").write_text("File\nkeep.png\n", encoding="utf-8")
+    summary = tmp_path / "integrated_output_x" / "GA_summary.md"
+    summary.parent.mkdir()
+    summary.write_text(
+        "\n".join(["## RECHECK", "", "- keep.png: area_mm2", ""]),
+        encoding="utf-8",
+    )
+    assert workflow_parent_from_summary(summary) == reading.resolve()
+    assert [path.name for path in recheck_images(summary)] == ["keep.png"]
+
+
+def test_summary_between_two_eyes_does_not_fall_back_to_the_case(tmp_path: Path):
+    for name in ("OD_reading", "OS_reading"):
+        images = tmp_path / name / "export" / "images"
+        images.mkdir(parents=True)
+        (images / "keep.png").write_bytes(b"png")
+        (tmp_path / name / "grader.csv").write_text("File\nkeep.png\n", encoding="utf-8")
+    summary = tmp_path / "integrated_output_x" / "GA_summary.md"
+    summary.parent.mkdir()
+    summary.write_text(
+        "\n".join(["## RECHECK", "", "- keep.png: area_mm2", ""]),
+        encoding="utf-8",
+    )
+    try:
+        workflow_parent_from_summary(summary)
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "複数" in str(exc)
 
 
 def test_absent_row_leaves_metrics_blank_and_writes_empty_mask(tmp_path: Path):

@@ -43,10 +43,28 @@ def load_gray(path: Path) -> np.ndarray:
     return img
 
 
+def classify_folder_entries(folder: Path) -> tuple[list[Path], list[tuple[str, str]]]:
+    """フォルダ直下のファイルを、読影対象と除外に分ける。
+
+    対応形式の画像は日付が同じでも、間隔が短くても、すべて対象にする。
+    除外するのは画像ではないファイルだけで、理由を一緒に返す。
+    隠しファイルとサブフォルダは対象の候補にしない。
+    """
+    folder = Path(folder)
+    images: list[Path] = []
+    excluded: list[tuple[str, str]] = []
+    for path in sorted(folder.iterdir(), key=lambda item: item.name.lower()):
+        if path.name.startswith(".") or path.is_dir():
+            continue
+        if path.suffix.lower() not in SUPPORTED_SUFFIXES:
+            kind = path.suffix or "拡張子なし"
+            excluded.append((path.name, f"未対応の形式（{kind}）"))
+            continue
+        images.append(path)
+    return images, excluded
+
+
 def list_images(folder: Path) -> list[Path]:
     """フォルダ内の対応画像形式を名前順に列挙する（大文字拡張子も可）。"""
-    folder = Path(folder)
-    return sorted(
-        f for f in folder.iterdir()
-        if f.is_file() and f.suffix.lower() in SUPPORTED_SUFFIXES
-    )
+    images, _excluded = classify_folder_entries(folder)
+    return images

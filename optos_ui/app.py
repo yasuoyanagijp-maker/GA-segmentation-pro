@@ -11,13 +11,21 @@ import cv2
 import flet as ft
 import numpy as np
 
-from engine.optos import px_from_mm, window_box
+from engine.optos import QUANT_RADIUS_MM, px_from_mm, window_box
 from engine.overlay import make_overlay
 from flet_ui import theme as T
 from flet_ui.theme import apply_page_theme
 from ga_reading.bundle import stamped_dir, write_grader_bundle, write_reader_csv
 from ga_reading.merge import merge_graders
-from ga_reading.queue import find_first_grader_csv, latest_workflow_csv, recheck_images, second_reader_images
+from ga_reading.queue import (
+    find_first_grader_csv,
+    first_reader_dir,
+    latest_workflow_csv,
+    recheck_images,
+    second_reader_images,
+    workflow_parent,
+    workflow_parent_from_summary,
+)
 from ga_reading.triad import resolve_triad
 from optos_ui.csv_export import SERIES_COLUMNS, VISIT_COLUMNS, csv_bytes, download_name, write_download
 from optos_ui.folder_dialog import choose_file, choose_folder
@@ -27,19 +35,31 @@ _ROLE_FIRST = "GRADER1"
 _ROLE_SECOND = "READER2"
 _ROLE_FINAL = "FINAL"
 
-VIEW_W = 760
-VIEW_H = 640
+VIEW_W = 1000
+VIEW_H = 840
+
+
+def _exclusion_brief(excluded: list[tuple[str, str]]) -> str:
+    if not excluded:
+        return ""
+    listed = "、".join(f"{name}（{reason}）" for name, reason in excluded)
+    return f"外した {len(excluded)} 枚: {listed}"
 
 
 def uses_macula_window(fovea_user_placed: bool, fovea_xy, scale_um_px) -> bool:
-    """中心窩をユーザーが置くまでは全体と同じ縮尺で見せる。仮の点では拡大しない。"""
-    return bool(fovea_user_placed and fovea_xy is not None and scale_um_px)
+    """乳頭のあと、中心窩の点があれば黄斑を拡大して見せる。全体は乳頭をクリックするときだけ。"""
+    del fovea_user_placed
+    return bool(fovea_xy is not None and scale_um_px)
 
 
 def analysis_display_zoom(scale_um_px: float, user_zoom: float) -> float:
-    """1x で中心 6 mm の円が画面に収まる。2x・4x はその倍率。"""
-    diameter = max(1.0, 2.0 * px_from_mm(6.0, scale_um_px))
-    fit = min(VIEW_W / (diameter * 1.08), VIEW_H / (diameter * 1.08), 1.0)
+    """1x では中心窩から 6 mm までを画面に入れる。乳頭（4.76 mm）が残る広さ。
+
+    シアン円はこれより小さい直径 6 mm。2x・4x はさらに拡大する。
+    """
+    field_mm = 6.0
+    diameter = max(1.0, 2.0 * field_mm * 1000.0 / float(scale_um_px))
+    fit = min(VIEW_W / (diameter * 1.08), VIEW_H / (diameter * 1.08))
     return fit * float(user_zoom)
 
 
@@ -56,6 +76,99 @@ def centered_crop_origin(
     x0 = int(np.clip(round(cx - VIEW_W / 2), 0, max(0, zw - VIEW_W)))
     y0 = int(np.clip(round(cy - VIEW_H / 2), 0, max(0, zh - VIEW_H)))
     return x0, y0
+
+
+_ARROW_PAN = {
+    "Arrow Left": (1.0, 0.0),
+    "Arrow Right": (-1.0, 0.0),
+    "Arrow Up": (0.0, 1.0),
+    "Arrow Down": (0.0, -1.0),
+    "Left": (1.0, 0.0),
+    "Right": (-1.0, 0.0),
+    "Up": (0.0, 1.0),
+    "Down": (0.0, -1.0),
+}
+
+
+def pan_delta_for_key(key: str, zoom: float, step_screen: float = 36.0) -> tuple[float, float] | None:
+    """矢印の向きへ、元画像とマスクが一緒に動く量。画面上の画素を元画像の座標に戻す。"""
+    sign = _ARROW_PAN.get(key)
+    if sign is None:
+        return None
+    step = float(step_screen) / (float(zoom) or 1.0)
+    return sign[0] * step, sign[1] * step
+
+
+def to_display_xy(
+    src_xy: tuple[float, float],
+    origin: tuple[float, float],
+    zoom: float,
+    crop_xy: tuple[float, float],
+) -> tuple[float, float]:
+    """元画像の点を、拡大して切り出した画面上の位置にする。"""
+    return (
+        (float(src_xy[0]) - float(origin[0])) * float(zoom) - float(crop_xy[0]),
+        (float(src_xy[1]) - float(origin[1])) * float(zoom) - float(crop_xy[1]),
+    )
+
+
+def draw_screen_marks(
+    shown: np.ndarray,
+    *,
+    fovea_xy: tuple[float, float] | None,
+    disc_xy: tuple[float, float] | None,
+    scale_um_px: float | None,
+    mask: np.ndarray | None,
+    origin: tuple[float, float],
+    zoom: float,
+    crop_xy: tuple[float, float],
+    contour_rgb: tuple[int, int, int],
+) -> None:
+    """拡大のあと、画面上で 1 画素の線だけを足す。中心窩は画面の外でも端に出す。"""
+    if mask is not None and np.any(mask > 0):
+        contours, _hier = cv2.findContours(
+            (mask > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+        )
+        polys = []
+        for contour in contours:
+            pts = [
+                [int(round(x)), int(round(y))]
+                for x, y in (
+                    to_display_xy((float(px), float(py)), origin, zoom, crop_xy)
+                    for px, py in contour.reshape(-1, 2)
+                )
+            ]
+            if len(pts) >= 2:
+                polys.append(np.array(pts, np.int32))
+        if polys:
+            cv2.polylines(shown, polys, True, contour_rgb, 1, cv2.LINE_8)
+    if fovea_xy is not None and scale_um_px:
+        fx, fy = to_display_xy(fovea_xy, origin, zoom, crop_xy)
+        radius = max(1, int(round(px_from_mm(QUANT_RADIUS_MM, scale_um_px) * float(zoom))))
+        cv2.circle(shown, (int(round(fx)), int(round(fy))), radius, (34, 211, 238), 1, cv2.LINE_8)
+    if disc_xy is not None and scale_um_px:
+        dx, dy = to_display_xy(disc_xy, origin, zoom, crop_xy)
+        radius = max(1, int(round(px_from_mm(0.9, scale_um_px) * float(zoom))))
+        cv2.circle(shown, (int(round(dx)), int(round(dy))), radius, (251, 191, 36), 1, cv2.LINE_8)
+    if fovea_xy is not None:
+        _draw_fovea_marker(shown, to_display_xy(fovea_xy, origin, zoom, crop_xy))
+
+
+def _draw_fovea_marker(shown: np.ndarray, xy: tuple[float, float]) -> None:
+    """今の中心窩。画面内なら細い十字、外なら端に印。"""
+    height, width = shown.shape[:2]
+    x, y = int(round(xy[0])), int(round(xy[1]))
+    inside = 0 <= x < width and 0 <= y < height
+    cx = min(max(x, 2), width - 3)
+    cy = min(max(y, 2), height - 3)
+    color = (34, 211, 238)
+    arm = 16 if inside else 8
+    gap = 4 if inside else 2
+    cv2.line(shown, (cx - arm, cy), (cx - gap, cy), color, 1, cv2.LINE_8)
+    cv2.line(shown, (cx + gap, cy), (cx + arm, cy), color, 1, cv2.LINE_8)
+    cv2.line(shown, (cx, cy - arm), (cx, cy - gap), color, 1, cv2.LINE_8)
+    cv2.line(shown, (cx, cy + gap), (cx, cy + arm), color, 1, cv2.LINE_8)
+    cv2.circle(shown, (cx, cy), 2, (255, 255, 255), 1, cv2.LINE_8)
 
 
 # 見出しと値を同じ幅にする。日付を含めて右の数字がずれないようにする。
@@ -122,10 +235,13 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
     series_detail = ft.Column(spacing=2)
     series_warn = ft.Text("", color=T.ACCENT_AMBER, size=12, selectable=True)
     date_field = ft.TextField(label="検査日時", width=220, dense=True, text_size=13)
-    age_field = ft.TextField(label="年齢", width=100, dense=True, text_size=13)
+    age_field = ft.TextField(label="年齢", width=90, dense=True, text_size=13)
+    min_lesion_field = ft.TextField(
+        label="最小病変 mm²", width=110, dense=True, text_size=13, value="0.05",
+    )
     sex_dd = ft.Dropdown(
         label="性別",
-        width=140,
+        width=110,
         dense=True,
         options=[ft.dropdown.Option("Male"), ft.dropdown.Option("Female")],
         value="Male",
@@ -133,7 +249,14 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
     case_dd = ft.Dropdown(label="症例", width=220, dense=True, options=[])
     visit_dd = ft.Dropdown(label="時点", width=280, dense=True, options=[])
     folder_field = ft.TextField(label="入力フォルダ", width=640, dense=True, text_size=13)
-    reading = {"scan_root": "", "first_csv": "", "second_csv": "", "summary": "", "final_csv": ""}
+    reading = {
+        "scan_root": "",
+        "first_dir": "",
+        "first_csv": "",
+        "second_csv": "",
+        "summary": "",
+        "final_csv": "",
+    }
     role_dd = ft.Dropdown(
         label="読影担当",
         width=360,
@@ -146,7 +269,7 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
         ],
     )
     role_hint = ft.Text(
-        "画像フォルダを開いて計測し、終わったら「第1読影を書き出す」。そのフォルダが export の親になります。",
+        "画像フォルダを開いて計測し、終わったら「第1読影を書き出す」。第2と最終の保存も、そのフォルダの中に出ます。",
         size=12,
         color=T.TEXT_MUTED,
         selectable=True,
@@ -158,6 +281,7 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
     next_step = ft.Text(session.next_instruction(), size=15, color=T.ACCENT_AMBER, selectable=True)
 
     view = {"origin": (0, 0), "zoom": 1.0, "pan": (0.0, 0.0)}
+    _keys_paused = {"on": False}
     series_rows: list[tuple[list[ft.Text], ft.Text]] = []
 
     def _set_status(text: str) -> None:
@@ -200,6 +324,18 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
         view["origin"] = origin
         view["zoom"] = src_zoom
         shown = _viewport(rgb)
+        if uses_macula_window(session.fovea_user_placed, session.fovea_xy, session.scale_um_px):
+            draw_screen_marks(
+                shown,
+                fovea_xy=session.fovea_xy,
+                disc_xy=session.disc_xy,
+                scale_um_px=session.scale_um_px,
+                mask=session.mask,
+                origin=origin,
+                zoom=src_zoom,
+                crop_xy=view["pan"],
+                contour_rgb=(0, 255, 80),
+            )
         img.src_base64 = _jpeg_b64(shown)
         img.width = shown.shape[1]
         img.height = shown.shape[0]
@@ -207,19 +343,21 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
     def _paint_metrics() -> None:
         stats = session.live_stats()
         if stats is None:
-            metrics.value = "面積は中心 6 mm だけを数えます" if session.gray is not None else ""
+            metrics.value = "面積は直径 6 mm の円の中だけを数えます" if session.gray is not None else ""
             return
         scale = f"{session.scale_um_px:.2f}" if session.scale_um_px else "—"
         metrics.value = (
-            f"中心6mm {stats['area_mm2']:.3f} mm²"
+            f"直径6mm {stats['area_mm2']:.3f} mm²"
             f"  ·  24mmモデル {_num(stats.get('area_mm2_24mm'), 3)} mm²"
             f"  ·  √{stats['area_mm_sqrt']:.2f} mm"
             f"  ·  病変 {stats['lesion_count']}"
             f"  ·  GAWAIN {stats['gawain']}"
             f"  ·  中心窩まで {stats['dist_um']} µm"
-            f"\n6mm の外 {stats['outside_quant_px']} px は面積に入れていません"
+            f"\n直径6mm の外 {stats['outside_quant_px']} px は面積に入れていません"
             f"  ·  スケール {scale} µm/px"
         )
+        if session.area_note:
+            metrics.value += "\n" + session.area_note
 
     def _paint() -> None:
         next_step.value = session.next_instruction()
@@ -314,13 +452,7 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
             x0, y0, x1, y1 = window_box(gray.shape[:2], session.fovea_xy, session.scale_um_px)
             crop_g = gray[y0:y1, x0:x1]
             crop_m = mask[y0:y1, x0:x1]
-            fov = (session.fovea_xy[0] - x0, session.fovea_xy[1] - y0)
-            rgb = make_overlay(crop_g, crop_m, fovea_xy=fov, mask_style="blend")
-            r6 = px_from_mm(6.0, session.scale_um_px)
-            cv2.circle(rgb, (int(fov[0]), int(fov[1])), r6, (34, 211, 238), 1)
-            if session.disc_xy is not None:
-                dc = (int(session.disc_xy[0] - x0), int(session.disc_xy[1] - y0))
-                cv2.circle(rgb, dc, px_from_mm(0.9, session.scale_um_px), (251, 191, 36), 1)
+            rgb = make_overlay(crop_g, crop_m, mask_style="blend")
             return rgb, (x0, y0), analysis_display_zoom(session.scale_um_px, session.zoom)
         rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
         fit = min(VIEW_W / rgb.shape[1], VIEW_H / rgb.shape[0])
@@ -406,11 +538,12 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
             return
         if _role() == _ROLE_SECOND:
             try:
-                images = second_reader_images(Path(typed))
-                reading["scan_root"] = str(Path(typed).resolve())
-                found = find_first_grader_csv(Path(typed))
-                reading["first_csv"] = str(found) if found else ""
-                _after(session.load_paths(images, label="第2") + "。第1のマスクは開きません。")
+                first = _remember_first(Path(typed))
+                images = second_reader_images(first)
+                note = session.load_paths(images, label="第2") + "。第1のマスクは開きません。"
+                if reading["first_csv"]:
+                    note += f" 統合には {Path(reading['first_csv']).name} を使います。"
+                _after(note)
             except ValueError as exc:
                 _after(str(exc))
             return
@@ -418,8 +551,7 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
             try:
                 summary = Path(typed)
                 images = recheck_images(summary)
-                reading["summary"] = str(summary.resolve())
-                reading["scan_root"] = str(summary.resolve().parent.parent)
+                _remember_summary(summary)
                 _after(session.load_paths(images, label="最終") + f"。RECHECK {len(images)} 画像。")
             except ValueError as exc:
                 _after(str(exc))
@@ -462,6 +594,21 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
     def on_confirm(_=None) -> None:
         _after(session.confirm())
 
+    def on_confirm_fovea(_=None) -> None:
+        _after(session.confirm_fovea())
+
+    def on_keyboard(e: ft.KeyboardEvent) -> None:
+        if _keys_paused["on"] or session.gray is None or session.fovea_xy is None:
+            return
+        if not uses_macula_window(session.fovea_user_placed, session.fovea_xy, session.scale_um_px):
+            return
+        delta = pan_delta_for_key(e.key, float(view["zoom"]) or 1.0)
+        if delta is None:
+            return
+        session.pan_xy = (session.pan_xy[0] + delta[0], session.pan_xy[1] + delta[1])
+        _paint_image()
+        page.update()
+
     def on_undo(_=None) -> None:
         _after(session.undo_mask())
 
@@ -475,6 +622,7 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
     def _sync_age() -> None:
         session.age = age_field.value or ""
         session.sex = sex_dd.value or "Male"
+        session.set_min_lesion(min_lesion_field.value or "")
 
     def on_series(_=None) -> None:
         _sync_age()
@@ -524,30 +672,56 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
             dlg.open = True
             page.update()
 
-    def _scan_root() -> Path:
-        root = Path(reading["scan_root"] or session.folder or ".").resolve()
-        if root.name == "images" and root.parent.name == "export":
-            return root.parent.parent
-        return root
+    def _remember_first(path: Path) -> Path:
+        first = first_reader_dir(path)
+        reading["first_dir"] = str(first)
+        reading["scan_root"] = str(workflow_parent(first))
+        found = find_first_grader_csv(first)
+        if found:
+            reading["first_csv"] = str(found)
+        return first
+
+    def _remember_summary(summary: Path) -> Path:
+        summary = summary.resolve()
+        reading["summary"] = str(summary)
+        parent = workflow_parent_from_summary(summary)
+        reading["scan_root"] = str(parent)
+        try:
+            reading["first_dir"] = str(first_reader_dir(summary))
+        except ValueError:
+            reading["first_dir"] = ""
+        return parent
+
+    def _save_parent() -> Path:
+        if reading.get("summary") and _role() == _ROLE_FINAL:
+            return _remember_summary(Path(reading["summary"]))
+        if reading.get("first_dir"):
+            parent = workflow_parent(Path(reading["first_dir"]))
+            reading["scan_root"] = str(parent)
+            return parent
+        if reading.get("scan_root"):
+            first = _remember_first(Path(reading["scan_root"]))
+            return workflow_parent(first)
+        raise ValueError("先に第1読影のフォルダを開いてください")
 
     def _apply_role(_=None) -> None:
         role = _role()
         if role == _ROLE_FIRST:
             role_hint.value = (
                 "画像フォルダを開いて計測し、終わったら「第1読影を書き出す」。"
-                "そのフォルダが export の親になります。"
+                "第2と最終の保存も、そのフォルダの中に出ます。"
             )
             start_btn.text = "画像フォルダを開く"
         elif role == _ROLE_SECOND:
             role_hint.value = (
-                "第1の出力フォルダ（export の親）を開きます。マスクは読まず、同じ画像を測り直します。"
-                "保存したあと「統合解析データ」で採用 CSV を作ります。"
+                "第1読影者のフォルダを開きます。マスクは読まず、その export/images だけを測り直します。"
+                "保存は、第1読影のフォルダの中に出ます。"
             )
-            start_btn.text = "第1の出力フォルダを開く"
+            start_btn.text = "第1読影者のフォルダを開く"
         else:
             role_hint.value = (
-                "RECHECK の *_summary.md を選ぶと、その画像だけが開きます。"
-                "保存したあと「トライアッド確定」で中央値を書き出します。他の読影値は画面に出しません。"
+                "RECHECK の *_summary.md を選ぶと、第1の export/images のうちその画像だけが開きます。"
+                "保存は、第1読影のフォルダの中に出ます。他の読影値は画面に出しません。"
             )
             start_btn.text = "summary.md を選ぶ"
         first_export.visible = role == _ROLE_FIRST
@@ -566,21 +740,20 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
             if role == _ROLE_SECOND:
                 path = await asyncio.to_thread(
                     choose_folder,
-                    "第1グレーダーの出力フォルダ（export の親）を選んでください",
+                    "第1読影者のフォルダを選んでください",
                 )
                 if not path:
                     _after("フォルダ選択をキャンセルしました")
                     return
-                images = second_reader_images(Path(path))
-                reading["scan_root"] = str(Path(path).resolve())
-                found = find_first_grader_csv(Path(path))
-                reading["first_csv"] = str(found) if found else ""
-                folder_field.value = reading["scan_root"]
+                first = _remember_first(Path(path))
+                images = second_reader_images(first)
+                folder_field.value = str(first)
                 note = session.load_paths(images, label="第2") + "。第1のマスクは開きません。"
-                if found:
-                    note += f" 統合には {found.name} を使います。"
+                if reading["first_csv"]:
+                    note += f" 統合には {Path(reading['first_csv']).name} を使います。"
                 else:
                     note += " 第1の grader.csv は統合のときに再検索します。"
+                note += f" 保存先は {reading['scan_root']} です。"
                 _after(note)
                 return
             path = await asyncio.to_thread(choose_file, "RECHECK の summary.md を選んでください")
@@ -589,49 +762,80 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
                 return
             summary = Path(path)
             images = recheck_images(summary)
-            reading["summary"] = str(summary.resolve())
-            reading["scan_root"] = str(summary.resolve().parent.parent)
+            parent = _remember_summary(summary)
             folder_field.value = reading["summary"]
             _after(
                 session.load_paths(images, label="最終")
                 + f"。RECHECK {len(images)} 画像。他の読影値は表示しません。"
+                + f" 保存先は {parent} です。"
             )
         except (ValueError, OSError, RuntimeError) as exc:
             _after(str(exc))
 
     async def on_export_first(_=None) -> None:
         rows = session.reading_payload()
+        excluded, report = session.exclusion_report()
         if not rows:
-            _after("確定した計測がありません")
+            _show("書き出せません", "確定した計測がありません。\n" + report)
+            _after("確定した計測がありません。" + _exclusion_brief(excluded))
             return
         path = await asyncio.to_thread(
             choose_folder,
-            "第1読影の出力フォルダを選んでください。ここが export の親になります",
+            "第1読影の出力フォルダを選んでください。第2と最終も、このフォルダの中に保存されます",
         )
         if not path:
             _after("出力フォルダの選択をキャンセルしました")
             return
-        saved = write_grader_bundle(Path(path), rows)
-        reading["scan_root"] = str(Path(path).resolve())
+        chosen = Path(path).resolve()
+        saved = write_grader_bundle(
+            chosen,
+            rows,
+            source_images=list(session.files),
+            log_text=report,
+        )
+        reading["first_dir"] = str(chosen)
+        reading["scan_root"] = str(chosen)
         reading["first_csv"] = str(saved)
-        _after(f"第1読影を書き出しました。第2はこのフォルダを開きます: {path}")
+        note = f"第1読影を書き出しました。画像 {len(session.files)} 枚を export に入れました。第2はこのフォルダを開きます: {chosen}"
+        if excluded:
+            _show("書き出しで外した画像", report)
+            note += "。" + _exclusion_brief(excluded)
+        _after(note)
 
     def on_export_second(_=None) -> None:
         rows = session.reading_payload()
+        excluded, report = session.exclusion_report()
         if not rows:
-            _after("確定した計測がありません")
+            _show("書き出せません", "確定した計測がありません。\n" + report)
+            _after("確定した計測がありません。" + _exclusion_brief(excluded))
             return
-        scan = _scan_root()
-        saved = write_reader_csv(stamped_dir(scan, "second_reader_output"), rows)
-        reading["scan_root"] = str(scan)
+        try:
+            parent = _save_parent()
+        except ValueError as exc:
+            _after(str(exc))
+            return
+        saved = write_reader_csv(
+            stamped_dir(parent, "second_reader_output"),
+            rows,
+            log_text=report,
+        )
         reading["second_csv"] = str(saved)
         merge_btn.disabled = False
-        _after(f"第2読影を保存しました。統合解析データが使えます: {saved}")
+        note = f"第2読影を保存しました。第1読影フォルダの中です: {saved}"
+        if excluded:
+            _show("保存時に外した画像", report)
+            note += "。" + _exclusion_brief(excluded)
+        _after(note)
 
     def on_merge(_=None) -> None:
+        try:
+            parent = _save_parent()
+        except ValueError as exc:
+            _show("統合解析データ", str(exc))
+            return
         second = reading["second_csv"]
         if not second or not Path(second).is_file():
-            found_second = latest_workflow_csv(_scan_root(), "second_reader_output")
+            found_second = latest_workflow_csv(parent, "second_reader_output")
             second = str(found_second) if found_second else ""
             reading["second_csv"] = second
         if not second or not Path(second).is_file():
@@ -639,15 +843,19 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
             return
         first = reading["first_csv"]
         if not first or not Path(first).is_file():
-            found = find_first_grader_csv(Path(reading["scan_root"]))
+            found = None
+            if reading.get("first_dir"):
+                found = find_first_grader_csv(Path(reading["first_dir"]))
+            if found is None:
+                found = find_first_grader_csv(parent)
             first = str(found) if found else ""
         if not first:
             _show(
                 "統合解析データ",
-                "第1の grader.csv が見つかりません。第1の出力フォルダ（export の親）を開いたか確認してください。",
+                "第1の grader.csv が見つかりません。第1読影者のフォルダを開いたか確認してください。",
             )
             return
-        out = stamped_dir(Path(reading["scan_root"]), "integrated_output")
+        out = stamped_dir(parent, "integrated_output")
         try:
             summary = merge_graders(Path(first), Path(second), out, prefix="GA")
         except ValueError as exc:
@@ -672,25 +880,37 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
 
     def on_export_final(_=None) -> None:
         rows = session.reading_payload()
+        excluded, report = session.exclusion_report()
         if not rows:
-            _after("確定した計測がありません")
+            _show("書き出せません", "確定した計測がありません。\n" + report)
+            _after("確定した計測がありません。" + _exclusion_brief(excluded))
             return
         if not reading["summary"]:
             _after("先に summary.md を選んでください")
             return
-        scan = Path(reading["summary"]).resolve().parent.parent
-        saved = write_reader_csv(stamped_dir(scan, "final_reader_output"), rows)
-        reading["scan_root"] = str(scan)
+        parent = _remember_summary(Path(reading["summary"]))
+        saved = write_reader_csv(
+            stamped_dir(parent, "final_reader_output"),
+            rows,
+            log_text=report,
+        )
         reading["final_csv"] = str(saved)
         triad_btn.disabled = False
-        _after(f"最終読影を保存しました。トライアッド確定が使えます: {saved}")
+        note = f"最終読影を保存しました。第1読影フォルダの中です: {saved}"
+        if excluded:
+            _show("保存時に外した画像", report)
+            note += "。" + _exclusion_brief(excluded)
+        _after(note)
 
     def on_triad(_=None) -> None:
         final_csv = reading["final_csv"]
         summary_md = reading["summary"]
         if not final_csv or not Path(final_csv).is_file():
             if summary_md:
-                found_final = latest_workflow_csv(Path(summary_md).resolve().parent.parent, "final_reader_output")
+                found_final = latest_workflow_csv(
+                    workflow_parent_from_summary(Path(summary_md)),
+                    "final_reader_output",
+                )
                 final_csv = str(found_final) if found_final else ""
                 reading["final_csv"] = final_csv
         if not final_csv or not Path(final_csv).is_file():
@@ -910,108 +1130,130 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
         mouse_cursor=ft.MouseCursor.PRECISE,
     )
 
+    # スクロールは左右で兄弟にする。スクロールの中にスクロールを置くと Flet がスピナーのまま止まる。
     page.add(
-        ft.Column(
+        ft.Row(
             [
-                ft.Text("GA Segmentation Optos", size=22, weight=ft.FontWeight.BOLD, color=T.PRIMARY),
-                ft.Row([role_dd, start_btn], spacing=8),
-                role_hint,
-                ft.Row(
-                    [
-                        folder_field,
-                        _btn("開く", on_load),
-                        _btn("フォルダ選択", lambda _: page.run_task(on_reading_start)),
-                    ],
-                    spacing=8,
-                ),
-                ft.Row([case_dd, visit_dd, date_field, _btn("日時を反映", on_date_submit)], spacing=8),
-                ft.Row(
-                    [
-                        gesture,
-                        ft.Container(
-                            width=420,
-                            bgcolor=T.PANEL_BG,
-                            border_radius=8,
-                            padding=12,
-                            content=ft.Column(
+                ft.Container(
+                    expand=True,
+                    content=ft.Column(
+                        [
+                            ft.Text("GA Segmentation Optos", size=22, weight=ft.FontWeight.BOLD, color=T.PRIMARY),
+                            ft.Row([role_dd, start_btn], spacing=8),
+                            role_hint,
+                            ft.Row(
                                 [
-                                    ft.Text("次にすること", size=12, color=T.TEXT_MUTED),
-                                    next_step,
-                                    ft.Divider(color="#374151"),
-                                    tool_label,
-                                    ft.Row([
-                                        _tool_btn("disc"),
-                                        _tool_btn("fovea"),
-                                        _tool_btn("pan"),
-                                        _tool_btn("grow"),
-                                    ], spacing=4),
-                                    ft.Row([
-                                        _tool_btn("brush_add"),
-                                        _tool_btn("brush_erase"),
-                                        _tool_btn("clear"),
-                                        ft.IconButton(
-                                            icon=ft.Icons.HIGHLIGHT_OFF,
-                                            tooltip="道具を閉じる",
-                                            icon_size=22,
-                                            icon_color=T.TEXT_MUTED,
-                                            bgcolor=T.BTN_SECONDARY_BG,
-                                            width=40,
-                                            height=40,
-                                            on_click=on_close_tool,
-                                            style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8)),
-                                        ),
-                                    ], spacing=4),
-                                    ft.Row([
-                                        _zoom_btn(1),
-                                        _zoom_btn(2),
-                                        _zoom_btn(4),
-                                    ], spacing=4),
-                                    ft.Row([
-                                        _action_btn(ft.Icons.AUTORENEW, "再セグ", on_reseg),
-                                        _action_btn(ft.Icons.UNDO, "取消", on_undo),
-                                        _action_btn(ft.Icons.REDO, "やり直し", on_redo),
-                                        _action_btn(ft.Icons.CHECK_CIRCLE, "この時点を確定", on_confirm, color=T.ACCENT_GREEN),
-                                    ], spacing=4),
-                                    ft.Divider(color="#374151"),
-                                    metrics,
-                                    ft.Text(
-                                        "黄斑窓のシアン円が定量する 6 mm です。黄の円は乳頭です。スケールは時点ごとの乳頭–中心窩（4.76 mm）で、ズームが違っても共有しません。",
-                                        size=11,
-                                        color=T.TEXT_MUTED,
-                                    ),
-                                    ft.Divider(color="#374151"),
-                                    ft.Row([age_field, sex_dd], spacing=8),
-                                    _btn("時系列を計算", on_series),
-                                    ft.Row([
-                                        _btn("個別CSV", on_csv_visits),
-                                        _btn("時系列CSV", on_csv_series),
-                                    ], spacing=6),
-                                    first_export,
-                                    second_export,
-                                    merge_btn,
-                                    final_export,
-                                    triad_btn,
-                                    series_text,
-                                    series_detail,
-                                    series_warn,
+                                    folder_field,
+                                    _btn("開く", on_load),
+                                    _btn("フォルダ選択", lambda _: page.run_task(on_reading_start)),
                                 ],
                                 spacing=8,
-                                scroll=ft.ScrollMode.AUTO,
                             ),
-                        ),
-                    ],
-                    spacing=12,
-                    vertical_alignment=ft.CrossAxisAlignment.START,
+                            ft.Row([case_dd, visit_dd, date_field, _btn("日時を反映", on_date_submit)], spacing=8),
+                            gesture,
+                            status,
+                        ],
+                        spacing=10,
+                        scroll=ft.ScrollMode.AUTO,
+                        expand=True,
+                    ),
                 ),
-                status,
+                ft.Container(
+                    width=380,
+                    bgcolor=T.PANEL_BG,
+                    border_radius=8,
+                    padding=12,
+                    content=ft.Column(
+                        [
+                            ft.Text("次にすること", size=12, color=T.TEXT_MUTED),
+                            next_step,
+                            ft.ElevatedButton(
+                                "中心窩確定",
+                                on_click=on_confirm_fovea,
+                                height=36,
+                            ),
+                            ft.Divider(color="#374151"),
+                            tool_label,
+                            ft.Row([
+                                _tool_btn("disc"),
+                                _tool_btn("fovea"),
+                                _tool_btn("pan"),
+                                _tool_btn("grow"),
+                            ], spacing=4),
+                            ft.Row([
+                                _tool_btn("brush_add"),
+                                _tool_btn("brush_erase"),
+                                _tool_btn("clear"),
+                                ft.IconButton(
+                                    icon=ft.Icons.HIGHLIGHT_OFF,
+                                    tooltip="道具を閉じる",
+                                    icon_size=22,
+                                    icon_color=T.TEXT_MUTED,
+                                    bgcolor=T.BTN_SECONDARY_BG,
+                                    width=40,
+                                    height=40,
+                                    on_click=on_close_tool,
+                                    style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8)),
+                                ),
+                            ], spacing=4),
+                            ft.Row([
+                                _zoom_btn(1),
+                                _zoom_btn(2),
+                                _zoom_btn(4),
+                            ], spacing=4),
+                            ft.Row([
+                                _action_btn(ft.Icons.AUTORENEW, "再セグ", on_reseg),
+                                _action_btn(ft.Icons.UNDO, "取消", on_undo),
+                                _action_btn(ft.Icons.REDO, "やり直し", on_redo),
+                                _action_btn(ft.Icons.CHECK_CIRCLE, "この時点を確定", on_confirm, color=T.ACCENT_GREEN),
+                            ], spacing=4),
+                            ft.Divider(color="#374151"),
+                            metrics,
+                            ft.Text(
+                                "シアン円は直径 6 mm で、面積もこの中だけです。乳頭–中心窩は 4.76 mm なので、乳頭はこの円の外です。黄の円は乳頭（直径 1.8 mm）です。2枚目以降の µm/px は、1枚目との乳頭–中心窩の画素距離の比です。",
+                                size=11,
+                                color=T.TEXT_MUTED,
+                            ),
+                            ft.Divider(color="#374151"),
+                            ft.Row([age_field, sex_dd, min_lesion_field], spacing=8),
+                            _btn("時系列を計算", on_series),
+                            ft.Row([
+                                _btn("個別CSV", on_csv_visits),
+                                _btn("時系列CSV", on_csv_series),
+                            ], spacing=6),
+                            first_export,
+                            second_export,
+                            merge_btn,
+                            final_export,
+                            triad_btn,
+                            series_text,
+                            series_detail,
+                            series_warn,
+                        ],
+                        spacing=8,
+                        scroll=ft.ScrollMode.AUTO,
+                        width=356,
+                    ),
+                ),
             ],
-            spacing=10,
             expand=True,
-            scroll=ft.ScrollMode.AUTO,
+            spacing=12,
+            vertical_alignment=ft.CrossAxisAlignment.START,
         )
     )
     case_dd.on_change = on_case
     visit_dd.on_change = on_visit
+
+    def _pause_arrows(_e=None) -> None:
+        _keys_paused["on"] = True
+
+    def _resume_arrows(_e=None) -> None:
+        _keys_paused["on"] = False
+
+    for _field in (folder_field, date_field, age_field, min_lesion_field, role_dd, case_dd, visit_dd, sex_dd):
+        _field.on_focus = _pause_arrows
+        _field.on_blur = _resume_arrows
+    page.on_keyboard_event = on_keyboard
     _paint()
     page.update()
 

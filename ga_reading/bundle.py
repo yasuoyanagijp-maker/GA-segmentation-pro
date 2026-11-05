@@ -30,29 +30,82 @@ def stamped_dir(parent: Path, prefix: str) -> Path:
     return folder
 
 
-def write_reader_csv(directory: Path, rows: list[dict]) -> Path:
+def exclusion_log_text(
+    n_images: int,
+    n_measured: int,
+    exclusions: list[tuple[str, str]],
+) -> str:
+    """外したファイルと理由。日付の重複や間隔では外さない、と残す。"""
+    lines = [
+        f"対象 {n_images} 枚。数値を書いた {n_measured} 枚。",
+        f"外した {len(exclusions)} 枚。",
+        "同じ日付や、短い間隔だけでは外しません。",
+    ]
+    lines.extend(f"- {name}: {reason}" for name, reason in exclusions)
+    return "\n".join(lines) + "\n"
+
+
+def write_exclusion_log(
+    directory: Path,
+    n_images: int,
+    n_measured: int,
+    exclusions: list[tuple[str, str]],
+) -> Path:
+    path = Path(directory) / "reading_exclusions.log"
+    path.write_text(
+        exclusion_log_text(n_images, n_measured, exclusions),
+        encoding="utf-8",
+    )
+    return path
+
+
+def write_reader_csv(
+    directory: Path,
+    rows: list[dict],
+    *,
+    n_images: int | None = None,
+    exclusions: list[tuple[str, str]] | None = None,
+    log_text: str | None = None,
+) -> Path:
     """第2・最終読影の数値だけを書く。画像とマスクはコピーしない。"""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     records = [_measured_record(row) for row in rows]
-    fields = [FILE_COL, LESION_PRESENT, QUALITY, "case_id", "date", "filename", *GA_PRIMARY_METRICS]
+    fields = [FILE_COL, LESION_PRESENT, QUALITY, "case_id", "date", "filename", *GA_PRIMARY_METRICS, "needs_review"]
     path = directory / "grader.csv"
     write_csv(path, fields, records)
+    if log_text is not None:
+        (directory / "reading_exclusions.log").write_text(log_text, encoding="utf-8")
+    elif exclusions is not None:
+        write_exclusion_log(directory, n_images if n_images is not None else len(rows), len(records), exclusions)
     return path
 
 
-def write_grader_bundle(root: Path, rows: list[dict]) -> Path:
-    """export/images と export/masks と grader.csv。第2は masks を使わない。"""
+def write_grader_bundle(
+    root: Path,
+    rows: list[dict],
+    *,
+    source_images: list[Path] | None = None,
+    exclusions: list[tuple[str, str]] | None = None,
+    log_text: str | None = None,
+) -> Path:
+    """export/images と export/masks と grader.csv。第2は masks を使わない。
+
+    source_images があれば、確定していない画像も export/images にコピーする。
+    数値を書かなかった画像は exclusions と reading_exclusions.log に理由を残す。
+    """
     root = Path(root)
     images = root / "export" / "images"
     masks = root / "export" / "masks"
     images.mkdir(parents=True, exist_ok=True)
     masks.mkdir(parents=True, exist_ok=True)
     csv_rows: list[dict] = []
+    copied: set[str] = set()
     for row in rows:
         source = Path(row["path"])
         filename = row.get("filename") or source.name
         shutil.copy2(source, images / filename)
+        copied.add(Path(filename).name)
         shape = tuple(row["shape"])
         mask = row.get("mask")
         if row.get("lesion_present") == "0" or mask is None:
@@ -66,9 +119,19 @@ def write_grader_bundle(root: Path, rows: list[dict]) -> Path:
         else:
             _write_mask(masks / f"{Path(filename).stem}.png", np.asarray(mask))
             csv_rows.append(_measured_record(row))
-    fields = [FILE_COL, LESION_PRESENT, QUALITY, "case_id", "date", "filename", *GA_PRIMARY_METRICS]
+    for source in source_images or []:
+        source = Path(source)
+        if source.name in copied or not source.is_file():
+            continue
+        shutil.copy2(source, images / source.name)
+        copied.add(source.name)
+    fields = [FILE_COL, LESION_PRESENT, QUALITY, "case_id", "date", "filename", *GA_PRIMARY_METRICS, "needs_review"]
     path = root / "grader.csv"
     write_csv(path, fields, csv_rows)
+    if log_text is not None:
+        (root / "reading_exclusions.log").write_text(log_text, encoding="utf-8")
+    elif exclusions is not None:
+        write_exclusion_log(root, len(copied), len(csv_rows), exclusions)
     return path
 
 
@@ -81,6 +144,7 @@ def _measured_record(row: dict) -> dict:
     record["case_id"] = row.get("case_id", "")
     record["date"] = row.get("date", "")
     record["filename"] = filename
+    record["needs_review"] = row.get("needs_review", "")
     return record
 
 

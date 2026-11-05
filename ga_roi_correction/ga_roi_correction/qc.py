@@ -169,7 +169,11 @@ def build_qc_records(dates, raw_areas, corrected_areas, dice_prev_raw, dice_prev
             shape_anom = True
 
         reg_low_conf = False
-        if reg_ccs[i] is not None and reg_ccs[i] < th.min_registration_cc:
+        # register_frame は相関が採用しきい値（0.6）未満だと identity を返す。
+        # その相関が min_registration_cc 以上でも位置合わせは無い。
+        if reg_modes[i] == "identity":
+            reg_low_conf = True
+        elif reg_ccs[i] is not None and reg_ccs[i] < th.min_registration_cc:
             reg_low_conf = True
 
         d_prior = dice_neighbor_prior[i] if dice_neighbor_prior is not None else None

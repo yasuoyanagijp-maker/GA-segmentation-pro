@@ -1,7 +1,8 @@
-"""第2は export の親から画像だけを取る。最終読影の列は summary の RECHECK だけ。"""
+"""第2は第1の export/images だけを取る。第2・統合・最終は第1読影フォルダの中に置く。"""
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -49,24 +50,124 @@ def find_first_grader_csv(scan_root: Path) -> Path | None:
     return found[0] if len(found) == 1 else None
 
 
+def _is_workflow_dir(path: Path) -> bool:
+    return path.name.startswith(_WORKFLOW_PREFIXES)
+
+
+def _bundle_root(path: Path) -> Path | None:
+    """grader の出力そのものなら、そのフォルダ。export や images を指していれば一段上。"""
+    path = Path(path)
+    if path.name == "images" and path.parent.name == "export":
+        path = path.parent.parent
+    elif path.name == "export" and (path / "images").is_dir():
+        path = path.parent
+    if _is_workflow_dir(path):
+        return None
+    if (path / "export" / "images").is_dir():
+        return path
+    return None
+
+
+def _child_bundles(selected: Path) -> list[Path]:
+    if not selected.is_dir():
+        return []
+    found: list[Path] = []
+    for child in sorted(selected.iterdir(), key=lambda item: item.name.lower()):
+        if not child.is_dir() or child.name.startswith(".") or _is_workflow_dir(child):
+            continue
+        root = _bundle_root(child)
+        if root is not None:
+            found.append(root)
+    return found
+
+
+def first_reader_dir(selected: Path) -> Path:
+    """第1読影の出力フォルダ。画像はここの export/images だけ。
+
+    選んだフォルダに grader.csv があれば、そこを第1とする。
+    csv が無く、直下の第1フォルダが1つだけならそれを使う。上の階層は見ない。
+    兄弟に複数あるときは、別の眼の画像を開かないよう止める。
+    """
+    selected = Path(selected).expanduser().resolve()
+    if selected.is_file():
+        if selected.name.endswith("_summary.md"):
+            return first_reader_dir_near_summary(selected)
+        selected = selected.parent
+    own = _bundle_root(selected)
+    children = _child_bundles(selected)
+    if own is not None and (selected / "grader.csv").is_file():
+        return own
+    if len(children) == 1:
+        return children[0]
+    if own is not None and not children:
+        return own
+    if len(children) > 1:
+        names = ", ".join(path.name for path in children)
+        raise ValueError(
+            "第1読影のフォルダが複数あります。読みたい眼のフォルダそのものを選んでください: " + names
+        )
+    if own is not None:
+        return own
+    raise ValueError(f"export/images が見つかりません: {selected}")
+
+
+def workflow_parent(first_reader: Path) -> Path:
+    """第2・統合・最終を置く場所。第1読影フォルダそのもの（例: OD_reading）。"""
+    return Path(first_reader).resolve()
+
+
+def workflow_parent_from_summary(summary_md: Path) -> Path:
+    """summary から、第1読影フォルダ（export と grader.csv がある場所）を返す。
+
+    見つからないとき、症例フォルダへは戻さない。
+    """
+    summary_md = Path(summary_md).resolve()
+    try:
+        return first_reader_dir_near_summary(summary_md)
+    except ValueError:
+        bundles = _child_bundles(summary_md.parent.parent)
+        if len(bundles) == 1:
+            return bundles[0]
+        raise
+
+
+def first_reader_dir_near_summary(summary_md: Path) -> Path:
+    """最終読影が開く画像の元。source json の第1 CSV を優先し、上の階層は探さない。"""
+    summary_md = Path(summary_md).resolve()
+    source = summary_md.with_name(summary_md.name.replace("_summary.md", "_source_csvs.json"))
+    if source.is_file():
+        try:
+            payload = json.loads(source.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            payload = {}
+        first_csv = Path(str(payload.get("first_csv", "")))
+        if first_csv.is_file():
+            root = _bundle_root(first_csv.parent)
+            if root is not None:
+                return root
+    container = summary_md.parent.parent
+    direct = _bundle_root(container)
+    if direct is not None:
+        return direct
+    return first_reader_dir(container)
+
+
 def recheck_images(summary_md: Path) -> list[Path]:
-    """*_summary.md の RECHECK 画像だけを、export/images から返す。"""
+    """*_summary.md の RECHECK 画像だけを、第1の export/images から返す。"""
     summary_md = Path(summary_md)
     if not summary_md.is_file() or not summary_md.name.endswith("_summary.md"):
         raise ValueError("RECHECK の *_summary.md を選んでください。")
     stems = set(recheck_stems(summary_md))
     if not stems:
         raise ValueError("この summary に RECHECK の画像はありません。")
-    images: list[Path] | None = None
-    anchor = summary_md.parent
-    for candidate in (anchor, anchor.parent, anchor.parent.parent):
-        try:
-            images = second_reader_images(candidate)
-            break
-        except ValueError:
-            continue
-    if images is None:
-        raise ValueError("export/images が見つかりません。第1の出力フォルダの近くに summary があるか確認してください。")
+    try:
+        images = second_reader_images(first_reader_dir_near_summary(summary_md))
+    except ValueError as exc:
+        if "複数" in str(exc):
+            raise
+        raise ValueError(
+            "export/images が見つかりません。第1の出力フォルダの近くに summary があるか確認してください。"
+        ) from exc
     picked = [path for path in images if file_stem(path.name) in stems]
     if not picked:
         raise ValueError("RECHECK の画像が export/images にありません。")
@@ -74,17 +175,16 @@ def recheck_images(summary_md: Path) -> list[Path]:
 
 
 def second_reader_images(selected: Path) -> list[Path]:
-    """第1の出力（export の親、または export 自身）から画像を返す。マスクは返さない。"""
-    selected = Path(selected).expanduser().resolve()
-    if selected.is_file():
-        selected = selected.parent
-    export = selected / "export" if (selected / "export").is_dir() else selected
-    images_dir = export / "images"
+    """第1の export/images 直下の画像だけを返す。マスクも、隣の出力フォルダも読まない。"""
+    root = first_reader_dir(selected)
+    images_dir = root / "export" / "images"
     if not images_dir.is_dir():
         raise ValueError(f"export/images が見つかりません: {selected}")
     images = [
-        path for path in images_dir.rglob("*")
-        if path.is_file() and path.suffix.lower() in _IMAGE and "masks" not in path.parts
+        path for path in images_dir.iterdir()
+        if path.is_file()
+        and not path.name.startswith(".")
+        and path.suffix.lower() in _IMAGE
     ]
     if not images:
         raise ValueError(f"第2が読む画像がありません: {images_dir}")

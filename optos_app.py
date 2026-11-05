@@ -1,5 +1,6 @@
 """GA Segmentation Optos — 現行アプリとは別の入口。"""
 
+import asyncio
 import os
 import sys
 import threading
@@ -56,11 +57,32 @@ async def main(page: ft.Page) -> None:
     apply_page_theme(page)
     page.bgcolor = T.BG_DARK
     page.padding = 16
-    page.window.width = 1280
-    page.window.height = 900
+    # この Mac の画面は 1440×900。それより大きいとスピナーが回り続ける。
+    # left/top や min_width を同時に入れると、既定の 800×628 に戻ってまた回り続ける。
+    # 既定の 800×628 のまま画像（1000×840）を置くと、配置計算が終わらずスピナーが回り続ける。
+    # 窓の大きさだけ先に送って、広がってから画面を置く。
+    page.window.width = 1430
+    page.window.height = 850
+    opened = asyncio.Event()
+
+    def _on_resized(e: ft.WindowResizeEvent) -> None:
+        if e.width >= 1200 and e.height >= 700:
+            opened.set()
+
+    page.on_resized = _on_resized
+    page.update()
+    try:
+        await asyncio.wait_for(opened.wait(), timeout=3)
+    except asyncio.TimeoutError:
+        print("optos: window did not reach 1430x850 before the view", flush=True)
 
     session = OptosSession()
     page.data = session
+
+    def _on_page_error(e) -> None:
+        print(f"optos page error: {getattr(e, 'data', e)}", flush=True)
+
+    page.on_error = _on_page_error
     try:
         await build_optos_view(page, session)
     except Exception as exc:

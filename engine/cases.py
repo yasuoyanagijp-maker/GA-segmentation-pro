@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from engine.io_utils import list_images
+from engine.io_utils import classify_folder_entries, list_images
 
 UNCLASSIFIED_CASE_ID = "未分類"
 
@@ -33,6 +33,25 @@ def discover_cases(folder: Path) -> dict[str, list[Path]]:
         cases[UNCLASSIFIED_CASE_ID] = root_imgs
 
     return cases
+
+
+def folder_exclusions(folder: Path) -> list[tuple[str, str]]:
+    """画像と同じフォルダにある、画像ではないファイル。日付では除外しない。"""
+    folder = Path(folder)
+    found: list[tuple[str, str]] = []
+    root_images, root_excluded = classify_folder_entries(folder)
+    if root_images:
+        found.extend(root_excluded)
+    if not folder.is_dir():
+        return found
+    for sub in sorted(folder.iterdir(), key=lambda path: path.name.lower()):
+        if not sub.is_dir() or sub.name.startswith("."):
+            continue
+        images, excluded = classify_folder_entries(sub)
+        if not images:
+            continue
+        found.extend((f"{sub.name}/{name}", reason) for name, reason in excluded)
+    return found
 
 
 def ordered_case_ids(cases: dict[str, list[Path]]) -> list[str]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 import os
 import re
 import time
@@ -302,13 +303,26 @@ def estimate_intact_mm2_per_year(results: list[dict]) -> float | None:
 
 
 def estimate_growth_mm_sqrt_per_year(results: list[dict]) -> float | None:
-    """√変換GA面積の時系列から拡大速度（mm/年, SQRT scale）を線形回帰で推定。"""
-    slope = _slope_per_year_from_results(
-        results, lambda r: r['stats']['area_mm_sqrt'],
-    )
+    """√面積の拡大速度（mm/年）。確定面積から平方根を取り直して傾きを出す。"""
+    slope = _slope_per_year_from_results(results, _sqrt_of_confirmed_area)
     if slope is None:
         return None
     return round(slope, 2)
+
+
+def _sqrt_of_confirmed_area(row: dict) -> float | None:
+    """速度用。保存済みの √列が面積と食い違っていても、面積から取り直す。"""
+    stats = row.get("stats") or {}
+    area = stats.get("area_mm2")
+    if area is None:
+        stored = stats.get("area_mm_sqrt")
+        return None if stored is None else float(stored)
+    value = float(area)
+    if value < 0:
+        return None
+    if value == 0:
+        return 0.0
+    return math.sqrt(value)
 
 
 def _compute_row_stats(mask, scale, fovea, fallback_stats):

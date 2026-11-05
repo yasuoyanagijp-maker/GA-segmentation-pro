@@ -15,7 +15,7 @@ from ga_reading.metrics import (
     QUALITY,
     RPD_THRESHOLD_PCT,
 )
-from ga_reading.rpd import adopt_pair, to_float
+from ga_reading.rpd import adopt_pair, sync_area_sqrt, to_float
 
 RECHECK_FIELDS = (
     "File",
@@ -140,6 +140,8 @@ def merge_graders(
         )
         filled: dict[str, str] = {}
         for column in numeric:
+            if column == "area_mm_sqrt":
+                continue
             a = to_float(left.get(column))
             b = to_float(right.get(column))
             value, status, score = adopt_pair(a, b, rpd_threshold)
@@ -156,9 +158,11 @@ def merge_graders(
                     "Adopted": "NA",
                     "Rule": "MISSING" if status == "MISSING" else f"RPD>{rpd_threshold:g}%",
                 })
+        sync_area_sqrt(out)
         adopted_rows.append(out)
         fallback = dict(out)
         fallback.update(filled)
+        sync_area_sqrt(fallback)
         fallback["avg_filled_columns"] = ";".join(filled)
         fallback_rows.append(fallback)
 
@@ -233,6 +237,7 @@ def _summary_md(summary: dict[str, Any]) -> str:
         "",
         "1. CSV の File のファイル名 stem で突合する。",
         "2. 両方有限で RPD が 20% 以下なら算術平均。両方 0 は 0。",
+        "   √面積は平均しない。採用した面積の平方根にする。",
         "3. 20% 超、またはどちらかが空欄なら NA。空欄を 0 とはみなさない。",
         "4. 主要指標の NA はその画像を RECHECK にする。",
         "5. *_avg_fallback.csv は参考だけで、提出には使わない。",
