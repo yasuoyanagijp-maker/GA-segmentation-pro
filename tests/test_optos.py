@@ -494,6 +494,11 @@ def test_failed_confirm_does_not_lock_the_proposed_fovea():
     assert "再セグ" in note
     assert session.fovea_user_placed is False
     assert session.confirmed is False
+    session.tool = "fovea"
+    note = session.confirm_fovea()
+    assert "確定できません" in note
+    assert session.fovea_user_placed is False
+    assert session.tool == "fovea"
 
 
 def test_confirm_waits_until_the_user_places_the_fovea():

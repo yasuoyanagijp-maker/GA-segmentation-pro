@@ -787,16 +787,16 @@ class OptosSession:
             return "先に乳頭と中心窩の位置を決めてください"
         if not self.fovea_user_placed and self._is_anchor_visit():
             return "1枚目は、中心窩らしい場所をクリックしてから「中心窩確定」を押してください"
+        if self.mask is None or not np.any(self.mask > 0):
+            self.mask_stale = True
+            return "中心窩を確定できません。マスクがないので「再セグ」を押してください"
+        if self.mask_stale:
+            return "中心窩を確定できません。マスクが古いので「再セグ」で作り直してください"
         self.fovea_user_placed = True
         self.alignment_gray = None
         self.tool = "pan"
         warn = self._fovea_proposal_note()
         suffix = f"。{warn}" if warn else ""
-        if self.mask is None or not np.any(self.mask > 0):
-            self.mask_stale = True
-            return f"中心窩を確定しました。マスクがないので「再セグ」を押してください{suffix}"
-        if self.mask_stale:
-            return f"中心窩を確定しました。マスクが古いので「再セグ」で作り直してください{suffix}"
         return f"中心窩を確定しました。マスクをいつもの色で表示しています{suffix}"
 
     def resegment(self) -> str:
