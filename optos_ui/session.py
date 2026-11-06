@@ -3,13 +3,22 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
 from engine.cases import discover_cases, folder_exclusions, ordered_case_ids
-from engine.eye_scale import fixed_eye_scale, is_scale_outlier
+from engine.dicom_scale import read_dicom_pixel_spacing
+from engine.eye_scale import (
+    OPTOS_NATIVE_UM_PER_PX,
+    OPTOS_NATIVE_WIDTH_PX,
+    SOURCE_EYE_MEDIAN,
+    fixed_eye_scale,
+    is_scale_outlier,
+    resolve_measurement_scale,
+)
 from engine.io_utils import load_gray
 from engine.life_table import life_expectancy_years
 from engine.optos import (
@@ -182,6 +191,16 @@ class OptosSession:
     registration_zoom: float | None = None
     folder_exclusions: list[tuple[str, str]] = field(default_factory=list)
     load_errors: dict[str, str] = field(default_factory=dict)
+    # 計測スケール。空なら眼の中央値。固定値 / DICOM / 全画面換算が中央値より優先。
+    fixed_scale_um_px: float | None = None
+    use_native_frame_scale: bool = False
+    native_um_per_px: float = OPTOS_NATIVE_UM_PER_PX
+    native_width_px: float = OPTOS_NATIVE_WIDTH_PX
+    dicom_um_per_px: float | None = None
+    dicom_columns_px: float | None = None
+
+    def __post_init__(self) -> None:
+        apply_env_scale_settings(self)
 
     def load_folder(self, folder: str) -> str:
         self.folder = folder
@@ -423,6 +442,55 @@ class OptosSession:
                 snap.mask_stale = True
                 changed += 1
         return changed
+
+    def set_fixed_scale(self, text: str) -> str:
+        raw = str(text or "").strip()
+        if raw == "":
+            self.fixed_scale_um_px = None
+            return "固定 µm/px を外しました。面積は眼の中央値（または DICOM / 全画面換算）です"
+        try:
+            value = float(raw)
+        except ValueError:
+            return "固定 µm/px は数値で指定してください"
+        if value <= 0:
+            return "固定 µm/px は正の値が必要です"
+        self.fixed_scale_um_px = value
+        return f"固定スケール {value:g} µm/px を面積換算に使います"
+
+    def set_native_frame_scale(self, enabled: bool) -> str:
+        self.use_native_frame_scale = bool(enabled)
+        if self.use_native_frame_scale:
+            return (
+                f"全画面換算です。{self.native_um_per_px:g} µm × "
+                f"{self.native_width_px:g} / 画像幅 で µm/px を出します"
+            )
+        return "全画面換算を外しました"
+
+    def set_native_spacing(self, um_per_px: str, width_px: str) -> str:
+        try:
+            spacing = float(str(um_per_px).strip() or OPTOS_NATIVE_UM_PER_PX)
+            width = float(str(width_px).strip() or OPTOS_NATIVE_WIDTH_PX)
+        except ValueError:
+            return "装置の µm/px と幅は数値で指定してください"
+        if spacing <= 0 or width <= 0:
+            return "装置の µm/px と幅は正の値が必要です"
+        self.native_um_per_px = spacing
+        self.native_width_px = width
+        return f"装置スケール {spacing:g} µm/px、幅 {width:g} px"
+
+    def load_dicom_scale(self, path: str | Path) -> str:
+        um_px, columns = read_dicom_pixel_spacing(Path(path))
+        self.dicom_um_per_px = um_px
+        self.dicom_columns_px = float(columns)
+        return (
+            f"DICOM の PixelSpacing は {um_px:g} µm/px、Columns は {columns}。"
+            "面積換算はこの値を、画像幅で合わせた µm/px にします"
+        )
+
+    def clear_dicom_scale(self) -> str:
+        self.dicom_um_per_px = None
+        self.dicom_columns_px = None
+        return "DICOM スケールを外しました"
 
     def set_min_lesion(self, text: str) -> str:
         try:
@@ -941,7 +1009,7 @@ class OptosSession:
                 or not snap.scale_um_px
             ):
                 continue
-            used = self.measurement_scale_um_px(snap.scale_um_px)
+            used, _source = self.resolve_used_scale(snap.scale_um_px, snap=snap)
             if used is None:
                 continue
             previous = stats_central(snap.mask, snap.fovea_xy, used, snap.disc_xy)
@@ -956,8 +1024,8 @@ class OptosSession:
             (prev_date, prev_area),
             (self.date_iso, float(stats["area_mm2"])),
         ])
-        prev_used = self.measurement_scale_um_px(prev_snap.scale_um_px)
-        current_used = self.measurement_scale_um_px(self.scale_um_px)
+        prev_used, _prev_src = self.resolve_used_scale(prev_snap.scale_um_px, snap=prev_snap)
+        current_used, _cur_src = self.resolve_used_scale(self.scale_um_px)
         prev_gap = robust_foveal_gap_um(prev_snap.mask, prev_snap.fovea_xy, prev_used or prev_snap.scale_um_px)
         gap = robust_foveal_gap_um(self.mask, self.fovea_xy, current_used or self.scale_um_px)
         notes += gap_reopen_warnings([
@@ -1086,17 +1154,45 @@ class OptosSession:
         return values
 
     def eye_scale_um_px(self) -> float | None:
-        """面積換算に使う、この眼の固定 µm/px（時点推定の中央値）。"""
+        """この眼の時点推定の中央値。固定 / DICOM が無いときの予備。"""
         return fixed_eye_scale(self._scale_estimates())
 
+    def _image_width_px(self, snap: VisitSnap | None = None) -> float | None:
+        gray = snap.gray if snap is not None else self.gray
+        if gray is None:
+            return None
+        return float(gray.shape[1])
+
+    def resolve_used_scale(
+        self,
+        estimate: float | None = None,
+        *,
+        snap: VisitSnap | None = None,
+        image_width_px: float | None = None,
+    ) -> tuple[float | None, str]:
+        """計測に使う µm/px と由来（fixed / dicom / eye_median）。"""
+        width = image_width_px
+        if width is None:
+            width = self._image_width_px(snap)
+        resolved = resolve_measurement_scale(
+            explicit_um_px=self.fixed_scale_um_px,
+            dicom_um_per_px=self.dicom_um_per_px,
+            dicom_columns_px=self.dicom_columns_px,
+            image_width_px=width,
+            native_um_per_px=self.native_um_per_px,
+            native_width_px=self.native_width_px,
+            use_native_frame=self.use_native_frame_scale,
+            eye_estimates=self._scale_estimates(),
+            estimate=estimate,
+        )
+        if resolved is None:
+            return None, ""
+        return resolved.um_per_px, resolved.source
+
     def measurement_scale_um_px(self, estimate: float | None = None) -> float | None:
-        """計測に使う µm/px。眼の中央値が無ければ、その時点の推定。"""
-        fixed = self.eye_scale_um_px()
-        if fixed is not None:
-            return fixed
-        if estimate is not None and float(estimate) > 0:
-            return float(estimate)
-        return None
+        """計測に使う µm/px。固定 / DICOM / 全画面換算が、眼の中央値より優先。"""
+        used, _source = self.resolve_used_scale(estimate)
+        return used
 
     def live_stats(self) -> dict | None:
         used = self.measurement_scale_um_px(self.scale_um_px)
@@ -1112,7 +1208,7 @@ class OptosSession:
     def _snap_row(self, snap: VisitSnap) -> dict:
         assert snap.fovea_xy and snap.disc_xy and snap.scale_um_px and snap.mask is not None
         estimate = float(snap.scale_um_px)
-        used = self.measurement_scale_um_px(estimate)
+        used, source = self.resolve_used_scale(estimate, snap=snap)
         assert used is not None
         stats = stats_central(snap.mask, snap.fovea_xy, used, snap.disc_xy)
         gap = robust_foveal_gap_um(snap.mask, snap.fovea_xy, used)
@@ -1139,6 +1235,7 @@ class OptosSession:
             "mask_px": int(np.count_nonzero(snap.mask > 0)),
             "scale_estimate_um_per_px": round(estimate, 4),
             "scale_outlier": int(outlier),
+            "scale_source": source or SOURCE_EYE_MEDIAN,
         }
 
     def visit_rows(self) -> list[dict]:
@@ -1165,7 +1262,7 @@ class OptosSession:
         gap_rows = []
         for s in visits:
             assert s.fovea_xy and s.scale_um_px and s.mask is not None
-            used = self.measurement_scale_um_px(s.scale_um_px)
+            used, _source = self.resolve_used_scale(s.scale_um_px, snap=s)
             assert used is not None
             stats = stats_central(s.mask, s.fovea_xy, used)
             gap = robust_foveal_gap_um(s.mask, s.fovea_xy, used)
@@ -1402,3 +1499,25 @@ class OptosSession:
         self.redo = []
         if len(self.undo) > 30:
             del self.undo[0]
+
+
+def apply_env_scale_settings(session: OptosSession) -> None:
+    """OPTOS_SCALE_UM_PX / OPTOS_DICOM / OPTOS_FROM_IMAGE_WIDTH を読む。"""
+    raw = os.environ.get("OPTOS_SCALE_UM_PX", "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = None
+        if value is not None and value > 0:
+            session.fixed_scale_um_px = value
+    native = os.environ.get("OPTOS_NATIVE_UM_PER_PX", "").strip()
+    width = os.environ.get("OPTOS_NATIVE_WIDTH_PX", "").strip()
+    if native or width:
+        session.set_native_spacing(native or str(session.native_um_per_px), width or str(session.native_width_px))
+    flag = os.environ.get("OPTOS_FROM_IMAGE_WIDTH", "").strip().lower()
+    if flag in {"1", "true", "yes", "on"}:
+        session.use_native_frame_scale = True
+    dicom = os.environ.get("OPTOS_DICOM", "").strip()
+    if dicom:
+        session.load_dicom_scale(dicom)

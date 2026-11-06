@@ -239,6 +239,18 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
     min_lesion_field = ft.TextField(
         label="最小病変 mm²", width=110, dense=True, text_size=13, value="0.05",
     )
+    scale_field = ft.TextField(
+        label="固定 µm/px",
+        width=110,
+        dense=True,
+        text_size=13,
+        hint_text="空欄は中央値",
+        value="" if session.fixed_scale_um_px is None else f"{session.fixed_scale_um_px:g}",
+    )
+    native_check = ft.Checkbox(
+        label="全画面換算",
+        value=session.use_native_frame_scale,
+    )
     sex_dd = ft.Dropdown(
         label="性別",
         width=110,
@@ -624,11 +636,21 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
         session.sex = sex_dd.value or "Male"
         session.set_min_lesion(min_lesion_field.value or "")
 
-    def on_series(_=None) -> None:
+    def _sync_scale() -> str:
+        note = session.set_fixed_scale(scale_field.value or "")
+        session.set_native_frame_scale(bool(native_check.value))
+        return note
+
+    def _sync_settings() -> None:
         _sync_age()
+        _sync_scale()
+
+    def on_series(_=None) -> None:
+        _sync_settings()
         _after(session.run_series())
 
     def on_csv_visits(_=None) -> None:
+        _sync_settings()
         rows = session.visit_rows()
         if not rows:
             _after("マスクのある時点がありません")
@@ -637,7 +659,7 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
         _after(f"個別CSV: {path}")
 
     def on_csv_series(_=None) -> None:
-        _sync_age()
+        _sync_settings()
         note = session.run_series()
         if session.series_summary is None:
             _after(note)
@@ -773,6 +795,7 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
             _after(str(exc))
 
     async def on_export_first(_=None) -> None:
+        _sync_settings()
         rows = session.reading_payload()
         excluded, report = session.exclusion_report()
         if not rows:
@@ -803,6 +826,7 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
         _after(note)
 
     def on_export_second(_=None) -> None:
+        _sync_settings()
         rows = session.reading_payload()
         excluded, report = session.exclusion_report()
         if not rows:
@@ -879,6 +903,7 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
         page.update()
 
     def on_export_final(_=None) -> None:
+        _sync_settings()
         rows = session.reading_payload()
         excluded, report = session.exclusion_report()
         if not rows:
@@ -1057,6 +1082,40 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
     picker = ft.FilePicker(on_result=on_folder_result)
     page.overlay.append(picker)
 
+    def on_dicom_result(e: ft.FilePickerResultEvent) -> None:
+        files = getattr(e, "files", None) or []
+        if not files:
+            return
+        path = getattr(files[0], "path", None)
+        if not path:
+            _after("DICOM のパスが取れません")
+            return
+        _after(session.load_dicom_scale(path))
+
+    dicom_picker = ft.FilePicker(on_result=on_dicom_result)
+    page.overlay.append(dicom_picker)
+
+    def on_dicom(_=None) -> None:
+        try:
+            path = choose_file("PixelSpacing のある DICOM を選んでください")
+        except RuntimeError:
+            dicom_picker.pick_files(
+                dialog_title="DICOM",
+                allowed_extensions=["dcm", "dicom"],
+            )
+            return
+        if not path:
+            _after("DICOM の選択をキャンセルしました")
+            return
+        _after(session.load_dicom_scale(path))
+
+    dicom_btn = ft.ElevatedButton(
+        "DICOM",
+        on_click=on_dicom,
+        height=34,
+        style=ft.ButtonStyle(text_style=ft.TextStyle(size=12)),
+    )
+
     def _btn(label: str, handler) -> ft.ElevatedButton:
         return ft.ElevatedButton(label, on_click=handler, height=34, style=ft.ButtonStyle(text_style=ft.TextStyle(size=12)))
 
@@ -1210,12 +1269,13 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
                             ft.Divider(color="#374151"),
                             metrics,
                             ft.Text(
-                                "シアン円は直径 6 mm で、面積もこの中だけです。乳頭–中心窩は 4.76 mm なので、乳頭はこの円の外です。黄の円は乳頭（直径 1.8 mm）です。2枚目以降の µm/px は、1枚目との乳頭–中心窩の画素距離の比です。",
+                                "シアン円は直径 6 mm で、面積もこの中だけです。固定 µm/px または DICOM / 全画面換算があればそれを使い、なければ眼の中央値です。",
                                 size=11,
                                 color=T.TEXT_MUTED,
                             ),
                             ft.Divider(color="#374151"),
                             ft.Row([age_field, sex_dd, min_lesion_field], spacing=8),
+                            ft.Row([scale_field, native_check, dicom_btn], spacing=8),
                             _btn("時系列を計算", on_series),
                             ft.Row([
                                 _btn("個別CSV", on_csv_visits),
@@ -1250,7 +1310,7 @@ async def build_optos_view(page: ft.Page, session: OptosSession) -> None:
     def _resume_arrows(_e=None) -> None:
         _keys_paused["on"] = False
 
-    for _field in (folder_field, date_field, age_field, min_lesion_field, role_dd, case_dd, visit_dd, sex_dd):
+    for _field in (folder_field, date_field, age_field, min_lesion_field, scale_field, role_dd, case_dd, visit_dd, sex_dd):
         _field.on_focus = _pause_arrows
         _field.on_blur = _resume_arrows
     page.on_keyboard_event = on_keyboard

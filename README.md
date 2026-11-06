@@ -9,7 +9,7 @@
 | アプリ | 起動 | 使う画像 |
 |---|---|---|
 | GA Segmentation Pro | `./run_flet.sh`（ポート 8551） | FAF。HRA は画像幅（mm）でスケールを付ける |
-| GA Segmentation Optos | `./run_optos.sh`（ポート 8552） | Optos。乳頭–中心窩 4.76 mm から時点ごとの推定 µm/px を出し、面積換算はその眼の中央値で固定する |
+| GA Segmentation Optos | `./run_optos.sh`（ポート 8552） | Optos。面積換算は固定 µm/px または DICOM PixelSpacing、なければ眼の中央値 |
 
 どちらもウィンドウが開きます。ブラウザで開くときだけ `FLET_USE_WEB=1` を付けます。Dock の名前は Flet になることがあります。ウィンドウのタイトルがアプリ名です。
 
@@ -52,4 +52,16 @@ pytest -q
 python -m ga_reading recompute-scale /path/case2/OD_reading
 # 第2・最終も直して採用ルールまで再実行するなら
 python -m ga_reading recompute-scale /path/case2/OD_reading --rerun-adoption
+# 装置の固定スケール（全画面 4000 px なら 10.4 µm/px）
+python -m ga_reading recompute-scale /path/case2/OD_reading --scale-um-px 10.4
+python -m ga_reading recompute-scale /path/case2/OD_reading --from-image-width
+python -m ga_reading recompute-scale /path/case2/OD_reading --dicom /path/to/export.dcm
 ```
+
+起動時の環境変数でも同じ指定ができます。`OPTOS_SCALE_UM_PX=10.4`、`OPTOS_FROM_IMAGE_WIDTH=1`、`OPTOS_DICOM=/path/to.dcm`、`OPTOS_NATIVE_UM_PER_PX` / `OPTOS_NATIVE_WIDTH_PX`（既定 10.4 / 4000）。
+
+### Optos の書き出し（推奨）
+
+OptosAdvance の DICOM（P200DTx、PROJECTED optomap/AF）は PixelSpacing 0.0104 mm（10.4 µm/px）、4000×4000、HFOV 200° です。軸長や 2D→3D マップはありません。
+
+読影用 PNG は **「現在の画像」** を、ズームしない・解像度を変えないで書き出してください。ビューポートを拡大した PNG は幅が時点ごとに変わり、µm/px がずれます。ずれている過去分は眼の中央値で揃えます。これから測る分は一定解像度の全画面なら 10.4 µm/px（または `10.4 × 4000 / 画像幅`）を使えます。

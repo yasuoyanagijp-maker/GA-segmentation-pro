@@ -168,6 +168,8 @@ def _measured_record(row: dict) -> dict:
 def _scale_cell(column: str, value) -> str:
     if value is None or value == "":
         return ""
+    if column == "scale_source":
+        return str(value)
     if column in {"mask_px", "scale_outlier"}:
         return str(int(round(float(value))))
     return f"{float(value):.4f}"

@@ -13,8 +13,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from engine.dicom_scale import read_dicom_pixel_spacing
 from engine.eye_scale import (
+    OPTOS_NATIVE_UM_PER_PX,
+    OPTOS_NATIVE_WIDTH_PX,
     SCALE_OUTLIER_RATIO,
+    SOURCE_EYE_MEDIAN,
     apply_area_correction,
     area_correction_factor,
     area_mm2_from_mask_px,
@@ -22,6 +26,7 @@ from engine.eye_scale import (
     fixed_eye_scale,
     is_scale_outlier,
     recover_scale_um_px,
+    resolve_measurement_scale,
 )
 from ga_reading.bundle import grader_csv_fields
 from ga_reading.merge import file_stem, merge_graders, read_csv, write_csv
@@ -41,30 +46,48 @@ def mask_pixel_count(path: Path) -> int:
     return int(np.count_nonzero(np.asarray(image) > 0))
 
 
-def find_mask(masks_dir: Path, row: dict[str, str]) -> Path | None:
+def find_export_file(folder: Path, row: dict[str, str], *, suffix: str = ".png") -> Path | None:
     """export/masks から、行の File / filename に対応する PNG を探す。"""
-    masks_dir = Path(masks_dir)
-    if not masks_dir.is_dir():
+    folder = Path(folder)
+    if not folder.is_dir():
         return None
     names = [row.get(FILE_COL, ""), row.get("filename", "")]
     tried: list[Path] = []
+    suffix = suffix if suffix.startswith(".") else f".{suffix}"
     for name in names:
         if not str(name).strip():
             continue
         stem = Path(str(name)).stem
-        tried.append(masks_dir / f"{stem}.png")
+        tried.append(folder / f"{stem}{suffix}")
+        source = Path(str(name))
+        if source.suffix:
+            tried.append(folder / source.name)
         if "__" in stem:
-            tried.append(masks_dir / f"{stem.split('__', 1)[1]}.png")
+            rest = stem.split("__", 1)[1]
+            tried.append(folder / f"{rest}{suffix}")
     for path in tried:
         if path.is_file():
             return path
     key = file_stem(row.get(FILE_COL, "") or row.get("filename", ""))
     if not key:
         return None
-    for path in sorted(masks_dir.iterdir(), key=lambda item: item.name.lower()):
-        if path.suffix.lower() == ".png" and file_stem(path.name) == key:
+    for path in sorted(folder.iterdir(), key=lambda item: item.name.lower()):
+        if path.is_file() and file_stem(path.name) == key:
             return path
     return None
+
+
+def find_mask(masks_dir: Path, row: dict[str, str]) -> Path | None:
+    return find_export_file(masks_dir, row, suffix=".png")
+
+
+def image_width_px(path: Path) -> int:
+    import cv2
+
+    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        raise OSError(f"画像を読めません: {path}")
+    return int(image.shape[1])
 
 
 def _row_key(row: dict[str, str]) -> str:
@@ -102,10 +125,20 @@ def collect_first_reader_factors(
     masks_dir: Path,
     *,
     outlier_ratio: float = SCALE_OUTLIER_RATIO,
-) -> tuple[float | None, dict[str, dict[str, Any]]]:
+    images_dir: Path | None = None,
+    explicit_um_px: float | None = None,
+    dicom_path: Path | None = None,
+    use_native_frame: bool = False,
+    native_um_per_px: float = OPTOS_NATIVE_UM_PER_PX,
+    native_width_px: float = OPTOS_NATIVE_WIDTH_PX,
+) -> tuple[float | None, dict[str, dict[str, Any]], str]:
     """第1の各行について、推定スケールとマスク画素数を集める。"""
     collected: dict[str, dict[str, Any]] = {}
     estimates: list[float] = []
+    dicom_um = None
+    dicom_columns = None
+    if dicom_path is not None:
+        dicom_um, dicom_columns = read_dicom_pixel_spacing(Path(dicom_path))
     for row in rows:
         key = _row_key(row)
         if not key:
@@ -115,21 +148,53 @@ def collect_first_reader_factors(
         estimate = recover_row_scale(row, mask_px)
         if estimate is not None:
             estimates.append(estimate)
+        width = None
+        if images_dir is not None:
+            image_path = find_export_file(images_dir, row)
+            if image_path is not None:
+                width = float(image_width_px(image_path))
         collected[key] = {
             "mask_px": mask_px,
             "estimate": estimate,
             "area_original": to_float(row.get("area_mm2")),
+            "image_width_px": width,
         }
-    fixed = fixed_eye_scale(estimates)
+    median = fixed_eye_scale(estimates)
+    used_values: list[float] = []
+    source = SOURCE_EYE_MEDIAN
     for item in collected.values():
+        resolved = resolve_measurement_scale(
+            explicit_um_px=explicit_um_px,
+            dicom_um_per_px=dicom_um,
+            dicom_columns_px=dicom_columns,
+            image_width_px=item.get("image_width_px"),
+            native_um_per_px=native_um_per_px,
+            native_width_px=native_width_px,
+            use_native_frame=use_native_frame,
+            eye_estimates=estimates,
+            estimate=item.get("estimate"),
+        )
+        if resolved is None:
+            item["fixed"] = median
+            item["source"] = SOURCE_EYE_MEDIAN
+        else:
+            item["fixed"] = resolved.um_per_px
+            item["source"] = resolved.source
+            source = resolved.source
+            used_values.append(resolved.um_per_px)
         estimate = item["estimate"]
-        item["fixed"] = fixed
-        item["outlier"] = is_scale_outlier(estimate, fixed, ratio=outlier_ratio)
-        if estimate is not None and fixed is not None:
-            item["factor"] = area_correction_factor(estimate, fixed)
+        used = item["fixed"]
+        item["outlier"] = is_scale_outlier(estimate, used, ratio=outlier_ratio)
+        if estimate is not None and used is not None:
+            item["factor"] = area_correction_factor(estimate, used)
         else:
             item["factor"] = None
-    return fixed, collected
+    if used_values:
+        # 報告用。幅が同じなら1値、違えば中央値。
+        reported = used_values[0] if len(set(round(v, 6) for v in used_values)) == 1 else fixed_eye_scale(used_values)
+    else:
+        reported = median
+    return reported, collected, source
 
 
 def apply_fixed_scale_to_row(
@@ -159,6 +224,7 @@ def apply_fixed_scale_to_row(
     out["scale_estimate_um_per_px"] = _format_scale(estimate)
     out["mask_px"] = "" if mask_px is None else str(int(mask_px))
     out["scale_outlier"] = "1" if info.get("outlier") else "0"
+    out["scale_source"] = str(info.get("source") or "")
     return out
 
 
@@ -182,6 +248,7 @@ def apply_factor_to_reader_row(
     out["scale_estimate_um_per_px"] = _format_scale(info.get("estimate"))
     out["mask_px"] = ""
     out["scale_outlier"] = "1" if info.get("outlier") else "0"
+    out["scale_source"] = str(info.get("source") or "")
     return out
 
 
@@ -209,6 +276,7 @@ def _factor_rows(first_rows: list[dict[str, str]], collected: dict[str, dict[str
                 "" if info.get("factor") is None else f"{float(info['factor']):.8g}"
             ),
             "scale_outlier": "1" if info.get("outlier") else "0",
+            "scale_source": info.get("source") or "",
             "area_mm2_original": row.get("area_mm2", ""),
         })
     return rows
@@ -220,6 +288,11 @@ def recompute_reading_dir(
     out_dir: Path | None = None,
     outlier_ratio: float = SCALE_OUTLIER_RATIO,
     rerun_adoption: bool = False,
+    scale_um_px: float | None = None,
+    dicom: Path | None = None,
+    from_image_width: bool = False,
+    native_um_per_px: float = OPTOS_NATIVE_UM_PER_PX,
+    native_width_px: float = OPTOS_NATIVE_WIDTH_PX,
 ) -> dict[str, Any]:
     """1眼の読影フォルダ（例: /path/case2/OD_reading）を直す。"""
     reading_dir = Path(reading_dir).expanduser().resolve()
@@ -230,10 +303,21 @@ def recompute_reading_dir(
     masks_dir = root / "export" / "masks"
     if not masks_dir.is_dir():
         raise ValueError(f"export/masks が見つかりません: {root}")
+    images_dir = root / "export" / "images"
+    if not images_dir.is_dir():
+        images_dir = None
 
     first_fields, first_rows = read_csv(first_csv)
-    fixed, collected = collect_first_reader_factors(
-        first_rows, masks_dir, outlier_ratio=outlier_ratio,
+    fixed, collected, source = collect_first_reader_factors(
+        first_rows,
+        masks_dir,
+        outlier_ratio=outlier_ratio,
+        images_dir=images_dir,
+        explicit_um_px=scale_um_px,
+        dicom_path=dicom,
+        use_native_frame=from_image_width,
+        native_um_per_px=native_um_per_px,
+        native_width_px=native_width_px,
     )
     if fixed is None:
         raise ValueError("マスクと面積から µm/px を復元できる行がありません")
@@ -258,6 +342,7 @@ def recompute_reading_dir(
             "scale_um_per_px",
             "correction_factor",
             "scale_outlier",
+            "scale_source",
             "area_mm2_original",
         ],
         _factor_rows(first_rows, collected),
@@ -299,7 +384,7 @@ def recompute_reading_dir(
             )
 
     readme = dest / "README.txt"
-    readme.write_text(_readme_text(root, first_csv, second_csv, final_csv, dest, fixed), encoding="utf-8")
+    readme.write_text(_readme_text(root, first_csv, second_csv, final_csv, dest, fixed, source), encoding="utf-8")
     n_outlier = sum(1 for item in collected.values() if item.get("outlier"))
     return {
         "reading_dir": str(root),
@@ -309,6 +394,7 @@ def recompute_reading_dir(
         "final_csv": None if final_out is None else str(final_out),
         "scale_factors_csv": str(dest / "scale_factors.csv"),
         "eye_scale_um_per_px": fixed,
+        "scale_source": source,
         "n_visits": len(collected),
         "n_outliers": n_outlier,
         "outlier_ratio": outlier_ratio,
@@ -323,10 +409,11 @@ def _readme_text(
     final_csv: Path | None,
     dest: Path,
     fixed: float,
+    source: str = SOURCE_EYE_MEDIAN,
 ) -> str:
     lines = [
-        "Optos 面積を、この眼の固定 µm/px（時点推定の中央値）でやり直した結果です。",
-        f"固定スケール: {fixed:.4f} µm/px",
+        "Optos 面積を、固定 µm/px でやり直した結果です。",
+        f"使ったスケール: {fixed:.4f} µm/px（由来 {source}）",
         f"第1入力: {first_csv}",
         f"第2入力: {second_csv or 'なし'}",
         f"最終入力: {final_csv or 'なし'}",
@@ -373,6 +460,35 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="直した第1・第2（と最終）で merge / triad を再実行する",
     )
+    parser.add_argument(
+        "--scale-um-px",
+        type=float,
+        default=None,
+        help="全時点に使う µm/px。指定すると眼の中央値より優先する",
+    )
+    parser.add_argument(
+        "--dicom",
+        type=Path,
+        default=None,
+        help="PixelSpacing と Columns を読む DICOM。画像幅があれば幅で合わせる",
+    )
+    parser.add_argument(
+        "--from-image-width",
+        action="store_true",
+        help="装置の µm/px × 装置幅 / 画像幅 で換算する（既定 10.4 × 4000 / 幅）",
+    )
+    parser.add_argument(
+        "--native-um-per-px",
+        type=float,
+        default=OPTOS_NATIVE_UM_PER_PX,
+        help="全画面換算の装置 µm/px（既定 10.4）",
+    )
+    parser.add_argument(
+        "--native-width-px",
+        type=float,
+        default=OPTOS_NATIVE_WIDTH_PX,
+        help="全画面換算の装置幅 px（既定 4000）",
+    )
     return parser
 
 
@@ -383,8 +499,14 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         out_dir=args.out,
         outlier_ratio=args.outlier_ratio,
         rerun_adoption=args.rerun_adoption,
+        scale_um_px=args.scale_um_px,
+        dicom=args.dicom,
+        from_image_width=args.from_image_width,
+        native_um_per_px=args.native_um_per_px,
+        native_width_px=args.native_width_px,
     )
     print(f"eye_scale_um_per_px={result['eye_scale_um_per_px']:.4f}")
+    print(f"scale_source={result['scale_source']}")
     print(f"first_csv={result['first_csv']}")
     if result["second_csv"]:
         print(f"second_csv={result['second_csv']}")

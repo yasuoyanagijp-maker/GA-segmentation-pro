@@ -34,6 +34,11 @@ def main() -> None:
     recompute.add_argument("--out", type=Path, default=None)
     recompute.add_argument("--outlier-ratio", type=float, default=None)
     recompute.add_argument("--rerun-adoption", action="store_true")
+    recompute.add_argument("--scale-um-px", type=float, default=None)
+    recompute.add_argument("--dicom", type=Path, default=None)
+    recompute.add_argument("--from-image-width", action="store_true")
+    recompute.add_argument("--native-um-per-px", type=float, default=None)
+    recompute.add_argument("--native-width-px", type=float, default=None)
 
     args = parser.parse_args()
     if args.command == "merge":
@@ -51,6 +56,16 @@ def main() -> None:
             argv.extend(["--outlier-ratio", str(args.outlier_ratio)])
         if args.rerun_adoption:
             argv.append("--rerun-adoption")
+        if args.scale_um_px is not None:
+            argv.extend(["--scale-um-px", str(args.scale_um_px)])
+        if args.dicom is not None:
+            argv.extend(["--dicom", str(args.dicom)])
+        if args.from_image_width:
+            argv.append("--from-image-width")
+        if args.native_um_per_px is not None:
+            argv.extend(["--native-um-per-px", str(args.native_um_per_px)])
+        if args.native_width_px is not None:
+            argv.extend(["--native-width-px", str(args.native_width_px)])
         recompute_scale_main(argv)
 
 

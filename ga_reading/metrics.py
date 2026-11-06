@@ -38,6 +38,7 @@ META_COLUMNS = (
     "mask_px",
     "scale_estimate_um_per_px",
     "scale_outlier",
+    "scale_source",
 )
 
 # grader.csv の末尾に足す。既存列の順は変えない。
@@ -46,6 +47,7 @@ SCALE_EXPORT_COLUMNS = (
     "mask_px",
     "scale_estimate_um_per_px",
     "scale_outlier",
+    "scale_source",
 )
 
 RPD_THRESHOLD_PCT = 20.0
