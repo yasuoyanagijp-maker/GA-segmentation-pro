@@ -16,6 +16,7 @@ from ga_reading.metrics import (
     LESION_PRESENT,
     PRESENT_QUALITY,
     QUALITY,
+    SCALE_EXPORT_COLUMNS,
 )
 
 
@@ -71,7 +72,7 @@ def write_reader_csv(
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     records = [_measured_record(row) for row in rows]
-    fields = [FILE_COL, LESION_PRESENT, QUALITY, "case_id", "date", "filename", *GA_PRIMARY_METRICS, "needs_review"]
+    fields = grader_csv_fields()
     path = directory / "grader.csv"
     write_csv(path, fields, records)
     if log_text is not None:
@@ -125,7 +126,7 @@ def write_grader_bundle(
             continue
         shutil.copy2(source, images / source.name)
         copied.add(source.name)
-    fields = [FILE_COL, LESION_PRESENT, QUALITY, "case_id", "date", "filename", *GA_PRIMARY_METRICS, "needs_review"]
+    fields = grader_csv_fields()
     path = root / "grader.csv"
     write_csv(path, fields, csv_rows)
     if log_text is not None:
@@ -133,6 +134,20 @@ def write_grader_bundle(
     elif exclusions is not None:
         write_exclusion_log(root, len(copied), len(csv_rows), exclusions)
     return path
+
+
+def grader_csv_fields() -> list[str]:
+    return [
+        FILE_COL,
+        LESION_PRESENT,
+        QUALITY,
+        "case_id",
+        "date",
+        "filename",
+        *GA_PRIMARY_METRICS,
+        "needs_review",
+        *SCALE_EXPORT_COLUMNS,
+    ]
 
 
 def _measured_record(row: dict) -> dict:
@@ -145,7 +160,17 @@ def _measured_record(row: dict) -> dict:
     record["date"] = row.get("date", "")
     record["filename"] = filename
     record["needs_review"] = row.get("needs_review", "")
+    for column in SCALE_EXPORT_COLUMNS:
+        record[column] = _scale_cell(column, row.get(column))
     return record
+
+
+def _scale_cell(column: str, value) -> str:
+    if value is None or value == "":
+        return ""
+    if column in {"mask_px", "scale_outlier"}:
+        return str(int(round(float(value))))
+    return f"{float(value):.4f}"
 
 
 def _blank_or_number(value) -> str:

@@ -9,7 +9,7 @@
 | アプリ | 起動 | 使う画像 |
 |---|---|---|
 | GA Segmentation Pro | `./run_flet.sh`（ポート 8551） | FAF。HRA は画像幅（mm）でスケールを付ける |
-| GA Segmentation Optos | `./run_optos.sh`（ポート 8552） | Optos。乳頭中心から中心窩までを 4.76 mm として、時点ごとにスケールを付ける |
+| GA Segmentation Optos | `./run_optos.sh`（ポート 8552） | Optos。乳頭–中心窩 4.76 mm から時点ごとの推定 µm/px を出し、面積換算はその眼の中央値で固定する |
 
 どちらもウィンドウが開きます。ブラウザで開くときだけ `FLET_USE_WEB=1` を付けます。Dock の名前は Flet になることがあります。ウィンドウのタイトルがアプリ名です。
 
@@ -45,3 +45,11 @@ pytest -q
 ```
 
 計測の本体は `engine/` です。画面は `flet_ui/`（Pro）と `optos_ui/`（Optos）です。
+
+すでに書き出した Optos の `grader.csv` を、眼ごとの固定 µm/px で面積だけやり直すとき:
+
+```bash
+python -m ga_reading recompute-scale /path/case2/OD_reading
+# 第2・最終も直して採用ルールまで再実行するなら
+python -m ga_reading recompute-scale /path/case2/OD_reading --rerun-adoption
+```

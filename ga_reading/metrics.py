@@ -35,6 +35,17 @@ META_COLUMNS = (
     "fovea_y",
     "outside_6mm_px",
     "needs_review",
+    "mask_px",
+    "scale_estimate_um_per_px",
+    "scale_outlier",
+)
+
+# grader.csv の末尾に足す。既存列の順は変えない。
+SCALE_EXPORT_COLUMNS = (
+    "scale_um_per_px",
+    "mask_px",
+    "scale_estimate_um_per_px",
+    "scale_outlier",
 )
 
 RPD_THRESHOLD_PCT = 20.0
