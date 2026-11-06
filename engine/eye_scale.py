@@ -10,9 +10,72 @@ from __future__ import annotations
 
 import math
 import statistics
+from dataclasses import dataclass
 
 # 中央値からこれ以上離れた時点推定は、面積換算には使わず印だけ残す。
 SCALE_OUTLIER_RATIO = 0.03
+
+# OptosAdvance P200DTx、PROJECTED optomap/AF の DICOM 既定。
+OPTOS_NATIVE_UM_PER_PX = 10.4
+OPTOS_NATIVE_WIDTH_PX = 4000
+
+SOURCE_FIXED = "fixed"
+SOURCE_DICOM = "dicom"
+SOURCE_EYE_MEDIAN = "eye_median"
+SCALE_SOURCES = (SOURCE_FIXED, SOURCE_DICOM, SOURCE_EYE_MEDIAN)
+
+
+@dataclass(frozen=True)
+class MeasurementScale:
+    um_per_px: float
+    source: str
+
+
+def scale_from_native_frame(
+    image_width_px: float,
+    native_um_per_px: float = OPTOS_NATIVE_UM_PER_PX,
+    native_width_px: float = OPTOS_NATIVE_WIDTH_PX,
+) -> float:
+    """全画面出力の µm/px = 装置の µm/px × 装置幅 / この画像の幅。"""
+    if image_width_px <= 0 or native_um_per_px <= 0 or native_width_px <= 0:
+        raise ValueError("画像幅と装置スケールは正の値が必要です")
+    return float(native_um_per_px) * float(native_width_px) / float(image_width_px)
+
+
+def resolve_measurement_scale(
+    *,
+    explicit_um_px: float | None = None,
+    dicom_um_per_px: float | None = None,
+    dicom_columns_px: float | None = None,
+    image_width_px: float | None = None,
+    native_um_per_px: float = OPTOS_NATIVE_UM_PER_PX,
+    native_width_px: float = OPTOS_NATIVE_WIDTH_PX,
+    use_native_frame: bool = False,
+    eye_estimates: list[float] | None = None,
+    estimate: float | None = None,
+) -> MeasurementScale | None:
+    """計測に使う µm/px。明示固定 > DICOM > 全画面換算 > 眼の中央値。"""
+    if explicit_um_px is not None and float(explicit_um_px) > 0:
+        return MeasurementScale(float(explicit_um_px), SOURCE_FIXED)
+    if dicom_um_per_px is not None and float(dicom_um_per_px) > 0:
+        columns = dicom_columns_px if dicom_columns_px and float(dicom_columns_px) > 0 else None
+        if image_width_px and float(image_width_px) > 0 and columns is not None:
+            return MeasurementScale(
+                scale_from_native_frame(image_width_px, dicom_um_per_px, columns),
+                SOURCE_DICOM,
+            )
+        return MeasurementScale(float(dicom_um_per_px), SOURCE_DICOM)
+    if use_native_frame and image_width_px and float(image_width_px) > 0:
+        return MeasurementScale(
+            scale_from_native_frame(image_width_px, native_um_per_px, native_width_px),
+            SOURCE_FIXED,
+        )
+    median = fixed_eye_scale(list(eye_estimates or []))
+    if median is not None:
+        return MeasurementScale(median, SOURCE_EYE_MEDIAN)
+    if estimate is not None and float(estimate) > 0:
+        return MeasurementScale(float(estimate), SOURCE_EYE_MEDIAN)
+    return None
 
 
 def fixed_eye_scale(estimates: list[float]) -> float | None:

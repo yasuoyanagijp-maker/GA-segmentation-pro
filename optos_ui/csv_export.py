@@ -125,6 +125,7 @@ VISIT_COLUMNS = (
     "mask_px",
     "scale_estimate_um_per_px",
     "scale_outlier",
+    "scale_source",
 )
 
 SERIES_COLUMNS = (

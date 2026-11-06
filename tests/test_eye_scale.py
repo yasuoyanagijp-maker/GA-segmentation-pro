@@ -104,6 +104,7 @@ def test_same_mask_pixels_keep_the_same_area_when_estimates_drift():
     assert by_date["2026-10-05"]["scale_um_per_px"] == pytest.approx(used)
     assert by_date["2026-10-05"]["scale_estimate_um_per_px"] == pytest.approx(57.9)
     assert by_date["2026-10-05"]["scale_outlier"] == 1
+    assert by_date["2026-10-05"]["scale_source"] == "eye_median"
     late_px = int(np.count_nonzero(session.mask))
     early_px = int(np.count_nonzero(early_mask))
     assert by_date["2026-10-05"]["mask_px"] == late_px
@@ -371,3 +372,159 @@ def test_recompute_then_triad_uses_the_corrected_areas(tmp_path: Path):
     final_fixed = (first_area * 1.1) * (result["eye_scale_um_per_px"] / 52.2) ** 2
     expected = float(np.median([first_fixed, second_fixed, final_fixed]))
     assert float(by_file[name]["area_mm2"]) == pytest.approx(round(expected, 3), abs=0.02)
+
+
+def test_native_frame_formula_and_priority():
+    from engine.eye_scale import (
+        SOURCE_DICOM,
+        SOURCE_EYE_MEDIAN,
+        SOURCE_FIXED,
+        resolve_measurement_scale,
+        scale_from_native_frame,
+    )
+
+    assert scale_from_native_frame(4000) == pytest.approx(10.4)
+    assert scale_from_native_frame(2000) == pytest.approx(20.8)
+    assert scale_from_native_frame(4000, native_um_per_px=10.4, native_width_px=4000) == 10.4
+    explicit = resolve_measurement_scale(
+        explicit_um_px=10.4,
+        dicom_um_per_px=12.0,
+        use_native_frame=True,
+        image_width_px=2000,
+        eye_estimates=[55.0, 56.0],
+    )
+    assert explicit is not None
+    assert explicit.source == SOURCE_FIXED
+    assert explicit.um_per_px == pytest.approx(10.4)
+    dicom = resolve_measurement_scale(
+        dicom_um_per_px=10.4,
+        dicom_columns_px=4000,
+        image_width_px=2000,
+        eye_estimates=[55.0],
+    )
+    assert dicom is not None
+    assert dicom.source == SOURCE_DICOM
+    assert dicom.um_per_px == pytest.approx(20.8)
+    median = resolve_measurement_scale(eye_estimates=[55.0, 56.0, 57.0])
+    assert median is not None
+    assert median.source == SOURCE_EYE_MEDIAN
+    assert median.um_per_px == pytest.approx(56.0)
+
+
+def test_synthetic_dicom_pixel_spacing(tmp_path: Path):
+    from engine.dicom_scale import read_dicom_pixel_spacing, write_synthetic_dicom
+
+    path = write_synthetic_dicom(tmp_path / "optos.dcm", spacing_mm=0.0104, columns=4000)
+    um_px, columns = read_dicom_pixel_spacing(path)
+    assert um_px == pytest.approx(10.4)
+    assert columns == 4000
+    other = write_synthetic_dicom(tmp_path / "wide.dcm", spacing_mm=0.0125, columns=3200)
+    um_px, columns = read_dicom_pixel_spacing(other)
+    assert um_px == pytest.approx(12.5)
+    assert columns == 3200
+
+
+def test_session_fixed_scale_beats_the_eye_median():
+    session = OptosSession()
+    session.case_id = "OD"
+    session.files = [Path("a.png"), Path("b.png")]
+    session.gray = np.full((80, 80), 180, dtype=np.uint8)
+    session.fovea_user_placed = True
+    session.fovea_xy = (30.0, 40.0)
+    session.disc_xy = (60.0, 40.0)
+    session.scale_um_px = 57.9
+    session.mask = np.zeros((80, 80), dtype=np.uint8)
+    session.mask[20:30, 20:30] = 255
+    session.snaps["OD/a.png"] = VisitSnap(
+        filename="a.png",
+        path="a.png",
+        date_iso="2022-01-01",
+        date_source="filename",
+        gray=session.gray,
+        disc_xy=(60.0, 40.0),
+        fovea_xy=(30.0, 40.0),
+        scale_um_px=55.6,
+        mask=session.mask,
+        confirmed=True,
+        fovea_user_placed=True,
+    )
+    session.set_fixed_scale("10.4")
+    used, source = session.resolve_used_scale(57.9)
+    assert used == pytest.approx(10.4)
+    assert source == "fixed"
+    rows = session.visit_rows()
+    assert {row["scale_source"] for row in rows} == {"fixed"}
+    assert all(row["scale_um_per_px"] == pytest.approx(10.4) for row in rows)
+
+
+def test_session_native_frame_uses_image_width():
+    session = OptosSession()
+    session.gray = np.full((100, 2000), 180, dtype=np.uint8)
+    session.set_native_frame_scale(True)
+    used, source = session.resolve_used_scale(55.0)
+    assert source == "fixed"
+    assert used == pytest.approx(20.8)
+
+
+def test_session_dicom_scale_uses_columns_and_width(tmp_path: Path):
+    from engine.dicom_scale import write_synthetic_dicom
+
+    path = write_synthetic_dicom(tmp_path / "ref.dcm", spacing_mm=0.0104, columns=4000)
+    session = OptosSession()
+    session.gray = np.full((50, 4000), 180, dtype=np.uint8)
+    note = session.load_dicom_scale(path)
+    assert "10.4" in note
+    used, source = session.resolve_used_scale(55.0)
+    assert source == "dicom"
+    assert used == pytest.approx(10.4)
+    session.gray = np.full((50, 2000), 180, dtype=np.uint8)
+    used, source = session.resolve_used_scale(55.0)
+    assert source == "dicom"
+    assert used == pytest.approx(20.8)
+
+
+def test_recompute_explicit_and_dicom_override_median(tmp_path: Path):
+    from engine.dicom_scale import write_synthetic_dicom
+    from ga_reading.merge import write_csv
+    from ga_reading.metrics import FILE_COL
+
+    reading = tmp_path / "OD_reading"
+    masks = reading / "export" / "masks"
+    images = reading / "export" / "images"
+    masks.mkdir(parents=True)
+    images.mkdir(parents=True)
+    name = "2026-01-01.png"
+    _write_mask(masks / name, 10)
+    cv2.imwrite(str(images / name), np.zeros((32, 2000), dtype=np.uint8))
+    px = 100
+    area = area_mm2_from_mask_px(px, 55.7)
+    fields = [FILE_COL, "lesion present", "Quality of analysis", *GA_PRIMARY_METRICS]
+    write_csv(reading / "grader.csv", fields, [{
+        FILE_COL: name,
+        "lesion present": "1",
+        "Quality of analysis": "OK",
+        "area_mm2": f"{area:.10g}",
+        "area_mm_sqrt": f"{area_mm_sqrt(area):.10g}",
+        "lesion_count": "1",
+        "gawain": "40",
+        "dist_um_nearest": "100",
+        "gap_um": "80",
+        "intact_1mm_mm2": "1.0",
+    }])
+    explicit = recompute_reading_dir(reading, out_dir=tmp_path / "explicit", scale_um_px=10.4)
+    assert explicit["scale_source"] == "fixed"
+    assert explicit["eye_scale_um_per_px"] == pytest.approx(10.4)
+    _fields, rows = read_csv(Path(explicit["first_csv"]))
+    assert rows[0]["scale_source"] == "fixed"
+    assert float(rows[0]["area_mm2"]) == pytest.approx(round(area_mm2_from_mask_px(px, 10.4), 3))
+
+    native = recompute_reading_dir(reading, out_dir=tmp_path / "native", from_image_width=True)
+    assert native["scale_source"] == "fixed"
+    assert native["eye_scale_um_per_px"] == pytest.approx(20.8)
+
+    dcm = write_synthetic_dicom(tmp_path / "ref.dcm", spacing_mm=0.0104, columns=4000)
+    dicom = recompute_reading_dir(reading, out_dir=tmp_path / "dicom", dicom=dcm)
+    assert dicom["scale_source"] == "dicom"
+    assert dicom["eye_scale_um_per_px"] == pytest.approx(20.8)
+    _fields, rows = read_csv(Path(dicom["first_csv"]))
+    assert rows[0]["scale_source"] == "dicom"
