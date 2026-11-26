@@ -81,19 +81,24 @@ jobs:
           fi
           notes="$(mktemp)"
           cat > "$notes" <<EOF
-          Mac（Apple Silicon）と Windows（64 bit）のデスクトップアプリです。
-
-          ### Mac（Apple Silicon）
-          ZIP を展開し、中の「インストール.command」を右クリック →「開く」で実行してください。Apple の公証は使いません。
-
-          - \`pro-macOS-arm64.zip\` … GA Segmentation Pro
-          - \`optos-macOS-arm64.zip\` … GA Segmentation Optos
+          Windows（64 bit）と Mac（Apple Silicon）のデスクトップアプリです。
 
           ### Windows（64 bit）
-          ダウンロードした exe をダブルクリックして起動します。
+          Windows では ZIP は使いません。\`GA-Segmentation-Optos-windows-x64.exe\` をダウンロードしてダブルクリックしてください。初回 SmartScreen が出たら「詳細情報」→「実行」。
 
-          - \`GA-Segmentation-Pro-windows-x64.exe\` … GA Segmentation Pro
+          インストール作業はありません。ブラウザがダウンロードを止めたら「保存/保持」を選んでください。初回起動は 1 分ほどかかることがあります。大学 PC などで exe の実行がブロックされるときは、情報システムの許可が必要なことがあります。
+
           - \`GA-Segmentation-Optos-windows-x64.exe\` … GA Segmentation Optos
+          - \`GA-Segmentation-Pro-windows-x64.exe\` … GA Segmentation Pro
+
+          ### Mac（Apple Silicon）
+          次の ZIP は Mac専用です。ZIP を展開し、中の「インストール.command」を右クリック →「開く」で実行してください。Apple の公証は使いません。
+
+          - \`optos-macOS-arm64.zip\` … GA Segmentation Optos（Mac専用）
+          - \`pro-macOS-arm64.zip\` … GA Segmentation Pro（Mac専用）
+
+          ### 使わないファイル
+          GitHub の「Source code (zip)」はソースコードであり、インストーラーではありません。Windows では使いません。
           EOF
           gh release create "${GITHUB_REF_NAME}" "${files[@]}" \
             --repo "${GITHUB_REPOSITORY}" \

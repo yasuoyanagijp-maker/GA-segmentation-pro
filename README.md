@@ -15,14 +15,16 @@
 
 ## ダウンロード
 
-ビルド済みのアプリは [Releases](https://github.com/yasuoyanagijp-maker/GA-segmentation-pro/releases) にあります。`desktop-v*` のタグを push すると、Mac（Apple Silicon）と Windows（64 bit）を作って同じ Release に載せます。
+ビルド済みのアプリは [Releases](https://github.com/yasuoyanagijp-maker/GA-segmentation-pro/releases) にあります。`desktop-v*` のタグを push すると、Windows（64 bit）と Mac（Apple Silicon）を作って同じ Release に載せます。
 
 | 環境 | ファイル |
 |---|---|
-| Mac（Apple Silicon） | `pro-macOS-arm64.zip`、`optos-macOS-arm64.zip` |
-| Windows（64 bit） | `GA-Segmentation-Pro-windows-x64.exe`、`GA-Segmentation-Optos-windows-x64.exe` |
+| Windows（64 bit） | `GA-Segmentation-Optos-windows-x64.exe`、`GA-Segmentation-Pro-windows-x64.exe` |
+| Mac（Apple Silicon） | `optos-macOS-arm64.zip`、`pro-macOS-arm64.zip`（いずれも Mac専用） |
 
-Mac は ZIP を展開し、「インストール.command」を右クリック →「開く」で Applications に入ります。Apple の公証は使いません。手順はマニュアルの「Mac に入れる」です。Windows は exe をダブルクリックして起動します。
+**Windows では ZIP は使いません。** `GA-Segmentation-Optos-windows-x64.exe` をダウンロードしてダブルクリックしてください。インストールは不要です。初回 SmartScreen が出たら「詳細情報」→「実行」。ブラウザがダウンロードを止めたら「保存/保持」を選んでください。初回起動は 1 分ほどかかることがあります。大学 PC などで exe の実行がブロックされるときは、情報システムの許可が必要なことがあります。Pro は `GA-Segmentation-Pro-windows-x64.exe` です。GitHub の「Source code (zip)」はインストーラーではありません。
+
+Mac は ZIP（Mac専用）を展開し、「インストール.command」を右クリック →「開く」で Applications に入ります。Apple の公証は使いません。手順はマニュアルの「Mac に入れる」です。
 
 ## 起動
 
